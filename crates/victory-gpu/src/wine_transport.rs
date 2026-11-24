@@ -72,6 +72,38 @@ pub struct Draw {
     pub constants: Vec<u32>, pub texture: Option<u64>, pub first_mip:u32, pub mip_count:u32,
     pub index: Option<Index>, pub depth: Option<u64>, pub linear_filter: bool,
     pub constant_slot:Option<u32>, pub texture_slot:Option<u32>, pub sampler_slot:Option<u32>,
+    /// Explicit vertex views for the extended input-layout protocol; empty for legacy draws.
+    pub vertices: Vec<VertexView>,
+}
+#[derive(Clone, Debug)]
+pub struct VertexView { pub slot:u32, pub buffer:u64, pub offset:u64, pub size:u32, pub stride:u32 }
+#[derive(Clone, Debug)]
+pub struct VertexInput {
+    pub semantic:String, pub semantic_index:u32, pub format:u32, pub slot:u32,
+    pub offset:u32, pub per_instance:bool, pub step_rate:u32,
+}
+
+pub fn vertex_format_size(format:u32) -> Option<u32> {
+    match format { 2=>Some(16), 16=>Some(8), 34|35=>Some(4), _=>None }
+}
+
+pub fn validate_vertex_inputs(inputs:&[VertexInput]) -> Result<(),String> {
+    if inputs.is_empty() || inputs.len()>16 {return Err("invalid vertex input count".into())}
+    for (i,a) in inputs.iter().enumerate() {
+        let size=vertex_format_size(a.format).ok_or("unsupported vertex format")?;
+        let align=if matches!(a.format,34|35) {2} else {4};
+        if a.slot>=16 || a.semantic.is_empty() || a.semantic.len()>64
+            || !a.semantic.bytes().all(|c| c.is_ascii_alphanumeric() || c==b'_')
+            || a.offset%align!=0 || a.offset.checked_add(size).is_none_or(|v|v>2048)
+            || (!a.per_instance && a.step_rate!=0) || (a.per_instance && a.step_rate==0)
+        {return Err("invalid vertex input".into())}
+        for b in &inputs[..i] {
+            if (a.semantic_index==b.semantic_index && a.semantic.eq_ignore_ascii_case(&b.semantic))
+                || (a.slot==b.slot && (a.per_instance!=b.per_instance || a.step_rate!=b.step_rate))
+            {return Err("duplicate semantic or inconsistent vertex slot".into())}
+        }
+    }
+    Ok(())
 }
 #[derive(Clone, Debug)]
 pub struct Index { pub buffer:u64, pub offset:u64, pub size:u32, pub format:u32, pub first:u32, pub base_vertex:i32 }
@@ -86,7 +118,7 @@ impl Stencil {
     }
 }
 #[derive(Clone, Debug)]
-pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend }
+pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend, pub inputs:Vec<VertexInput> }
 #[derive(Clone, Debug)]
 pub struct Blend { pub enabled:bool, pub write_mask:u8, pub factors:[u32;6] }
 impl Blend {
@@ -196,15 +228,48 @@ pub fn decode_results(data:&[u8])->Result<Vec<Resource>,String> { if data.len()>
 pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
     validate_commands(&batch.resources,&batch.commands)?;
     let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?; count(&mut w,batch.pipelines.len())?;
-    let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(if z.stencil.is_some(){2}else{1});w.u32(z.write as u32);w.u32(z.compare);if let Some(s)=&z.stencil {if s.enabled && !s.valid() {return Err("invalid stencil state".into())} w.u32(s.enabled as u32);w.u32(s.read_mask as u32);w.u32(s.write_mask as u32);for v in s.front.into_iter().chain(s.back) {w.u32(v);}}} else {w.u32(0);} if Blend::new(p.blend.enabled,p.blend.write_mask,p.blend.factors).is_none() {return Err("invalid blend state".into())} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.encode());}
+    let mut ids=HashSet::new();
+    for p in &batch.pipelines {
+        if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())}
+        w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;
+        if p.vertex_stride & 0x8000_0000 != 0 {return Err("invalid vertex stride".into())}
+        w.u32(p.vertex_stride | if p.inputs.is_empty(){0}else{0x8000_0000});w.u32(p.format);
+        if let Some(z)=&p.depth {
+            w.u32(if z.stencil.is_some(){2}else{1});w.u32(z.write as u32);w.u32(z.compare);
+            if let Some(s)=&z.stencil {
+                if s.enabled && !s.valid() {return Err("invalid stencil state".into())}
+                w.u32(s.enabled as u32);w.u32(s.read_mask as u32);w.u32(s.write_mask as u32);
+                for v in s.front.into_iter().chain(s.back) {w.u32(v);}
+            }
+        } else {w.u32(0);}
+        if Blend::new(p.blend.enabled,p.blend.write_mask,p.blend.factors).is_none() {return Err("invalid blend state".into())}
+        w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.encode());
+        if !p.inputs.is_empty() {
+            validate_vertex_inputs(&p.inputs)?;
+            w.u32(p.inputs.len() as u32);
+            for a in &p.inputs {
+                w.bytes(a.semantic.as_bytes(),64)?;
+                for v in [a.semantic_index,a.format,a.slot,a.offset,a.per_instance as u32,a.step_rate] {w.u32(v);}
+            }
+        }
+    }
     count(&mut w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
-        Command::Draw(d) => {w.u32(1);w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
+        Command::Draw(d) => {w.u32(if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
             if d.texture==Some(0) || d.depth==Some(0) || [d.constant_slot,d.texture_slot,d.sampler_slot].contains(&Some(u32::MAX)) {return Err("invalid optional identifier or slot".into())}
             if let Some(i)=&d.index {w.u32(1);w.u64(i.buffer);w.u64(i.offset);for v in [i.size,i.format,i.first,i.base_vertex as u32] {w.u32(v);}} else {w.u32(0);}
             w.u64(d.depth.unwrap_or(0));w.u32(d.linear_filter as u32);
             w.u32(d.vertex_stride);for slot in [d.constant_slot,d.texture_slot,d.sampler_slot] {w.u32(slot.unwrap_or(u32::MAX));}
+            if !d.vertices.is_empty() {
+                if d.vertices.len()>16 {return Err("too many vertex views".into())}
+                w.u32(d.vertices.len() as u32);
+                let mut slots=0u32;
+                for v in &d.vertices {
+                    if v.slot>=16 || v.buffer==0 || v.size==0 || v.stride==0 || slots & (1<<v.slot)!=0 {return Err("invalid vertex view".into())}
+                    slots|=1<<v.slot;w.u32(v.slot);w.u64(v.buffer);w.u64(v.offset);w.u32(v.size);w.u32(v.stride);
+                }
+            }
         },
         Command::Barrier {id,before,after} => {w.u32(2);w.u64(*id);w.u32(*before);w.u32(*after);},
         Command::CopyTexture(c) => {w.u32(3);w.u64(c.src);w.u64(c.dst);w.u64(c.offset);for v in [c.pitch,c.width,c.height,c.format,c.mip,c.buffer_to_texture as u32] {w.u32(v);}},
@@ -217,14 +282,55 @@ pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
 }
 pub fn decode_batch(data:&[u8])->Result<Batch,String> {
     if data.len()>MAX_PAYLOAD {return Err("wire payload exceeds limit".into());} let mut r=Reader {data,pos:0}; let resources=read_resources(&mut r)?;
-    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();for _ in 0..n {let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())} let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;let vertex_stride=r.u32()?;let format=r.u32()?;let depth=match r.u32()? {0=>None,k @ (1|2)=>{let write=r.boolean()?;let compare=r.u32()?;let stencil=if k==2 {let enabled=r.boolean()?;let read_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;let write_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;let mut front=[0;4];let mut back=[0;4];for v in front.iter_mut().chain(back.iter_mut()) {*v=r.u32()?;} let s=Stencil {enabled,read_mask,write_mask,front,back};if enabled && !s.valid() {return Err("invalid stencil state".into())} Some(s)}else{None};Some(PipelineDepth {write,compare,stencil})},_=>return Err("invalid depth state".into())};let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())} let blend=Blend::decode(enabled,mask as u8,r.u32()?).ok_or("invalid blend flags")?;pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend});}
+    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();
+    for _ in 0..n {
+        let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())}
+        let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;
+        let raw_stride=r.u32()?;let extended=raw_stride & 0x8000_0000!=0;let vertex_stride=raw_stride & 0x7fff_ffff;
+        let format=r.u32()?;
+        let depth=match r.u32()? {
+            0=>None,k @ (1|2)=>{
+                let write=r.boolean()?;let compare=r.u32()?;
+                let stencil=if k==2 {
+                    let enabled=r.boolean()?;let read_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;
+                    let write_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;
+                    let mut front=[0;4];let mut back=[0;4];for v in front.iter_mut().chain(back.iter_mut()) {*v=r.u32()?;}
+                    let s=Stencil {enabled,read_mask,write_mask,front,back};
+                    if enabled && !s.valid() {return Err("invalid stencil state".into())} Some(s)
+                } else {None};
+                Some(PipelineDepth {write,compare,stencil})
+            },_=>return Err("invalid depth state".into())
+        };
+        let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())}
+        let blend=Blend::decode(enabled,mask as u8,r.u32()?).ok_or("invalid blend flags")?;
+        let mut inputs=Vec::new();
+        if extended {
+            let n=r.count()?;if n==0 || n>16 {return Err("invalid vertex input count".into())}
+            for _ in 0..n {
+                let semantic=String::from_utf8(r.bytes(64)?).map_err(|_|"invalid vertex semantic")?;
+                inputs.push(VertexInput {semantic,semantic_index:r.u32()?,format:r.u32()?,slot:r.u32()?,offset:r.u32()?,per_instance:r.boolean()?,step_rate:r.u32()?});
+            }
+            validate_vertex_inputs(&inputs)?;
+        }
+        pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend,inputs});
+    }
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
-        1=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
+        kind @ (1|9)=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
             let index=if r.boolean()? {Some(Index {buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,format:r.u32()?,first:r.u32()?,base_vertex:r.u32()? as i32})} else {None};
             let depth=match r.u64()? {0=>None,id=>Some(id)};let linear_filter=r.boolean()?;let vertex_stride=r.u32()?;let mut slot=|| -> Result<Option<u32>,String> {Ok(match r.u32()? {u32::MAX=>None,v=>Some(v)})};let constant_slot=slot()?;let texture_slot=slot()?;let sampler_slot=slot()?;
-            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,first_mip,mip_count,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot})},
+            let mut vertices=Vec::new();
+            if kind==9 {
+                let n=r.count()?;if n==0 || n>16 {return Err("invalid vertex view count".into())}
+                let mut slots=0u32;
+                for _ in 0..n {
+                    let v=VertexView {slot:r.u32()?,buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,stride:r.u32()?};
+                    if v.slot>=16 || v.buffer==0 || v.size==0 || v.stride==0 || slots & (1<<v.slot)!=0 {return Err("invalid vertex view".into())}
+                    slots|=1<<v.slot;vertices.push(v);
+                }
+            }
+            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,first_mip,mip_count,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot,vertices})},
         2=>Command::Barrier {id:r.u64()?,before:r.u32()?,after:r.u32()?},
         3=> {let src=r.u64()?;let dst=r.u64()?;let offset=r.u64()?;let pitch=r.u32()?;let width=r.u32()?;let height=r.u32()?;let format=r.u32()?;let mip=r.u32()?;let buffer_to_texture=match r.u32()? {0=>false,1=>true,_=>return Err("invalid copy direction".into())};Command::CopyTexture(CopyTexture {src,dst,offset,pitch,width,height,format,mip,buffer_to_texture})},
         4=>Command::CopyBuffer {src:r.u64()?,dst:r.u64()?,src_offset:r.u64()?,dst_offset:r.u64()?,size:r.u64()?},
@@ -307,14 +413,33 @@ mod tests {
     fn pipeline_and_draw_round_trip() {
         let mut b=batch();
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
-            depth:Some(PipelineDepth {write:true,compare:4,stencil:None}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap()});
+            depth:Some(PipelineDepth {write:true,compare:4,stencil:None}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap(),inputs:vec![]});
         b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
-            depth:Some(3),linear_filter:true,constant_slot:Some(3),texture_slot:Some(2),sampler_slot:Some(1)}));
+            depth:Some(3),linear_filter:true,constant_slot:Some(3),texture_slot:Some(2),sampler_slot:Some(1),vertices:vec![]}));
         let encoded=encode_batch(&b).unwrap();
         assert_eq!(encode_batch(&decode_batch(&encoded).unwrap()).unwrap(),encoded);
         b.pipelines.push(b.pipelines[0].clone());
+        assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
+    fn vertex_input_wire_round_trip() {
+        let mut b=batch();
+        b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:24,format:28,
+            depth:None,blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![
+                VertexInput {semantic:"TEXCOORD".into(),semantic_index:0,format:34,slot:1,offset:0,per_instance:true,step_rate:2},
+                VertexInput {semantic:"POSITION".into(),semantic_index:0,format:2,slot:0,offset:4,per_instance:false,step_rate:0},
+            ]});
+        b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
+            vertex_count:3,instance_count:3,first_vertex:0,first_instance:2,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
+            topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
+            constant_slot:None,texture_slot:None,sampler_slot:None,
+            vertices:vec![VertexView {slot:0,buffer:1,offset:0,size:4,stride:16},VertexView {slot:1,buffer:1,offset:0,size:4,stride:4}]}));
+        let bytes=encode_batch(&b).unwrap();
+        assert_eq!(encode_batch(&decode_batch(&bytes).unwrap()).unwrap(),bytes);
+        b.pipelines[0].inputs[0].step_rate=0;
         assert!(encode_batch(&b).is_err());
     }
 
@@ -324,7 +449,7 @@ mod tests {
         b.resources.push(Resource {id:3,state:0x10,kind:ResourceKind::Texture {width:1,height:1,format:20,mips:1},bytes:vec![0;5]});
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
             depth:Some(PipelineDepth {write:true,compare:2,stencil:Some(Stencil {enabled:true,read_mask:0xf0,write_mask:0x0f,front:[1,2,3,4],back:[5,6,7,8]})}),
-            blend:Blend::new(false,15,[0;6]).unwrap()});
+            blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![]});
         b.commands.extend([Command::SetStencilRef(0xa5),Command::ClearStencil {target:3,flags:3,depth:0.5,stencil:0xa0},
             Command::CopyDepthStencil {src:3,dst:1,offset:0,pitch:256,width:1,height:1,plane:1,upload:false}]);
         let encoded=encode_batch(&b).unwrap();
@@ -411,7 +536,7 @@ mod tests {
         b.commands=vec![Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:Some(2),first_mip:1,mip_count:2,index:None,depth:None,linear_filter:false,
-            constant_slot:None,texture_slot:Some(0),sampler_slot:Some(0)})];
+            constant_slot:None,texture_slot:Some(0),sampler_slot:Some(0),vertices:vec![]})];
         let encoded=encode_batch(&b).unwrap();
         for end in 0..encoded.len() {assert!(decode_batch(&encoded[..end]).is_err());}
         let decoded=decode_batch(&encoded).unwrap();

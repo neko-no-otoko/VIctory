@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use crate::object::{guid, HRESULT, Iid, Object, Table, This, E_INVALIDARG, E_NOINTERFACE, S_OK};
-use crate::wine_transport::{self, Batch, Resource, ResourceKind, Command, Draw, CopyTexture, Blend, Pipeline, PipelineDepth, Stencil, Index};
+use crate::wine_transport::{self, Batch, Resource, ResourceKind, Command, Draw, CopyTexture, Blend, Pipeline, PipelineDepth, Stencil, Index, VertexInput};
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
 fn resource_id() -> u64 {
@@ -153,7 +153,7 @@ struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, state
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Option<Srv>>>;
-struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, depth: Option<PipelineDepth>, blend: Blend }
+struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
 type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 #[derive(Clone)]
 enum GraphicsResource { Buffer(Arc<Buffer>), Texture(Arc<Texture>) }
@@ -196,7 +196,7 @@ struct GraphicsState {
     depth: Option<Rtv>,
     stencil_ref: u32,
     viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: bool,
-    vertices: Option<(Arc<Buffer>, usize, u32, u32)>, constants: Vec<Option<u32>>,
+    vertices: [Option<(Arc<Buffer>, usize, u32, u32)>; 16], constants: Vec<Option<u32>>,
     index: Option<(Arc<Buffer>, usize, u32, u32)>,
     heaps: Vec<usize>, texture: Option<(u32, TextureHeap, Srv)>,
     sampler: Option<(u32, Arc<Mutex<Option<bool>>>, bool)>, constant_slot: Option<u32>,
@@ -1418,7 +1418,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
                 blend = state;
             }
             9 => if word(4) != u32::MAX { return E_INVALIDARG; },
-            12 => { ep = stream_ptr(b,at+8); input_count = word(16); if !matches!(input_count, 1 | 2) { return E_INVALIDARG; } }
+            12 => { ep = stream_ptr(b,at+8); input_count = word(16); if !(1..=16).contains(&input_count) { return E_INVALIDARG; } }
             10 => {
                 if word(4) != 3 || word(8) != 1 || (16..48).step_by(4).any(|i| word(i) != if i == 28 { 1 } else { 0 }) { return E_INVALIDARG; }
                 front_counter_clockwise = word(12) != 0;
@@ -1457,15 +1457,30 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
         d.stencil = stencil_state;
     }
     if vp == 0 || pp == 0 || ep == 0 || vl == 0 || pl == 0 || vl > MAX_SHADER || pl > MAX_SHADER { return E_INVALIDARG; }
-    let e = unsafe { &*(ep as *const InputElement) };
-    if e.name.is_null() || e.index != 0 || e.format != 2 || e.slot != 0 || e.offset != 0 || e.class != 0 || e.step != 0 { return E_INVALIDARG; }
-    if !unsafe { std::ffi::CStr::from_ptr(e.name.cast()) }.to_bytes().eq_ignore_ascii_case(b"POSITION") { return E_INVALIDARG; }
-    if input_count == 2 {
-        let uv = unsafe { &*((ep as *const InputElement).add(1)) };
-        if uv.name.is_null() || uv.index != 0 || uv.format != 16 || uv.slot != 0 || uv.offset != 16 || uv.class != 0 || uv.step != 0
-            || !unsafe { std::ffi::CStr::from_ptr(uv.name.cast()) }.to_bytes().eq_ignore_ascii_case(b"TEXCOORD") { return E_INVALIDARG; }
+    let mut inputs = Vec::with_capacity(input_count as usize);
+    let mut next = [0u32;16];
+    for i in 0..input_count as usize {
+        let e = unsafe { &*((ep as *const InputElement).add(i)) };
+        if e.name.is_null() || e.slot >= 16 || e.class > 1 { return E_INVALIDARG; }
+        let Ok(name) = unsafe { std::ffi::CStr::from_ptr(e.name.cast()) }.to_str() else { return E_INVALIDARG; };
+        let Some(size) = wine_transport::vertex_format_size(e.format) else { return E_INVALIDARG; };
+        let align = if matches!(e.format, 34 | 35) { 2 } else { 4 };
+        let offset = if e.offset == u32::MAX {
+            let Some(v)=next[e.slot as usize].checked_add(align-1) else { return E_INVALIDARG; };
+            v & !(align-1)
+        } else { e.offset };
+        let Some(end)=offset.checked_add(size) else { return E_INVALIDARG; };
+        next[e.slot as usize] = end;
+        inputs.push(VertexInput { semantic: name.to_owned(), semantic_index:e.index, format:e.format,
+            slot:e.slot, offset, per_instance:e.class==1, step_rate:e.step });
     }
-    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if input_count == 2 { 24 } else { 16 }, depth, blend };
+    if wine_transport::validate_vertex_inputs(&inputs).is_err() { return E_INVALIDARG; }
+    let legacy = inputs[0].semantic.eq_ignore_ascii_case("POSITION") && inputs[0].semantic_index==0
+        && inputs[0].format==2 && inputs[0].slot==0 && inputs[0].offset==0 && !inputs[0].per_instance
+        && (inputs.len()==1 || (inputs.len()==2 && inputs[1].semantic.eq_ignore_ascii_case("TEXCOORD")
+            && inputs[1].semantic_index==0 && inputs[1].format==16 && inputs[1].slot==0
+            && inputs[1].offset==16 && !inputs[1].per_instance));
+    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, inputs, legacy, depth, blend };
     new(Data::GraphicsPipeline(Arc::new(p)), &PIPELINE_TABLE, iid, PIPELINE, out)
 }
 extern "system" fn gpu_address(this: This) -> u64 {
@@ -1547,16 +1562,21 @@ extern "system" fn scissor(this: This, n: u32, p: *const [i32; 4]) {
 struct VertexView { address: u64, size: u32, stride: u32 }
 extern "system" fn vertices(this: This, slot: u32, n: u32, p: *const VertexView) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
-    if slot != 0 || n != 1 || p.is_null() { l.invalid = true; return; }
-    let v = unsafe { &*p };
-    if !matches!(v.stride, 16 | 24) || v.size < v.stride { l.invalid = true; return; }
+    if n == 0 || slot.checked_add(n).is_none_or(|end|end>16) || p.is_null() { l.invalid = true; return; }
+    let views = unsafe { std::slice::from_raw_parts(p,n as usize) };
     let map = objects().lock().unwrap();
-    let found = map.values().find_map(|e| if let Data::Buffer(b) = &e.data {
-        let offset = v.address.checked_sub(b.ptr() as u64)?;
-        if offset.checked_add(v.size as u64)? <= b.len() as u64 { Some((b.clone(), offset as usize, v.size, v.stride)) } else { None }
-    } else { None });
+    let mut resolved = Vec::with_capacity(n as usize);
+    for v in views {
+        if v.stride==0 || v.stride>2048 || v.size==0 { l.invalid=true; return; }
+        let found = map.values().find_map(|e| if let Data::Buffer(b) = &e.data {
+            let offset = v.address.checked_sub(b.ptr() as u64)?;
+            if offset.checked_add(v.size as u64)? <= b.len() as u64 { Some((b.clone(),offset as usize,v.size,v.stride)) } else { None }
+        } else { None });
+        let Some(found)=found else { l.invalid=true; return; };
+        resolved.push(found);
+    }
     drop(map);
-    if found.is_none() { l.invalid = true; } else { l.graphics.vertices = found; }
+    for (i,v) in resolved.into_iter().enumerate() { l.graphics.vertices[slot as usize+i]=Some(v); }
 }
 extern "system" fn graphics_constant(this: This, slot: u32, value: u32, offset: u32) {
     graphics_constants(this, slot, 1, &value, offset);
@@ -1594,8 +1614,8 @@ extern "system" fn draw_indexed(this: This, count: u32, instances: u32, first: u
 }
 fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32, base: Option<i32>) {
     let l = graphics_list(this); let mut l = l.lock().unwrap(); let g = &mut l.graphics;
-    let (Some(desc), Some(pipeline), Some((buffer, offset, size, stride)), Some(viewport), Some(scissor), Some(constants)) =
-        (g.target.clone(), g.pipeline.clone(), g.vertices.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>())
+    let (Some(desc), Some(pipeline), Some(viewport), Some(scissor), Some(constants)) =
+        (g.target.clone(), g.pipeline.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>())
         else { l.invalid = true; return; };
     let index = if let Some(base_vertex) = base {
         let Some((b, offset, size, format)) = g.index.clone() else { l.invalid = true; return; };
@@ -1603,14 +1623,33 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         if first.checked_add(count).and_then(|n| n.checked_mul(element)).is_none_or(|n| n > size) { l.invalid = true; return; }
         Some((b.clone(), Index { buffer: b.id, offset: offset as u64, size, format, first, base_vertex }))
     } else { None };
-    let end = first.checked_add(count).and_then(|n| n.checked_mul(stride));
-    if !g.topology || count == 0 || instances == 0 || stride != pipeline.stride || (index.is_none() && end.is_none_or(|n| n > size))
+    if !g.topology || count == 0 || instances == 0
         || !viewport.iter().all(|v| v.is_finite()) || viewport[2] <= 0.0 || viewport[3] <= 0.0
         || scissor[0] < 0 || scissor[1] < 0 || scissor[2] <= scissor[0] || scissor[3] <= scissor[1] {
         l.invalid = true; return;
     }
     let target = desc.1.clone();
-    let mut resources = vec![GraphicsResource::Texture(target.clone()), GraphicsResource::Buffer(buffer.clone())];
+    let mut resources = vec![GraphicsResource::Texture(target.clone())];
+    let mut views = Vec::new();
+    for a in &pipeline.inputs {
+        let Some((buffer,offset,size,stride)) = g.vertices[a.slot as usize].as_ref() else { l.invalid=true; return; };
+        let max = if a.per_instance {
+            instance.checked_add((instances-1)/a.step_rate)
+        } else if index.is_none() { first.checked_add(count-1) } else { None };
+        if let Some(max)=max {
+            let end=u64::from(max).checked_mul(u64::from(*stride))
+                .and_then(|v|v.checked_add(u64::from(a.offset)))
+                .and_then(|v|v.checked_add(u64::from(wine_transport::vertex_format_size(a.format).unwrap())));
+            if end.is_none_or(|v|v>u64::from(*size)) { l.invalid=true; return; }
+        } else if a.per_instance || index.is_none() { l.invalid=true; return; }
+        if !views.iter().any(|v: &wine_transport::VertexView|v.slot==a.slot) {
+            views.push(wine_transport::VertexView {slot:a.slot,buffer:buffer.id,offset:*offset as u64,size:*size,stride:*stride});
+            resources.push(GraphicsResource::Buffer(buffer.clone()));
+        }
+    }
+    let legacy=pipeline.legacy && instances==1 && instance==0 && views.len()==1
+        && views[0].slot==0 && views[0].stride==pipeline.stride;
+    let first_view=views.first().unwrap().clone();
     if let Some((b,_)) = &index { resources.push(GraphicsResource::Buffer(b.clone())); }
     if let Some((_,_,view)) = &g.texture { resources.push(GraphicsResource::Texture(view.texture.clone())); }
     if g.texture.is_some() != g.sampler.is_some() { l.invalid = true; return; }
@@ -1621,14 +1660,14 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
     if pipeline.depth.is_some() != g.depth.is_some() { l.invalid = true; return; }
     if let Some((_,t,_)) = &g.depth { resources.push(GraphicsResource::Texture(t.clone())); }
     let command = Command::Draw(Draw { target: target.id, pipeline: pipeline.id,
-        vertex_buffer: buffer.id, vertex_offset: offset as u64, vertex_size: size, vertex_stride: stride,
+        vertex_buffer: first_view.buffer, vertex_offset: first_view.offset, vertex_size: first_view.size, vertex_stride: first_view.stride,
         vertex_count: count, instance_count: instances, first_vertex: if index.is_some() { 0 } else { first }, first_instance: instance,
         viewport, scissor, topology: 4, constants, texture: g.texture.as_ref().map(|v| v.2.texture.id),
         first_mip: g.texture.as_ref().map_or(0, |v| v.2.first_mip),
         mip_count: g.texture.as_ref().map_or(0, |v| v.2.mip_count),
         index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: g.sampler.as_ref().is_some_and(|v| v.2),
         constant_slot: g.constant_slot, texture_slot: g.texture.as_ref().map(|v| v.0),
-        sampler_slot: g.sampler.as_ref().map(|v| v.0) });
+        sampler_slot: g.sampler.as_ref().map(|v| v.0), vertices: if legacy {Vec::new()} else {views} });
     g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
         texture: g.texture.as_ref().map(|v| (v.1.clone(),v.2.clone())),
         sampler: g.sampler.as_ref().map(|v| (v.1.clone(),v.2)) });
@@ -1727,8 +1766,9 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
             if *h.lock().unwrap() != Some(*v) { return Err("sampler descriptor changed".into()); }
         }
         if let Some(p) = &j.pipeline {
-            pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
-                format: 28, depth: p.depth.clone(), blend: p.blend.clone() });
+            let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
+                format: 28, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new() });
+            if matches!(&j.command,Command::Draw(d) if !d.vertices.is_empty()) { entry.inputs=p.inputs.clone(); }
         }
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }
         commands.push(j.command.clone());

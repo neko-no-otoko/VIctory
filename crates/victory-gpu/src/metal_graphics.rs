@@ -22,6 +22,7 @@ pub(crate) struct Prepared {
     pub(crate) color_format: victory_metal::ColorFormat,
     pub(crate) blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
+    input_renderer: Option<(u32, u32, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
 }
 
 /// A supplied input-layout element and the Metal attribute assigned to it.
@@ -30,6 +31,7 @@ pub(crate) struct ResolvedVertexInput {
     pub(crate) attribute_index: u8,
 }
 
+#[derive(Debug)]
 struct VertexSignature {
     row: u8,
     mask: u8,
@@ -79,6 +81,7 @@ impl Prepared {
             vertex_stride: if graphics.input_uv { 24 } else { 16 },
             color_format: graphics.color_format,
             renderer: None,
+            input_renderer: None,
         })
     }
 
@@ -104,14 +107,19 @@ impl Prepared {
         for sig in &signatures {
             let attribute = reflected.iter().find(|a| a.name.eq_ignore_ascii_case(&sig.reflected_name))
                 .ok_or("converter vertex reflection is missing an input semantic")?;
-            resolved.push(ResolvedVertexInput { layout_index: sig.layout_index, attribute_index: attribute.index });
+            // Converter reflection numbers inputs from zero; Metal vertex
+            // fetch reserves attributes 0..10 (kIRStageInAttributeStartIndex).
+            let attribute_index = attribute.index.checked_add(11)
+                .filter(|&index| index < 31)
+                .ok_or("reflected vertex attribute exceeds Metal vertex-fetch limits")?;
+            resolved.push(ResolvedVertexInput { layout_index: sig.layout_index, attribute_index });
         }
         let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         Ok((Self {
             vertex, pixel, user_data: pixel_host.user_data, dwords, texture_slot, sampler_slot,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
-            color_format: graphics.color_format, renderer: None,
+            color_format: graphics.color_format, renderer: None, input_renderer: None,
         }, resolved))
     }
 
@@ -171,6 +179,82 @@ impl Prepared {
             (Vertices::Position(v), None) => renderer.draw_preserving(v, constants, pixels),
             (Vertices::PositionUv(v), indices) => renderer.draw_uv_preserving(v, indices, constants, pixels),
         }.map_err(|e| e.to_string())?;
+        if let Some(pixels) = depth.as_deref_mut() {
+            renderer.read_depth_pixels(pixels).map_err(|e| e.to_string())?;
+        }
+        if let Some(pixels) = stencil.as_deref_mut() {
+            renderer.stencil_pixels(pixels, false).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Draw using the caller's resolved Metal attributes and input-slot buffers.
+    pub(crate) fn draw_inputs(
+        &mut self,
+        width: u32,
+        height: u32,
+        attributes: &[victory_metal::VertexAttribute],
+        buffers: &[victory_metal::VertexBuffer<'_>],
+        indices: Option<(victory_metal::IndexData<'_>, i32)>,
+        first_vertex: u32,
+        vertex_count: u32,
+        instance_count: u32,
+        start_instance: u32,
+        viewport: [f64; 6],
+        scissor: [u32; 4],
+        mut depth: Option<&mut [f32]>,
+        mut stencil: Option<&mut [u8]>,
+        stencil_reference: u32,
+        constants: &[u32],
+        texture: Option<Texture<'_>>,
+        pixels: &mut [u8],
+        preserve: bool,
+    ) -> Result<(), String> {
+        if self.vertex_stride != 0 {
+            return Err("layout-aware rendering requires a generic input pipeline".into());
+        }
+        if texture.is_some() != self.texture_slot.is_some() {
+            return Err("texture binding does not match pixel shader".into());
+        }
+        if depth.is_some() != self.depth.is_some() {
+            return Err("depth attachment does not match pipeline".into());
+        }
+        let matches_layout = |cached: &[victory_metal::VertexAttribute]| {
+            cached.len() == attributes.len() && cached.iter().zip(attributes).all(|(a, b)| {
+                a.index == b.index && a.format == b.format && a.slot == b.slot
+                    && a.offset == b.offset && a.stride == b.stride
+                    && a.per_instance == b.per_instance && a.step_rate == b.step_rate
+            })
+        };
+        if !matches!(&self.input_renderer, Some((w, h, layout, _))
+            if *w == width && *h == height && matches_layout(layout))
+        {
+            let renderer = victory_metal::Renderer::new_configured_layout(
+                &self.vertex, "main", &self.pixel, "main", width, height,
+                self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
+                self.color_format, attributes,
+            ).map_err(|e| e.to_string())?;
+            self.input_renderer = Some((width, height, attributes.to_vec(), renderer));
+        }
+        let renderer = &mut self.input_renderer.as_mut().unwrap().3;
+        renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
+        if let Some(pixels) = depth.as_deref() {
+            renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
+        }
+        if let Some(pixels) = stencil.as_deref_mut() {
+            renderer.stencil_pixels(pixels, true).map_err(|e| e.to_string())?;
+            renderer.set_stencil_reference(stencil_reference);
+        }
+        if let Some(texture) = texture {
+            renderer.set_fragment_texture_mips(
+                texture.width, texture.height, texture.levels, texture.pixels, texture.filter,
+                texture.format, texture.min_lod, texture.max_lod,
+            ).map_err(|e| e.to_string())?;
+        }
+        renderer.draw_buffers(
+            buffers, indices, first_vertex, vertex_count, instance_count, start_instance,
+            constants, pixels, preserve,
+        ).map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref_mut() {
             renderer.read_depth_pixels(pixels).map_err(|e| e.to_string())?;
         }
@@ -363,8 +447,8 @@ fn vertex_signatures(
         }
         let layout_index = inputs.iter().position(|input| input.semantic_index == index
             && input.semantic.eq_ignore_ascii_case(name)).ok_or("vertex input semantic missing from layout")?;
-        if !matches!(inputs[layout_index].format, 2 | 16 | 34 | 35) {
-            return Err("unsupported vertex input format".into());
+        if !matches!((inputs[layout_index].format, mask), (2, 15) | (16 | 34 | 35, 3)) {
+            return Err("vertex input format does not match signature components".into());
         }
         let reflected_name = format!("{name}{index}");
         if result.iter().any(|other| other.row == row as u8
@@ -506,7 +590,7 @@ fn validate(
                     input.usage == native::Usage::Generic
                         && signatures.iter().any(|s| s.row == input.row && s.mask == input.mask)
                         && input.vgpr >= 4
-                        && u16::from(input.vgpr) + (32 - input.mask.leading_zeros()) as u16 <= p.vgprs
+                        && u16::from(input.vgpr) + (u8::BITS - input.mask.leading_zeros()) as u16 <= 256
                         && inputs[..i].iter().all(|other| {
                             input.row != other.row && (0..4).all(|a| (0..4).all(|b| {
                                 input.mask & (1 << a) == 0 || other.mask & (1 << b) == 0
@@ -539,7 +623,7 @@ fn validate(
                     && !inputs[0].flat && !inputs[0].fp16 && !inputs[0].pack2
                     && input_addr & 2 != 0 && input_addr & !0xf02 == 0,
             } => {}
-        _ => return Err("unsupported native stage inputs or outputs".into()),
+        _ => return Err(format!("unsupported native stage inputs or outputs: {:?}, vgprs {}, signatures {:?}", p.io, p.vgprs, vertex_signatures)),
     }
     let program = ir::build(&p.patched_code(), p.wave64, p.vgprs).map_err(|e| e.to_string())?;
     let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;

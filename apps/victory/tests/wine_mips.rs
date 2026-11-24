@@ -239,3 +239,27 @@ fn launcher_runs_real_depth_stencil() {
         f.assert_host_gone();
     }
 }
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn launcher_runs_flexible_vertex_inputs() {
+    let f = Fixture::new();
+    let exe = f.build("wine_launcher_mips.c");
+    let host = f.tracked_host();
+    for variant in ["--vertex-interleaved","--vertex-instance","--vertex-semantic","--vertex-unorm","--vertex-indexed"] {
+        let mut cmd = f.command(&exe,&host);
+        cmd.arg("--").arg(variant);
+        let out=run(&mut cmd,f.temp.path());
+        assert_eq!(out.status.code(),Some(42),"{variant}: {}\n{}",out.stdout,out.stderr);
+        assert!(out.stdout.contains("D3D12X flexible vertex inputs passed"),"{variant}: {}\n{}",out.stdout,out.stderr);
+        f.assert_host_gone();
+    }
+    for variant in ["--invalid-vertex-range","--invalid-vertex-format","--invalid-vertex-step"] {
+        let mut cmd=f.command(&exe,&host);
+        cmd.arg("--").arg(variant);
+        let out=run(&mut cmd,f.temp.path());
+        assert_eq!(out.status.code(),Some(43),"{variant}: {}\n{}",out.stdout,out.stderr);
+        assert!(out.stdout.contains("rejected"),"{variant}: {}\n{}",out.stdout,out.stderr);
+        f.assert_host_gone();
+    }
+}

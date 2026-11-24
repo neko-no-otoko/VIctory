@@ -1,6 +1,6 @@
 //! Synchronous execution of copied Wine graphics batches on the Metal renderer.
 use std::collections::HashMap;
-use crate::metal_graphics::{GraphicsState, Prepared, Texture, Vertices};
+use crate::metal_graphics::{GraphicsState, Prepared, ResolvedVertexInput, Texture, Vertices};
 use crate::wine_transport::{block_geometry, mip_layout, texture_size, Batch, Command, CopyTexture, Draw, Pipeline, Resource, ResourceKind};
 use victory_metal::{BlendState, ColorFormat, DepthState, IndexData, TextureFilter, TextureFormat};
 use victory_shader::native::RootType;
@@ -60,15 +60,18 @@ fn depth_image(r:&Resource)->Result<(u32,u32),String> {
     let size=texture_size(fmt,width,height,1).ok_or("invalid depth texture dimensions")?;
     if r.bytes.len()!=size {return Err("invalid depth texture size".into())} Ok((width,height))
 }
-fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,Prepared>,d:Draw,stencil_reference:u32)->Result<(),String> {
+fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,(Prepared,Vec<ResolvedVertexInput>)>,d:Draw,stencil_reference:u32)->Result<(),String> {
     let p=pipelines.get(&d.pipeline).ok_or("unknown pipeline")?;
-    if d.instance_count!=1 || d.first_instance!=0 || d.topology!=4 || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride || d.vertex_count==0 || d.vertex_count%3!=0 {return Err("unsupported draw topology, instances or vertex layout".into())}
+    let generic=!p.inputs.is_empty();
+    if d.instance_count==0 || d.topology!=4 || d.vertex_count==0 || d.vertex_count%3!=0
+        || (!generic && (d.instance_count!=1 || d.first_instance!=0 || !d.vertices.is_empty() || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride))
+    {return Err("unsupported draw topology, instances or vertex layout".into())}
     if d.target==d.vertex_buffer || d.texture==Some(d.target) || d.depth==Some(d.target) || d.depth==d.texture && d.depth.is_some() {return Err("draw resource alias is unsupported".into())}
     let target=rs.get(&d.target).ok_or("unknown target")?; let (width,height,color_format)=target_image(target)?;
     if format(p.format)?!=color_format || p.depth.is_some()!=d.depth.is_some() {return Err("pipeline attachment mismatch".into())}
     let vb=rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?; buffer(vb)?;
     let view=range(d.vertex_offset,d.vertex_size as u64,vb.bytes.len())?;
-    let (first,size)=if d.index.is_some() {(0,view.len()/d.vertex_stride as usize*d.vertex_stride as usize)} else {((d.first_vertex as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex offset overflow")?,(d.vertex_count as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex size overflow")?)};
+    let (first,size)=if generic {(0,0)} else if d.index.is_some() {(0,view.len()/d.vertex_stride as usize*d.vertex_stride as usize)} else {((d.first_vertex as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex offset overflow")?,(d.vertex_count as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex size overflow")?)};
     let end=first.checked_add(size).ok_or("vertex range overflow")?; if end>view.len() {return Err("vertex view out of bounds".into())}
     let words:Vec<f32>=vb.bytes[view.start+first..view.start+end].chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect();
     let indices=if let Some(i)=&d.index {
@@ -78,7 +81,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         let start=(i.first as usize).checked_mul(element).ok_or("index offset overflow")?;let len=(d.vertex_count as usize).checked_mul(element).ok_or("index size overflow")?;
         let end=start.checked_add(len).ok_or("index overflow")?;if end>view.len() {return Err("index view out of bounds".into())}
         let bytes=&ib.bytes[view.start+start..view.start+end];
-        let check=|v:u32| {let n=i64::from(v)+i64::from(i.base_vertex);n>=0 && (n as usize)<size/d.vertex_stride as usize};
+        let check=|v:u32| {let n=i64::from(v)+i64::from(i.base_vertex);n>=0 && (generic || (n as usize)<size/d.vertex_stride as usize)};
         if element==2 {let v:Vec<u16>=bytes.chunks_exact(2).map(|b|u16::from_le_bytes(b.try_into().unwrap())).collect();if v.iter().any(|&x|!check(x as u32)) {return Err("index out of bounds".into())} Some(Indices::U16(v))}
         else {let v:Vec<u32>=bytes.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();if v.iter().any(|&x|!check(x)) {return Err("index out of bounds".into())} Some(Indices::U32(v))}
     } else {None};
@@ -86,9 +89,11 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         let depth=if let Some(z)=&p.depth {if !(1..=8).contains(&z.compare) {return Err("unsupported depth comparison".into())} Some(DepthState {write:z.write,compare:z.compare,stencil:z.stencil.as_ref().map(|s|victory_metal::StencilState {enabled:s.enabled,read_mask:s.read_mask,write_mask:s.write_mask,front:s.front,back:s.back})})} else {None};
         if p.blend.write_mask>15 {return Err("invalid blend mask".into())}
         let state=GraphicsState {depth,blend:BlendState {enabled:p.blend.enabled,write_mask:p.blend.write_mask,factors:p.blend.factors},input_uv:p.vertex_stride==24,color_format};
-        prepared.insert(d.pipeline,Prepared::new(&p.vertex_shader,&p.pixel_shader,state)?);
+        let value=if generic { Prepared::new_inputs(&p.vertex_shader,&p.pixel_shader,state,&p.inputs)? }
+            else { (Prepared::new(&p.vertex_shader,&p.pixel_shader,state)?,Vec::new()) };
+        prepared.insert(d.pipeline,value);
     }
-    let prepared=prepared.get_mut(&d.pipeline).unwrap();
+    let (prepared,resolved)=prepared.get_mut(&d.pipeline).unwrap();
     if d.texture_slot!=prepared.texture_slot.map(u32::from) || d.sampler_slot!=prepared.sampler_slot.map(u32::from) || d.texture.is_some()!=prepared.texture_slot.is_some() {return Err("shader texture or sampler slot mismatch".into())}
     let mut constants=vec![0;prepared.dwords];let mut has_constants=false;
     for u in &prepared.user_data {constants[u.index as usize]=match u.root {RootType::Constants=>{has_constants=true;if d.constant_slot!=Some(u.slot as u32) {return Err("constant root slot mismatch".into())} *d.constants.get(u.dword as usize).ok_or("missing root constant")?},RootType::Table=>0,_=>return Err("unsupported root argument".into())};}
@@ -112,7 +117,23 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         Some(Texture {width:view_width,height:view_height,levels:d.mip_count,pixels:&r.bytes[start..end_offset],filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:f,min_lod:0.,max_lod:0.})
     } else {if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())} None};
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
-    let result=if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)};
+    let result=if generic {
+        let legacy_view=crate::wine_transport::VertexView {slot:0,buffer:d.vertex_buffer,offset:d.vertex_offset,size:d.vertex_size,stride:d.vertex_stride};
+        let views=if d.vertices.is_empty() {std::slice::from_ref(&legacy_view)} else {d.vertices.as_slice()};
+        let mut buffers=Vec::with_capacity(views.len());
+        for v in views {
+            let resource=rs.get(&v.buffer).ok_or("unknown vertex buffer")?;buffer(resource)?;
+            let bytes=range(v.offset,u64::from(v.size),resource.bytes.len())?;
+            buffers.push(victory_metal::VertexBuffer {slot:v.slot,bytes:&resource.bytes[bytes]});
+        }
+        let mut attributes=Vec::with_capacity(resolved.len());
+        for r in resolved.iter() {
+            let a=p.inputs.get(r.layout_index).ok_or("invalid reflected vertex input")?;
+            let v=views.iter().find(|v|v.slot==a.slot).ok_or("missing vertex buffer")?;
+            attributes.push(victory_metal::VertexAttribute {index:u32::from(r.attribute_index),format:a.format,slot:a.slot,offset:a.offset,stride:v.stride,per_instance:a.per_instance,step_rate:a.step_rate});
+        }
+        prepared.draw_inputs(width,height,&attributes,&buffers,index,d.first_vertex,d.vertex_count,d.instance_count,d.first_instance,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes,true)
+    } else if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)};
     rs.insert(d.target,target);result?;
     if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;let size=depth.len()*4;for (bytes,value) in r.bytes[..size].chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}if let Some(stencil)=stencil {r.bytes[size..].copy_from_slice(&stencil);}}
     Ok(())
@@ -133,7 +154,9 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
         },
         Command::Clear {target,color}=>{access(&mut rs,&mut touched,target,4)?;let r=rs.get_mut(&target).ok_or("unknown clear target")?;let (w,h,f)=target_image(r)?; victory_metal::clear_color_float(f,w,h,w as usize*4,&mut r.bytes,color,&[]).map_err(|e|e.to_string())?;},
         Command::Draw(d)=>{
-            access(&mut rs,&mut touched,d.target,4)?;access(&mut rs,&mut touched,d.vertex_buffer,1)?;
+            access(&mut rs,&mut touched,d.target,4)?;
+            if d.vertices.is_empty() {access(&mut rs,&mut touched,d.vertex_buffer,1)?;}
+            else {for v in &d.vertices {access(&mut rs,&mut touched,v.buffer,1)?;}}
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}
             if let Some(id)=d.texture {access(&mut rs,&mut touched,id,0x80)?;}
             if let Some(id)=d.depth {access(&mut rs,&mut touched,id,0x10)?;}

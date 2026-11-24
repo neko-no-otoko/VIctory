@@ -403,10 +403,19 @@ and pipeline changes. Committed default-heap resources are limited to
 RGBA8_UNORM and typed BC1/BC3 linear or sRGB sampled textures (including
 multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT or
 D32_FLOAT_S8X24_UINT depth/stencil textures, and buffers.
-Graphics supports POSITION float4, optionally followed by TEXCOORD0
-float2; one color target and optional depth target per draw; the native depth
-comparison/write subset; restricted single-target D3D blending and color write
-masks; and a single sampled texture and point or linear clamp sampler.
+Graphics supports one color target and optional depth target per draw; the
+native depth comparison/write subset; restricted single-target D3D blending
+and color write masks; and a single sampled texture and point or linear clamp
+sampler.
+Vertex input layouts support up to 16 elements and 16 slots, with converter
+reflection mapping semantic names and indices to Metal attributes. Supported
+formats are R32G32B32A32_FLOAT, R32G32_FLOAT, R16G16_FLOAT, and R16G16_UNORM.
+Offsets may be explicit or D3D12_APPEND_ALIGNED_ELEMENT; each slot has a single
+stride and per-vertex or per-instance classification, and per-instance step
+rates must be nonzero. All declared slots must have bounded vertex buffer views.
+Unsupported formats, system-value vertex inputs, invalid layouts, and
+out-of-range fetches are rejected. This is not general D3D12 vertex input
+support.
 Shader constants must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
