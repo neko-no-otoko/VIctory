@@ -235,10 +235,10 @@ does not establish game compatibility or ARM-native PE execution.
 
 ## Experimental Wine D3D12.X-to-Metal proxy
 
-The opt-in proxy keeps the Windows D3D12.X HLE objects and vtables inside the
-Wine PE process. It copies bounded shader, buffer, constant and dispatch data
-over authenticated loopback TCP to a separate x86-64 macOS host, which uses
-VIctory's Metal compute path and synchronously copies the result back. No
+The opt-in proxy keeps D3D12.X HLE objects and vtables inside the Wine PE
+process. It copies bounded, ordered resource and command data over
+authenticated loopback TCP to a separate x86-64 macOS host, which uses
+VIctory's Metal paths and synchronously copies results back. No
 guest pointers or COM objects cross the process boundary. Wine and the native
 host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
 execution. This is a trusted-workload experiment, not a process sandbox.
@@ -304,25 +304,42 @@ configured; these results are not evidence of game compatibility.
 
 ### Restricted offscreen graphics
 
-The same opt-in service supports one full clear, one nonindexed triangle,
-one render-target-to-copy-source transition, and one full texture-to-buffer
-copy to a mapped readback buffer. The pipeline stream must have the exact
-224-byte POSITION-float4/RGBA8_UNORM layout used by the fixture; it uses a
-single RTV, full-target viewport and scissor, triangle-list topology, and
-contiguous initialized pixel shader root constants at slot 3. The translated
-console vertex and pixel shaders are converted by Apple Metal Shader Converter
-and the actual Metal pixels return through the guest buffer; row pitch must be
-256-byte aligned and copy offset 512-byte aligned. Texture sampling, depth,
-blending, indexed and instanced draws, multiple draws or render targets,
-presentation, and other pipeline or resource states are unsupported.
+Graphics submissions carry ID-keyed resources and pipelines and an ordered
+command stream. The proxy retains guest objects referenced by recorded
+commands, snapshots their data when the queue executes, and writes the
+resulting bytes and resource states back after the host completes. All proxy
+queue submissions are serialized and synchronous; this is not asynchronous
+fence or cross-process shared-memory support.
 
-On the M3 Max with Wine 11 and the Apple converter, the TLS-bearing fixture
-passed its thread/callback checks and read back a red triangle pixel
-`(191,0,0,255)`, the clear pixel `(64,128,255,0)`, and unchanged row padding.
-An invalid-topology variant was rejected at command-list close. The Wine
-compute bridge (including wrong-token rejection) and the native graphics
-fixture also passed their focused regressions. These synthetic results do not
-establish arbitrary TLS instruction support or game compatibility.
+The supported subset includes multiple full color/depth clears, buffer copies,
+full texture uploads and readbacks, resource transitions, and multiple
+nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
+and pipeline changes. Committed default-heap resources are limited to
+single-mip RGBA8_UNORM color/sampled textures, D32_FLOAT depth textures, and
+buffers. Graphics supports POSITION float4, optionally followed by TEXCOORD0
+float2; one color target and optional depth target per draw; the native depth
+comparison/write subset; source-alpha blending and color write masks; and a
+single sampled texture and point or linear clamp sampler. Shader constants
+must be contiguous and use one root slot. Texture copy row pitch is
+256-byte aligned and buffer offset is 512-byte aligned.
+
+This remains restricted: no presentation, asynchronous fences, partial clears,
+multi-mip or tiled textures, BGRA/sRGB/BC formats through this proxy, stencil,
+arbitrary sampler/address modes, or general D3D12 resource or pipeline states.
+Unsupported combinations fail or trap rather than being ignored. Limits are
+4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
+and 64 MiB per request. Shader translation and drawing use the existing
+native Metal path, not MetalVulkan.
+
+On an M3 Max with Wine 11 and the Apple converter, the compiled TLS-bearing
+guest uploaded two textures, sampled them in multiple draws across two
+submissions, and verified changed and preserved pixels, row padding, and
+recorded-resource lifetime. The indexed, depth and blending fixtures passed
+their pixel/readback checks and rejected invalid cases. A separate guest
+verified perspective-interpolated UVs and linear filtering of a nonuniform
+texture. The original Wine graphics and compute tests and native graphics
+regression also passed. These synthetic results do not establish arbitrary
+TLS or game compatibility.
 
 Using the import libraries built above, build both the valid and invalid-state
 TLS fixtures:
@@ -344,4 +361,76 @@ export VICTORY_TEST_D3D12X_TLS_GRAPHICS_PE="$(winepath -w /tmp/victory-wine-hle-
 export VICTORY_TEST_D3D12X_TLS_GRAPHICS_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/graphics-invalid.exe)"
 CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
   --test wine_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
+```
+
+Build and run the ordered TLS guest and its invalid-topology variant:
+
+```sh
+for variant in valid invalid; do
+  flags=
+  [ "$variant" = invalid ] && flags=-DINVALID_GRAPHICS_TOPOLOGY
+  x86_64-w64-mingw32-clang -O2 -fno-emulated-tls $flags \
+    -c tests/fixtures/windows_d3d12x_ordered_graphics.c \
+    -o "/tmp/victory-wine-hle-tls/ordered-$variant.obj"
+  lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /include:_tls_used \
+    "/out:/tmp/victory-wine-hle-tls/ordered-$variant.exe" \
+    "/tmp/victory-wine-hle-tls/ordered-$variant.obj" \
+    /tmp/victory-wine-hle-tls/kernel32.lib /tmp/victory-wine-hle-tls/d3d12_xs.lib \
+    "$LLVM_MINGW/x86_64-w64-mingw32/lib/libmingw32.a"
+done
+export VICTORY_TEST_D3D12X_ORDERED_GRAPHICS_PE="$(winepath -w /tmp/victory-wine-hle-tls/ordered-valid.exe)"
+export VICTORY_TEST_D3D12X_ORDERED_GRAPHICS_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/ordered-invalid.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test wine_ordered_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
+```
+
+The separate indexed, depth and blending fixtures use the same D3D12.X import
+library and service:
+
+```sh
+for feature in indexed depth blend; do
+  case "$feature" in
+    indexed) invalid=INVALID_GRAPHICS_TOPOLOGY ;;
+    depth) invalid=INVALID_DEPTH_CLEAR ;;
+    blend) invalid=INVALID_BLEND_STATE ;;
+  esac
+  for variant in valid invalid; do
+    flags=
+    [ "$variant" = invalid ] && flags="-D$invalid"
+    x86_64-w64-mingw32-clang -O2 $flags \
+      -c "tests/fixtures/windows_d3d12x_${feature}_graphics.c" \
+      -o "/tmp/victory-wine-hle-tls/$feature-$variant.obj"
+    lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /dynamicbase \
+      "/out:/tmp/victory-wine-hle-tls/$feature-$variant.exe" \
+      "/tmp/victory-wine-hle-tls/$feature-$variant.obj" \
+      /tmp/victory-wine-hle-tls/d3d12_xs.lib
+  done
+done
+export VICTORY_TEST_D3D12X_INDEXED_PE="$(winepath -w /tmp/victory-wine-hle-tls/indexed-valid.exe)"
+export VICTORY_TEST_D3D12X_INDEXED_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/indexed-invalid.exe)"
+export VICTORY_TEST_D3D12X_DEPTH_PE="$(winepath -w /tmp/victory-wine-hle-tls/depth-valid.exe)"
+export VICTORY_TEST_D3D12X_DEPTH_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/depth-invalid.exe)"
+export VICTORY_TEST_D3D12X_BLEND_PE="$(winepath -w /tmp/victory-wine-hle-tls/blend-valid.exe)"
+export VICTORY_TEST_D3D12X_BLEND_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/blend-invalid.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test wine_extended_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
+```
+
+For the independent UV/linear-filter fixture:
+
+```sh
+for variant in valid invalid; do
+  flags=
+  [ "$variant" = invalid ] && flags=-DINVALID_UV_TOPOLOGY
+  x86_64-w64-mingw32-clang -O2 $flags \
+    -c tests/fixtures/windows_d3d12x_uv_graphics.c \
+    -o "/tmp/victory-wine-hle-tls/uv-$variant.obj"
+  lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /dynamicbase \
+    "/out:/tmp/victory-wine-hle-tls/uv-$variant.exe" \
+    "/tmp/victory-wine-hle-tls/uv-$variant.obj" /tmp/victory-wine-hle-tls/d3d12_xs.lib
+done
+export VICTORY_TEST_D3D12X_UV_PE="$(winepath -w /tmp/victory-wine-hle-tls/uv-valid.exe)"
+export VICTORY_TEST_D3D12X_UV_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/uv-invalid.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test wine_uv_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
 ```

@@ -61,6 +61,11 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+pub mod wine_transport;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod wine_graphics;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub use wine_graphics::execute_wine_batch;
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub use metal::WineMetalCompute;

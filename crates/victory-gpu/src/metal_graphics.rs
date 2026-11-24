@@ -3,10 +3,10 @@ use std::ffi::CStr;
 use victory_shader::{Container, FourCC, HwStage, emit, io, ir, native, resource};
 #[derive(Clone, Copy)]
 pub(crate) struct GraphicsState {
-    depth: Option<victory_metal::DepthState>,
-    blend: victory_metal::BlendState,
-    input_uv: bool,
-    color_format: victory_metal::ColorFormat,
+    pub(crate) depth: Option<victory_metal::DepthState>,
+    pub(crate) blend: victory_metal::BlendState,
+    pub(crate) input_uv: bool,
+    pub(crate) color_format: victory_metal::ColorFormat,
 }
 
 

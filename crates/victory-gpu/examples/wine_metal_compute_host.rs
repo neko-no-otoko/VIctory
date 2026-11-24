@@ -105,7 +105,7 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 3) {
             return Err("invalid protocol header".into());
         }
         if fields[1] == 1 {
@@ -117,6 +117,11 @@ mod host {
                 return Err("invalid request lengths or dispatch dimensions".into());
             }
         }
+        if fields[1] == 3 && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
+            || fields[3..].iter().any(|&v| v != 0))
+        {
+            return Err("invalid batch request length or reserved fields".into());
+        }
         let mut supplied_token = [0; 16];
         stream.read_exact(&mut supplied_token).map_err(|e| e.to_string())?;
         if supplied_token.iter().zip(expected_token).fold(0u8, |diff, (a, b)| diff | (a ^ b)) != 0 {
@@ -125,6 +130,13 @@ mod host {
         match fields[1] {
             1 => compute_request(stream, fields, cache),
             2 => graphics_request(stream, fields),
+            3 => {
+                let mut payload = vec![0; fields[2] as usize];
+                stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+                let batch = victory_gpu::wine_transport::decode_batch(&payload)?;
+                let results = victory_gpu::execute_wine_batch(batch)?;
+                victory_gpu::wine_transport::encode_results(&results)
+            }
             _ => unreachable!(),
         }
     }
