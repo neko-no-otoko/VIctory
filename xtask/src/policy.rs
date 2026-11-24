@@ -18,6 +18,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 ];
 const ALLOWED_NAMES: &[&str] = &[
     "d3d12-probe.c",
+    "rosetta-avx-probe.c",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
