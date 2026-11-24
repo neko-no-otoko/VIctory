@@ -9,7 +9,7 @@
 //! support single-link regular files, not directories or case-only renames.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -36,6 +36,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_NAME: u32 = 123;
 const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_NO_MORE_FILES: u32 = 18;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
 const INVALID_HANDLE: usize = usize::MAX;
 
@@ -43,6 +44,7 @@ struct Context {
     root: File,
     save: Option<File>,
     handles: HashMap<usize, GuestFile>,
+    searches: HashMap<usize, std::vec::IntoIter<FindData>>,
 }
 
 struct GuestFile {
@@ -100,7 +102,7 @@ impl FileScope {
             } else {
                 None
             };
-            *slot = Some(Context { root: root_file, save: save_file, handles: HashMap::new() });
+            *slot = Some(Context { root: root_file, save: save_file, handles: HashMap::new(), searches: HashMap::new() });
             Ok(Self { _thread_bound: PhantomData })
         })
     }
@@ -123,6 +125,10 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
         "CreateDirectoryW" => create_directory_w as *const () as usize,
         "MoveFileExW" => move_file_ex_w as *const () as usize,
         "DeleteFileW" => delete_file_w as *const () as usize,
+        "GetFileAttributesExW" => get_file_attributes_ex_w as *const () as usize,
+        "FindFirstFileW" => find_first_file_w as *const () as usize,
+        "FindNextFileW" => find_next_file_w as *const () as usize,
+        "FindClose" => find_close as *const () as usize,
         "ReadFile" => read_file as *const () as usize,
         "WriteFile" => write_file as *const () as usize,
         "FlushFileBuffers" => flush_file_buffers as *const () as usize,
@@ -641,6 +647,229 @@ extern "win64" fn close_handle(handle: usize) -> i32 {
     if closed { 1 } else { fail(ERROR_INVALID_HANDLE); 0 }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime { low: u32, high: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AttributeData {
+    attributes: u32,
+    creation: FileTime,
+    access: FileTime,
+    write: FileTime,
+    size_high: u32,
+    size_low: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FindData {
+    attributes: u32,
+    creation: FileTime,
+    access: FileTime,
+    write: FileTime,
+    size_high: u32,
+    size_low: u32,
+    reserved: [u32; 2],
+    name: [u16; 260],
+    alternate_name: [u16; 14],
+}
+
+fn file_time(seconds: i64, nanos: i64) -> Result<FileTime, u32> {
+    if !(0..1_000_000_000).contains(&nanos) { return Err(ERROR_INVALID_DATA); }
+    let ticks = (i128::from(seconds) + 11_644_473_600) * 10_000_000 + i128::from(nanos / 100);
+    let ticks = u64::try_from(ticks).map_err(|_| ERROR_INVALID_DATA)?;
+    Ok(FileTime { low: ticks as u32, high: (ticks >> 32) as u32 })
+}
+
+fn attributes(stat: &libc::stat) -> Result<AttributeData, u32> {
+    let kind = stat.st_mode & libc::S_IFMT;
+    let attributes = match kind {
+        libc::S_IFREG => 0x80,
+        libc::S_IFDIR => 0x10,
+        libc::S_IFLNK => return Err(ERROR_ACCESS_DENIED),
+        _ => return Err(ERROR_NOT_SUPPORTED),
+    };
+    let size = if kind == libc::S_IFDIR { 0 } else {
+        u64::try_from(stat.st_size).map_err(|_| ERROR_INVALID_DATA)?
+    };
+    Ok(AttributeData {
+        attributes,
+        creation: file_time(stat.st_birthtime, stat.st_birthtime_nsec)?,
+        access: file_time(stat.st_atime, stat.st_atime_nsec)?,
+        write: file_time(stat.st_mtime, stat.st_mtime_nsec)?,
+        size_high: (size >> 32) as u32,
+        size_low: size as u32,
+    })
+}
+
+fn stat_at(parent: &File, name: &CStr) -> Result<libc::stat, u32> {
+    let mut stat = std::mem::MaybeUninit::uninit();
+    if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(error_code(&io::Error::last_os_error(), false));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn find_record(name: &CStr, stat: &libc::stat) -> Result<FindData, u32> {
+    let data = attributes(stat)?;
+    let name = name.to_str().map_err(|_| ERROR_INVALID_NAME)?;
+    let mut wide = [0; 260];
+    let mut length = 0;
+    for unit in name.encode_utf16() {
+        if length == wide.len() - 1 { return Err(ERROR_INVALID_NAME); }
+        wide[length] = unit;
+        length += 1;
+    }
+    Ok(FindData {
+        attributes: data.attributes, creation: data.creation, access: data.access,
+        write: data.write, size_high: data.size_high, size_low: data.size_low,
+        reserved: [0; 2], name: wide, alternate_name: [0; 14],
+    })
+}
+
+// Match CreateFileW's drive aliases, including T: mapping to game without a save root.
+fn discovery_root<'a>(context: &'a Context, path: &'a str) -> Result<(&'a File, &'a str, bool), u32> {
+    let bytes = path.as_bytes();
+    let (drive, relative) = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        if bytes.get(2).is_none_or(|b| !matches!(b, b'/' | b'\\')) { return Err(ERROR_ACCESS_DENIED); }
+        (Some(bytes[0].to_ascii_uppercase()), &path[3..])
+    } else { (None, path) };
+    let save = drive == Some(b'T') && context.save.is_some();
+    Ok((if save { context.save.as_ref().unwrap() } else { &context.root }, relative, save))
+}
+
+fn discovery_parent(root: &File, path: &str) -> Result<(File, CString), u32> {
+    if path.split(['/', '\\']).any(|part| part.contains(['*', '?'])) { return Err(ERROR_NOT_SUPPORTED); }
+    save_parent(root, path)
+}
+
+unsafe extern "win64" fn get_file_attributes_ex_w(path: *const u16, level: u32, output: *mut AttributeData) -> i32 {
+    if level != 0 { fail(ERROR_NOT_SUPPORTED); return 0; }
+    if output.is_null() { fail(ERROR_INVALID_PARAMETER); return 0; }
+    let result = unsafe { guest_path(path) }.and_then(|path| CONTEXT.with(|slot| {
+        let slot = slot.borrow();
+        if path.is_empty() { return Err(ERROR_INVALID_NAME); }
+        let context = slot.as_ref().ok_or(ERROR_INVALID_HANDLE)?;
+        let (root, relative, save) = discovery_root(context, &path)?;
+        let _lock = if save { Some(lock_save(root)?) } else { None };
+        let stat = if relative.is_empty() {
+            stat_at(root, c".")?
+        } else {
+            let (parent, name) = discovery_parent(root, relative)?;
+            let name = selected_name(&parent, &name)?.ok_or(ERROR_FILE_NOT_FOUND)?;
+            stat_at(&parent, &name)?
+        };
+        attributes(&stat)
+    }));
+    match result {
+        Ok(data) => { unsafe { output.write(data); } 1 }
+        Err(code) => { fail(code); 0 }
+    }
+}
+
+fn collect_matches(root: &File, path: &str) -> Result<Vec<FindData>, u32> {
+    if path.is_empty() { return Err(ERROR_INVALID_NAME); }
+    if path.starts_with(['/', '\\']) || path.contains(':') { return Err(ERROR_ACCESS_DENIED); }
+    if path.split(['/', '\\']).any(|part| part.is_empty() || part == "." || part == "..") {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    let (directory, pattern) = match path.rsplit_once(['/', '\\']) {
+        Some((dir, pattern)) => (dir, pattern),
+        None => ("", path),
+    };
+    if directory.contains(['*', '?']) || pattern.contains('?') { return Err(ERROR_NOT_SUPPORTED); }
+    let wildcard = pattern.contains('*');
+    let prefix = if pattern == "*" || pattern == "*.*" { "" }
+        else if let Some(prefix) = pattern.strip_suffix('*') {
+            if prefix.contains('*') || prefix.ends_with('.') { return Err(ERROR_NOT_SUPPORTED); }
+            prefix
+        } else {
+            if wildcard { return Err(ERROR_NOT_SUPPORTED); }
+            pattern
+        };
+    if pattern.is_empty() { return Err(ERROR_INVALID_NAME); }
+    let probe = if directory.is_empty() { "__find_probe__".to_owned() } else { format!("{directory}/__find_probe__") };
+    let (parent, _) = discovery_parent(root, &probe)?;
+    if !wildcard {
+        let name = find_component(&parent, pattern, false)?;
+        return Ok(vec![find_record(&name, &stat_at(&parent, &name)?)?]);
+    }
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(error_code(&io::Error::last_os_error(), true)); }
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd); }
+        return Err(error_code(&error, true));
+    }
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory { fn drop(&mut self) { unsafe { libc::closedir(self.0); } } }
+    let dir = Directory(dir);
+    let mut records = Vec::new();
+    let mut names = HashSet::new();
+    loop {
+        unsafe { *libc::__error() = 0; }
+        let entry = unsafe { libc::readdir(dir.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) { return Err(error_code(&error, true)); }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." || bytes.len() < prefix.len()
+            || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) { continue; }
+        let stat = stat_at(&parent, name)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK { continue; }
+        if !names.insert(bytes.to_ascii_lowercase()) { return Err(ERROR_DUP_NAME); }
+        records.push(find_record(name, &stat)?);
+    }
+    if records.is_empty() { return Err(ERROR_FILE_NOT_FOUND); }
+    Ok(records)
+}
+
+unsafe extern "win64" fn find_first_file_w(path: *const u16, output: *mut FindData) -> usize {
+    if output.is_null() { fail(ERROR_INVALID_PARAMETER); return INVALID_HANDLE; }
+    let result = unsafe { guest_path(path) }.and_then(|path| CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let context = slot.as_mut().ok_or(ERROR_INVALID_HANDLE)?;
+        let (root, relative, save) = discovery_root(context, &path)?;
+        let _lock = if save { Some(lock_save(root)?) } else { None };
+        let mut records = collect_matches(root, relative)?.into_iter();
+        let first = records.next().ok_or(ERROR_FILE_NOT_FOUND)?;
+        drop(_lock);
+        let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            (value != INVALID_HANDLE).then(|| value + 1)
+        }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        context.searches.insert(handle, records);
+        Ok((handle, first))
+    }));
+    match result {
+        Ok((handle, data)) => { unsafe { output.write(data); } handle }
+        Err(code) => { fail(code); INVALID_HANDLE }
+    }
+}
+
+unsafe extern "win64" fn find_next_file_w(handle: usize, output: *mut FindData) -> i32 {
+    if output.is_null() { fail(ERROR_INVALID_PARAMETER); return 0; }
+    let result = CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let search = slot.as_mut().and_then(|c| c.searches.get_mut(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
+        search.next().ok_or(ERROR_NO_MORE_FILES)
+    });
+    match result {
+        Ok(data) => { unsafe { output.write(data); } 1 }
+        Err(code) => { fail(code); 0 }
+    }
+}
+
+extern "win64" fn find_close(handle: usize) -> i32 {
+    let closed = CONTEXT.with(|slot| slot.borrow_mut().as_mut().and_then(|c| c.searches.remove(&handle)).is_some());
+    if closed { 1 } else { fail(ERROR_INVALID_HANDLE); 0 }
+}
+
 extern "win64" fn get_last_error() -> u32 { LAST_ERROR.with(Cell::get) }
 extern "win64" fn set_last_error(code: u32) { LAST_ERROR.with(|error| error.set(code)); }
 
@@ -657,6 +886,104 @@ mod tests {
     unsafe fn open(path: &str) -> usize {
         // SAFETY: the UTF-16 buffer stays alive for the call.
         unsafe { create_file_w(wide(path).as_ptr(), 0x8000_0000, 1, null(), 3, 0x80, null_mut()) }
+    }
+
+    #[test]
+    fn discovery_layout_and_timestamps() {
+        assert_eq!(std::mem::size_of::<AttributeData>(), 36);
+        assert_eq!(std::mem::size_of::<FindData>(), 592);
+        assert_eq!(std::mem::offset_of!(FindData, name), 44);
+        assert_eq!(std::mem::offset_of!(FindData, alternate_name), 564);
+        let epoch = file_time(0, 123_456_789).unwrap();
+        assert_eq!((u64::from(epoch.high) << 32) | u64::from(epoch.low), 116_444_736_001_234_567);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("é😀.dat"), b"12345").unwrap();
+        let _scope = FileScope::enter(dir.path()).unwrap();
+        unsafe {
+            let mut attrs = AttributeData::default();
+            set_last_error(1234);
+            assert_eq!(get_file_attributes_ex_w(wide("é😀.DAT").as_ptr(), 0, &mut attrs), 1);
+            assert_eq!(get_last_error(), 1234);
+            assert_eq!((attrs.attributes, attrs.size_high, attrs.size_low), (0x80, 0, 5));
+            let metadata = std::fs::metadata(dir.path().join("é😀.dat")).unwrap();
+            let expected = file_time(metadata.mtime(), metadata.mtime_nsec()).unwrap();
+            assert_eq!((attrs.write.low, attrs.write.high), (expected.low, expected.high));
+            let mut record = std::mem::MaybeUninit::<FindData>::uninit();
+            let h = find_first_file_w(wide("é😀.dat").as_ptr(), record.as_mut_ptr());
+            assert_ne!(h, INVALID_HANDLE);
+            let record = record.assume_init();
+            assert_eq!(&record.name[..wide("é😀.dat").len()], wide("é😀.dat"));
+            assert_eq!(record.alternate_name, [0; 14]);
+            assert_eq!(record.size_low, 5);
+            assert_eq!(find_close(h), 1);
+            assert_eq!(get_file_attributes_ex_w(wide("C:\\").as_ptr(), 0, &mut attrs), 1);
+            assert_eq!(attrs.attributes, 0x10);
+            assert_eq!((attrs.size_high, attrs.size_low), (0, 0));
+            assert_eq!(get_file_attributes_ex_w(wide("é😀.dat").as_ptr(), 1, &mut attrs), 0);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            assert_eq!(get_file_attributes_ex_w(wide("é😀.dat").as_ptr(), 0, null_mut()), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn discovery_patterns_handles_roots_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(game.join("Alpha"), b"game").unwrap();
+        std::fs::write(game.join("Alpine"), b"data").unwrap();
+        std::fs::write(save.join("Alpha"), b"save!").unwrap();
+        symlink("Alpha", game.join("Alink")).unwrap();
+        let scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            let mut data = std::mem::MaybeUninit::<FindData>::uninit();
+            for pattern in ["a?", "a*b", "**", "a*.*", "a.*", "*\\x"] {
+                assert_eq!(find_first_file_w(wide(pattern).as_ptr(), data.as_mut_ptr()), INVALID_HANDLE);
+                assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            }
+            for pattern in ["Alink", "C:\\Alink"] {
+                assert_eq!(find_first_file_w(wide(pattern).as_ptr(), data.as_mut_ptr()), INVALID_HANDLE);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            }
+            let mut attrs = AttributeData::default();
+            assert_eq!(get_file_attributes_ex_w(wide("Alink").as_ptr(), 0, &mut attrs), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(get_file_attributes_ex_w(wide("T:\\alpha").as_ptr(), 0, &mut attrs), 1);
+            assert_eq!(attrs.size_low, 5);
+            set_last_error(456);
+            let h = find_first_file_w(wide("aL*").as_ptr(), data.as_mut_ptr());
+            assert_ne!(h, INVALID_HANDLE);
+            assert_eq!(get_last_error(), 456);
+            assert_eq!(close_handle(h), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(find_next_file_w(h, data.as_mut_ptr()), 1);
+            assert_eq!(find_next_file_w(h, data.as_mut_ptr()), 0);
+            assert_eq!(get_last_error(), ERROR_NO_MORE_FILES);
+            assert_eq!(find_close(h), 1);
+            assert_eq!(find_close(h), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            let h = find_first_file_w(wide("*.*").as_ptr(), data.as_mut_ptr());
+            assert_ne!(h, INVALID_HANDLE);
+            drop(scope);
+            let _scope = FileScope::enter(&game).unwrap();
+            assert_eq!(find_close(h), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(get_file_attributes_ex_w(wide("T:\\alpha").as_ptr(), 0, &mut attrs), 1);
+            assert_eq!(attrs.size_low, 4);
+            assert_eq!(find_first_file_w(wide("missing\\*").as_ptr(), data.as_mut_ptr()), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_PATH_NOT_FOUND);
+            assert_eq!(find_first_file_w(wide("absent*").as_ptr(), data.as_mut_ptr()), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_FILE_NOT_FOUND);
+            assert_eq!(find_next_file_w(h, data.as_mut_ptr()), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            let root = OpenOptions::new().read(true).open(&game).unwrap();
+            let stat = stat_at(&root, c".").unwrap();
+            let too_long = CString::new("x".repeat(260)).unwrap();
+            assert!(matches!(find_record(&too_long, &stat), Err(ERROR_INVALID_NAME)));
+        }
     }
 
     #[test]

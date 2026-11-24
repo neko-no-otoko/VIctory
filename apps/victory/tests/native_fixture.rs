@@ -588,3 +588,164 @@ unsigned entry(void) {
     assert_eq!(std::fs::read(game.join("game.bin")).unwrap(), b"game");
     assert_eq!(std::fs::read(dir.path().join("outside.bin")).unwrap(), b"outside");
 }
+
+#[test]
+fn native_fixture_discovers_scoped_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    let save = dir.path().join("save");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::create_dir(&save).unwrap();
+    std::fs::create_dir(game.join("Folder")).unwrap();
+    std::fs::write(game.join("Folder").join("child"), b"child").unwrap();
+    std::fs::write(game.join("Alpha.bin"), b"12345").unwrap();
+    std::fs::write(game.join("café😀.txt"), b"unicode").unwrap();
+    std::fs::write(save.join("Save.dat"), b"save data").unwrap();
+    std::fs::create_dir(save.join("Saves")).unwrap();
+    std::fs::write(dir.path().join("outside"), b"outside").unwrap();
+    for root in [&game, &save] {
+        std::os::unix::fs::symlink(dir.path().join("outside"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("dirlink")).unwrap();
+    }
+    let modified = std::fs::metadata(game.join("Alpha.bin")).unwrap().modified().unwrap()
+        .duration_since(std::time::UNIX_EPOCH).unwrap();
+    let filetime = 116_444_736_000_000_000u64 + modified.as_secs() * 10_000_000
+        + u64::from(modified.subsec_nanos()) / 100;
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nGetFileAttributesExW\nFindFirstFileW\nFindNextFileW\nFindClose\nCloseHandle\nGetLastError\n").unwrap();
+    let source = r#"
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef int BOOL;
+typedef unsigned short WCHAR;
+typedef struct { DWORD low, high; } FILETIME;
+typedef struct {
+    DWORD attributes;
+    FILETIME creation, access, write;
+    DWORD size_high, size_low;
+} ATTR_DATA;
+typedef struct {
+    DWORD attributes;
+    FILETIME creation, access, write;
+    DWORD size_high, size_low, reserved0, reserved1;
+    WCHAR name[260], alternate[14];
+} FIND_DATA;
+typedef char attr_size_check[sizeof(ATTR_DATA) == 36 ? 1 : -1];
+typedef char find_size_check[sizeof(FIND_DATA) == 592 ? 1 : -1];
+__declspec(dllimport) BOOL GetFileAttributesExW(const WCHAR *, int, void *);
+__declspec(dllimport) HANDLE FindFirstFileW(const WCHAR *, FIND_DATA *);
+__declspec(dllimport) BOOL FindNextFileW(HANDLE, FIND_DATA *);
+__declspec(dllimport) BOOL FindClose(HANDLE);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) DWORD GetLastError(void);
+#define W(s) ((const WCHAR *)L##s)
+#define INVALID ((HANDLE)-1)
+#define DIR 0x10
+int marker = 7; int *volatile relocated_marker = &marker;
+static int equal(const WCHAR *a, const WCHAR *b) {
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+static unsigned long long ticks(FILETIME t) {
+    return ((unsigned long long)t.high << 32) | t.low;
+}
+static int game_record(FIND_DATA *d) {
+    if (equal(d->name, W("Alpha.bin")))
+        return !(d->attributes & DIR) && !d->size_high && d->size_low == 5 &&
+               ticks(d->write) == @FILETIME@ULL && ticks(d->creation) && ticks(d->access) ? 1 : -1;
+    if (equal(d->name, W("caf\u00e9\U0001f600.txt")))
+        return !(d->attributes & DIR) && !d->size_high && d->size_low == 7 ? 2 : -1;
+    if (equal(d->name, W("Folder")))
+        return (d->attributes & DIR) && !d->size_high && !d->size_low ? 4 : -1;
+    return -1;
+}
+static int save_record(FIND_DATA *d) {
+    if (equal(d->name, W("Save.dat")))
+        return !(d->attributes & DIR) && !d->size_high && d->size_low == 9 ? 1 : -1;
+    if (equal(d->name, W("Saves")))
+        return (d->attributes & DIR) && !d->size_high && !d->size_low ? 2 : -1;
+    return -1;
+}
+static int enumerate(const WCHAR *pattern, int save, int expected) {
+    FIND_DATA d;
+    HANDLE h = FindFirstFileW(pattern, &d);
+    int seen = 0, bit;
+    if (h == INVALID || !h) return 0;
+    do {
+        bit = save ? save_record(&d) : game_record(&d);
+        if (bit < 0 || (seen & bit)) { FindClose(h); return 0; }
+        seen |= bit;
+    } while (FindNextFileW(h, &d));
+    if (GetLastError() != 18 || seen != expected) { FindClose(h); return 0; }
+    if (FindNextFileW(h, &d) || GetLastError() != 18) { FindClose(h); return 0; }
+    if (!FindClose(h)) return 0;
+    if (FindClose(h) || GetLastError() != 6) return 0;
+    if (FindNextFileW(h, &d) || GetLastError() != 6) return 0;
+    return 1;
+}
+unsigned entry(void) {
+    ATTR_DATA a;
+    FIND_DATA d;
+    HANDLE h, other;
+    if (*relocated_marker != 7) return 1;
+    if (!GetFileAttributesExW(W("c:\\aLPHA.BIN"), 0, &a) ||
+        (a.attributes & DIR) || a.size_high || a.size_low != 5 ||
+        ticks(a.write) != @FILETIME@ULL || !ticks(a.creation) || !ticks(a.access)) return 2;
+    if (!GetFileAttributesExW(W("C:\\folder"), 0, &a) ||
+        !(a.attributes & DIR) || a.size_high || a.size_low) return 3;
+    if (!GetFileAttributesExW(W("T:\\sAVE.DAT"), 0, &a) ||
+        (a.attributes & DIR) || a.size_high || a.size_low != 9) return 4;
+    if (!GetFileAttributesExW(W("T:\\saves"), 0, &a) || !(a.attributes & DIR)) return 5;
+    if (!GetFileAttributesExW(W("caf\u00e9\U0001f600.txt"), 0, &a) || a.size_low != 7) return 6;
+    if (GetFileAttributesExW(W("caf\u00c9\U0001f600.txt"), 0, &a) || GetLastError() != 2) return 7;
+    if (GetFileAttributesExW(W("Alpha.bin"), 1, &a) || GetLastError() != 50) return 8;
+    if (!enumerate(W("C:\\*"), 0, 7)) return 9;
+    if (!enumerate(W("C:\\*.*"), 0, 7)) return 10;
+    if (!enumerate(W("c:\\aL*"), 0, 1)) return 11;
+    if (!enumerate(W("C:\\ALPHA.BIN"), 0, 1)) return 12;
+    if (!enumerate(W("T:\\*"), 1, 3)) return 13;
+    if (!enumerate(W("T:\\*.*"), 1, 3)) return 14;
+    if (!enumerate(W("t:\\save.d*"), 1, 1)) return 15;
+    h = FindFirstFileW(W("C:\\no-match*"), &d);
+    if (h != INVALID || GetLastError() != 2) return 16;
+    h = FindFirstFileW(W("C:\\a?pha.bin"), &d);
+    if (h != INVALID || GetLastError() != 50) return 17;
+    h = FindFirstFileW(W("C:\\*pha*"), &d);
+    if (h != INVALID || GetLastError() != 50) return 18;
+    h = FindFirstFileW(W("C:\\Fol*\\child"), &d);
+    if (h != INVALID || GetLastError() != 50) return 19;
+    h = FindFirstFileW(W("T:\\sa?e*"), &d);
+    if (h != INVALID || GetLastError() != 50) return 20;
+    if (GetFileAttributesExW(W("C:\\link"), 0, &a) || GetLastError() != 5) return 21;
+    h = FindFirstFileW(W("C:\\link"), &d);
+    if (h != INVALID || GetLastError() != 5) return 22;
+    h = FindFirstFileW(W("T:\\link"), &d);
+    if (h != INVALID || GetLastError() != 5) return 23;
+    if (GetFileAttributesExW(W("T:\\dirlink\\outside"), 0, &a) || GetLastError() != 5) return 24;
+    h = FindFirstFileW(W("C:\\dirlink\\*"), &d);
+    if (h != INVALID || GetLastError() != 5) return 25;
+    if (GetFileAttributesExW(W("C:\\..\\outside"), 0, &a) || GetLastError() != 5) return 26;
+    h = FindFirstFileW(W("T:\\..\\*"), &d);
+    if (h != INVALID || GetLastError() != 5) return 27;
+    h = FindFirstFileW(W("C:\\Alpha.bin"), &d);
+    if (h == INVALID || !h) return 28;
+    if (CloseHandle(h) || GetLastError() != 6) return 29;
+    if (!FindClose(h)) return 30;
+    if (FindClose((HANDLE)12345) || GetLastError() != 6) return 31;
+    h = FindFirstFileW(W("C:\\*"), &d);
+    other = FindFirstFileW(W("T:\\*"), &d);
+    if (h == INVALID || !h || other == INVALID || !other) return 32;
+    if (!FindClose(h)) return 33;
+    if (!FindNextFileW(other, &d)) return 34;
+    if (!FindClose(other)) return 35;
+    return 42;
+}
+"#.replace("@FILETIME@", &filetime.to_string());
+    std::fs::write(dir.path().join("discover.c"), source).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "discover.c", "-o", "discover.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:discover.exe", "discover.obj", "kernel32.lib"]);
+    let exe = dir.path().join("discover.exe");
+    let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+}

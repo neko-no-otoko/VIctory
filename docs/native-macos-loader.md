@@ -233,6 +233,18 @@ Open save handles prevent moves, replacement and deletion in cooperating
 processes; Windows sharing restrictions against other host processes are not
 enforced. Truncation, other creation modes and flags, and overlapped I/O are
 not supported.
+
+`GetFileAttributesExW` (standard information level), `FindFirstFileW`,
+`FindNextFileW`, and `FindClose` provide thread-scoped discovery of regular
+files and directories. They return host creation/access/write times and file
+sizes in Windows records; directory sizes are zero. Enumeration snapshots
+matches at the first call, has unspecified ordering, and does not synthesize
+short names. Exact symlink queries fail; wildcard enumeration omits symlinks.
+Names that cannot be represented in the fixed UTF-16 record are rejected.
+Supported patterns are a literal name, `*`, `*.*`, or a literal prefix followed
+by one `*` (not after a dot); `?`, other wildcard positions, and wildcards in
+parent components return `ERROR_NOT_SUPPORTED`. This is a limited subset,
+not full Windows DOS wildcard behavior.
 Without `--file-root`, these imports remain unresolved. This path binding is
 not a process sandbox: guest machine code and host callbacks execute
 unsandboxed and must be trusted.
