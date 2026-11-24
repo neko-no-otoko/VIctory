@@ -85,7 +85,7 @@ fn synthetic_root_cbv_through_native_cli() {
 
 #[test]
 #[ignore = "requires LLVM MinGW, a trusted Apple Metal Shader Converter and Metal GPU"]
-fn native_compute_rejects_accesses_outside_single_uav_and_cbv_views() {
+fn native_compute_guards_single_uav_accesses_and_rejects_dynamic_cbv() {
     assert!(std::env::var_os("VICTORY_METAL_CONVERTER").is_some());
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -98,33 +98,69 @@ fn native_compute_rejects_accesses_outside_single_uav_and_cbv_views() {
     let flags = "rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;";
     assert!(original.contains(flags));
     let source = original.replace(flags, "rd.Width=8; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;");
-    let close_check = "#if (CASE >= 1 && CASE <= 4) || CASE == 7 || CASE == 8";
-    assert!(source.contains(close_check));
-    let reject_at_close = source.replace(close_check, "#if 1");
     let pipeline_check = "if (SLOT(dev,0x58,CreatePipeline)(dev,&pd,&IID_ID3D12PipelineState,&pipeline)!=S_OK || !pipeline) return 7;";
-    assert!(reject_at_close.contains(pipeline_check));
-    let dynamic_source = reject_at_close.replace(pipeline_check, "HRESULT hr=SLOT(dev,0x58,CreatePipeline)(dev,&pd,&IID_ID3D12PipelineState,&pipeline); if (hr==E_NOTIMPL && !pipeline) return 42; if (hr!=S_OK || !pipeline) return 7;");
+    let result_check = "if (result[0]!=42 || result[1]!=1) return 13;";
+    let close_check = "#if (CASE >= 1 && CASE <= 4) || CASE == 7 || CASE == 8";
+    assert!(source.contains(pipeline_check));
+    assert!(source.contains(result_check));
+    assert!(source.contains(close_check));
 
-    for case in ["control", "uav_load", "uav_store", "uav_dynamic_load", "uav_dynamic_store", "uav_vector_load", "uav_vector_store", "cbv_dynamic"] {
+    for (case, expected) in [
+        ("control", (42, 1)),
+        ("uav_load", (41, 1)),
+        ("uav_store", (7, 1)),
+        ("uav_partial_load", (41, 1)),
+        ("uav_partial_store", (7, 42)),
+        ("scalar_load_in", (42, 1)),
+        ("scalar_load_out", (41, 1)),
+        ("scalar_store_in", (7, 42)),
+        ("scalar_store_out", (7, 1)),
+        ("vector_load_in", (42, 1)),
+        ("vector_load_out", (41, 1)),
+        ("vector_store_in", (7, 42)),
+        ("vector_store_out", (7, 1)),
+        ("scalar_load_wrap", (41, 1)),
+        ("scalar_store_wrap", (7, 1)),
+        ("vector_load_wrap", (41, 1)),
+        ("vector_store_wrap", (7, 1)),
+        ("cbv_dynamic", (0, 0)),
+    ] {
         let mut words = WORDS.to_vec();
-        let dynamic = case.contains("dynamic") || case.contains("vector");
         match case {
             "control" => {}
             "uav_load" => words[11] = 0xe0300008,
             "uav_store" => words[15] = 0xe0700008,
-            // s2 is runtime shader state, not an immediate offset.
-            "uav_dynamic_load" => { words[12] = 0x02020000; words.insert(0, 0xbe820388); }
-            "uav_dynamic_store" => { words[16] = 0x02020000; words.insert(0, 0xbe820388); }
-            // Vector offsets exercise per-lane dynamic addressing as well.
-            "uav_vector_load" => { words[11] = 0xe0301000; words[12] = 0x80020001; words.insert(0, 0x7e020288); }
-            "uav_vector_store" => { words[15] = 0xe0701000; words[16] = 0x80020001; words.insert(0, 0x7e020288); }
-            // Root CBV starts at byte 16; byte 48 is one past its allocation.
-            "cbv_dynamic" => { words[7] = 0x04000000; words.insert(0, 0xbe8203b0); }
+            // The second dword is outside the eight-byte UAV. Observe the
+            // loaded second component through the ordinary in-bounds store.
+            "uav_partial_load" => { words[11] = 0xe0340004; words[14] = 0x4a000206; }
+            "uav_partial_store" => { words[15] = 0xe0740004; }
+            // s2 and v1 supply runtime scalar and per-thread byte offsets.
+            "scalar_load_in" => { words[12] = 0x02020000; words.splice(0..0, [0xbe820380]); }
+            "scalar_load_out" => { words[12] = 0x02020000; words.splice(0..0, [0xbe820384]); }
+            "scalar_store_in" => { words[16] = 0x02020000; words.splice(0..0, [0xbe820384]); }
+            "scalar_store_out" => { words[16] = 0x02020000; words.splice(0..0, [0xbe820388]); }
+            "vector_load_in" => { words[11] = 0xe0301004; words[12] = 0x80020001; words.splice(0..0, [0x7e020280]); }
+            "vector_load_out" => { words[11] = 0xe0301004; words[12] = 0x80020001; words.splice(0..0, [0x7e020284]); }
+            "vector_store_in" => { words[15] = 0xe0701000; words[16] = 0x80020001; words.splice(0..0, [0x7e020284]); }
+            "vector_store_out" => { words[15] = 0xe0701000; words[16] = 0x80020001; words.splice(0..0, [0x7e020288]); }
+            // 0xfffffffc + 4 must not wrap back to the first dword.
+            "scalar_load_wrap" => { words[12] = 0x02020000; words.splice(0..0, [0xbe8203ff, 0xfffffffc]); }
+            "scalar_store_wrap" => { words[15] = 0xe0700004; words[16] = 0x02020000; words.splice(0..0, [0xbe8203ff, 0xfffffffc]); }
+            "vector_load_wrap" => { words[11] = 0xe0301004; words[12] = 0x80020001; words.splice(0..0, [0x7e0202ff, 0xfffffffc]); }
+            "vector_store_wrap" => { words[15] = 0xe0701004; words[16] = 0x80020001; words.splice(0..0, [0x7e0202ff, 0xfffffffc]); }
+            // Root CBV starts at byte 16; dynamic CBV access remains unsupported.
+            "cbv_dynamic" => { words[7] = 0x04000000; words.splice(0..0, [0xbe8203b0]); }
             _ => unreachable!(),
         }
         let array = shader_with_words(&words).iter().map(u8::to_string).collect::<Vec<_>>().join(",");
         std::fs::write(root.join("shaders.h"), format!("static const unsigned char shader[] = {{{array}}};\n")).unwrap();
-        std::fs::write(root.join("cbv.c"), if case == "control" { &source } else if dynamic { &dynamic_source } else { &reject_at_close }).unwrap();
+        let fixture = if case == "cbv_dynamic" {
+            source.replace(pipeline_check, "HRESULT hr=SLOT(dev,0x58,CreatePipeline)(dev,&pd,&IID_ID3D12PipelineState,&pipeline); if (hr==E_NOTIMPL && !pipeline) return 42; if (hr!=S_OK || !pipeline) return 7;")
+                .replace(close_check, "#if 1")
+        } else {
+            source.replace(result_check, &format!("if (result[0]!={} || result[1]!={}) return 13;", expected.0, expected.1))
+        };
+        std::fs::write(root.join("cbv.c"), fixture).unwrap();
         tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-DCASE=0", "-c", "cbv.c", "-o", "cbv.obj"]);
         tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:cbv.exe", "cbv.obj", "d3d.lib"]);
         let out = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("cbv.exe")).arg("--execute").output().unwrap();

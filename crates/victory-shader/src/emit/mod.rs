@@ -186,6 +186,15 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_inner(container, false)
+}
+
+/// Translate compute with explicit raw-buffer view guards for the Metal backend.
+pub fn translate_guarded_raw_buffers(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_inner(container, true)
+}
+
+fn translate_inner(container: &[u8], guarded_raw_buffers: bool) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,7 +215,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_inner(&c, &native, &p, &st, &io, &res, guarded_raw_buffers)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -217,6 +226,18 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_inner(c, native, p, st, io, res, false)
+}
+
+fn emit_inner(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    guarded_raw_buffers: bool,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -276,6 +297,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        guarded_raw_buffers,
     })?;
     Ok(HostShader {
         stage: native.stage,

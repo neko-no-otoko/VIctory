@@ -242,7 +242,7 @@ impl Drop for Fixture {
 
 #[test]
 #[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
-fn launcher_rejects_compute_accesses_outside_views() {
+fn launcher_checks_compute_view_bounds_and_rejects_indexed_accesses() {
     let f = Fixture::new();
     let exe = f.build();
     let host = f.tracked_host();
@@ -254,7 +254,7 @@ fn launcher_rejects_compute_accesses_outside_views() {
         assert!(f.host_pid.is_file(), "host was not started: {context}");
         f.assert_host_gone();
         assert!(out.stdout.contains("D3D12X bounds dispatch armed"), "{context}");
-        if case == 0 {
+        if case <= 2 {
             assert_eq!(out.status.code(), Some(42), "{context}");
             assert!(out.stdout.contains("D3D12X bounds valid passed"), "{context}");
         } else {
@@ -262,12 +262,9 @@ fn launcher_rejects_compute_accesses_outside_views() {
             assert!(!out.stdout.contains("D3D12X unsafe dispatch returned"), "{context}");
             assert!(!out.stdout.contains("D3D12X bounds valid passed"), "{context}");
             assert!(out.stderr.contains("proxy status"), "{context}");
-            let reason = match (mode, case) {
-                (0 | 1, 1 | 2) => "UAV range is too small for shader access",
-                (0 | 1, _) => "dynamic or unsupported UAV buffer addressing",
-                (2, 1 | 2) => "invalid raw view compute request",
-                (3, 1 | 2) => "raw descriptor range is too small for shader access",
-                _ => "dynamic or unsupported raw buffer addressing",
+            let reason = match mode {
+                0 | 1 => "unsupported UAV buffer addressing",
+                _ => "unsupported raw buffer addressing",
             };
             assert!(out.stderr.contains(reason), "{context}");
         }

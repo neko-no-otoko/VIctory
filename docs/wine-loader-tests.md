@@ -287,22 +287,23 @@ execution is rejected, and writable resources are returned after Metal
 completes. Opcode 8 carries general tables; the prior two-entry opcode 7
 remains supported.
 
-Only raw dword loads/stores with statically provable immediate byte offsets
-are accepted on all these compute paths, including the whole-buffer UAV
-path. The host checks every access width and offset against its view length
-before dispatch; indexed, dynamic and out-of-range accesses are rejected.
-This restriction matters: in a test on
-the Apple converter and M3 Max, a load outside an SRV view but inside its
-backing allocation returned the backing byte rather than zero. Do not rely
-on Metal descriptor length alone to enforce D3D out-of-bounds semantics.
+Raw dword loads and stores, including dynamic scalar and per-lane byte
+offsets, are guarded in translated compute shaders using the selected view's
+reported byte length. Each out-of-view dword reads as zero or is discarded
+on write; arithmetic overflow is treated as out of range. This is necessary:
+on the Apple converter and M3 Max, an unguarded load outside an SRV view but
+inside its backing allocation returned the backing byte. Do not rely on
+Metal descriptor length alone to enforce D3D out-of-bounds semantics.
+Indexed/structured addressing, dynamic descriptor selection and atomics
+remain unsupported in this compute path.
 Aliased views, structured or typed buffers, counters and mixing these
 tables with root CBVs are rejected. This is pipeline-metadata binding, not
 general D3D12 root-signature support. Metal uses the buffer descriptor
 encoding documented by [Apple](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
 
-The `wine_compute_bounds` fixture exercises legacy, paired-view and
-multi-view access checks using real translated shaders, including boundary
-loads and stores and dynamic addressing.
+The `wine_compute_bounds` and `wine_dynamic_bounds` fixtures exercise legacy,
+paired-view and multi-view accesses using translated shaders, including
+dynamic offsets, partial vectors, overflow and adjacent resource bytes.
 
 On an M3 Max under Rosetta with Wine 11 and Apple's converter, a normally
 launched TLS guest sampled a nonzero-offset raw SRV and wrote a nonzero-offset

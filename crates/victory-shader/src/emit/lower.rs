@@ -48,6 +48,8 @@ pub(crate) struct Parts<'a> {
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     pub prims: Vec<SigElement>,
+    /// Guard compute raw dword accesses against the selected descriptor's view.
+    pub guarded_raw_buffers: bool,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
 }
@@ -5774,6 +5776,13 @@ impl<'a> Lower<'a> {
             r
         })
     }
+    /// Add unsigned byte offsets without allowing a wrap to enter the view.
+    fn raw_offset_add(&mut self, base: V, add: V, valid: V) -> (V, V) {
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, base, add);
+        let no_carry = self.s.m.cmp(c, pred::IUGE, sum, base);
+        (sum, self.s.m.bin(c, Bin::And, valid, no_carry))
+    }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
@@ -5844,6 +5853,94 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
             l.i32_of(v)
         };
+        if self.x.guarded_raw_buffers
+            && matches!(self.x.native.io, StageIo::Cs(_))
+            && !typed
+            && format.is_none()
+            && atomic.is_none()
+        {
+            if *idxen {
+                return Err("an indexed raw buffer access with view bounds");
+            }
+            let src = self.descriptors.get(&(site, false)).copied()
+                .ok_or("an untracked buffer")?;
+            let used = self.used_kind(src);
+            if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                return Err("a constant buffer access with raw view bounds");
+            }
+            // A descriptor synthesized around a root view has its own bounds,
+            // which cannot be recovered from the root handle's dimensions.
+            if matches!(src, Source::Built { .. }) {
+                return Err("a built buffer descriptor with view bounds");
+            }
+            let uav = store || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let h = self.handle(site, src, false, (11 | if uav { 0x1000 } else { 0 }, 0))?;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let undef = self.s.m.undef(i32t);
+            // Inactive lanes must not query a descriptor selected by values
+            // that are only defined for active lanes.
+            let at = self.begin_guarded(guard);
+            let c = self.cur;
+            let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, undef]);
+            let len = self.s.m.extract(c, d, 0);
+            let zero = self.s.m.i32(0);
+            let len = self.end_guarded(at, &[(len, zero)])[0];
+            let c = self.cur;
+            let four = self.s.m.i32(4);
+            let fits_dword = self.s.m.cmp(c, pred::IUGE, len, four);
+            let last = self.s.m.bin(c, Bin::Sub, len, four);
+            let mut off = self.s.m.i32(u32::from(*offset));
+            let mut valid = self.s.m.bool(true);
+            if *offen {
+                let o = vaddr(self, 0)?;
+                (off, valid) = self.raw_offset_add(off, o, valid);
+            }
+            if !matches!(
+                soffset,
+                Operand::Scalar { code: NULL, .. } | Operand::Const(128)
+            ) {
+                let so = self.operand(inst, soffset)?;
+                (off, valid) = self.raw_offset_add(off, so, valid);
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer data register");
+            };
+            let vals = if store {
+                Some(self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, count as u8)?)
+            } else {
+                None
+            };
+            for k in 0..count {
+                let delta = self.s.m.i32(4 * k);
+                let (address, no_carry) = self.raw_offset_add(off, delta, valid);
+                let c = self.cur;
+                let in_range = self.s.m.cmp(c, pred::IULE, address, last);
+                let in_range = self.s.m.bin(c, Bin::And, in_range, fits_dword);
+                let mut active = self.s.m.bin(c, Bin::And, in_range, no_carry);
+                if let Some(g) = guard {
+                    active = self.s.m.bin(c, Bin::And, active, g);
+                }
+                let at = self.begin_guarded(Some(active));
+                let c = self.cur;
+                let mask = self.s.m.i8(1);
+                if let Some(vals) = &vals {
+                    let void = self.s.t.void;
+                    self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140,
+                        &[h, address, undef, vals[k as usize], undef, undef, undef, mask, four]);
+                    self.end_guarded(at, &[]);
+                } else {
+                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret,
+                        139, &[h, address, undef, mask, four]);
+                    let x = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(x);
+                    let zero = self.s.m.i32(0);
+                    let x = self.end_guarded(at, &[(x, zero)])[0];
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            }
+            return Ok(());
+        }
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
         if *offen {
@@ -6593,6 +6690,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
+            guarded_raw_buffers: false,
             mesh_stride: 0,
         })
         .map(|_| ())

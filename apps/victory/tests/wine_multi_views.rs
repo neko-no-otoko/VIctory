@@ -224,8 +224,9 @@ fn launcher_runs_multi_views_and_rejects_invalid_cases() {
     let f = Fixture::new();
     let exe = f.build();
     let host = f.tracked_host();
-    for _ in 0..2 {
+    for variant in [None, None, Some("--short-view")] {
         let mut cmd = f.command(&exe, &host);
+        if let Some(variant) = variant { cmd.arg("--").arg(variant); }
         let out = run(&mut cmd, f.temp.path());
         f.assert_host_gone();
         assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
@@ -233,7 +234,7 @@ fn launcher_runs_multi_views_and_rejects_invalid_cases() {
     }
     for (variant, rejected_at_close) in [
         ("--invalid-slot", false), ("--invalid-missing", true), ("--invalid-alias", true),
-        ("--invalid-mismatch", false), ("--short-view", false),
+        ("--invalid-mismatch", false),
         ("--invalid-srv-state", false), ("--invalid-uav-state", false),
         ("--invalid-srv-offset", false), ("--invalid-srv-range", false),
         ("--invalid-uav-offset", false), ("--invalid-uav-range", false),
@@ -247,11 +248,7 @@ fn launcher_runs_multi_views_and_rejects_invalid_cases() {
             assert!(out.stdout.contains("D3D12X invalid multi views rejected"), "{variant}: {}\n{}", out.stdout, out.stderr);
         } else {
             assert!(!out.status.success() && out.status.code() != Some(13), "{variant}: {}\n{}", out.stdout, out.stderr);
-            if variant == "--short-view" {
-                assert!(out.stderr.contains("raw descriptor range is too small for shader access"),
-                    "{variant}: {}\n{}", out.stdout, out.stderr);
-            }
-            if variant.ends_with("-state") || matches!(variant, "--invalid-slot" | "--invalid-mismatch" | "--short-view") {
+            if variant.ends_with("-state") || matches!(variant, "--invalid-slot" | "--invalid-mismatch") {
                 assert!(out.stdout.contains("D3D12X invalid dispatch armed"), "{variant}: {}\n{}", out.stdout, out.stderr);
             } else {
                 assert!(!out.stdout.contains("D3D12X invalid descriptors accepted"), "{variant}: {}\n{}", out.stdout, out.stderr);

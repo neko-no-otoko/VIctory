@@ -135,6 +135,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
+        guarded_raw_buffers: false,
         mesh_stride: 0,
     })
     .expect("lower");

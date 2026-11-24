@@ -27,11 +27,14 @@ typedef void (__stdcall *SetHeaps)(void *, unsigned, void **);
 typedef void (__stdcall *SetTable)(void *, unsigned, U64);
 typedef void (__stdcall *SetCbv)(void *, unsigned, U64);
 typedef void (__stdcall *Dispatch)(void *, unsigned, unsigned, unsigned);
+typedef HRESULT (__stdcall *CreateFence)(void *, U64, unsigned, const IID *, void **);
+typedef HRESULT (__stdcall *FenceEvent)(void *, U64, HANDLE);
+typedef HRESULT (__stdcall *QueueSignal)(void *, void *, U64);
 static _Thread_local volatile int tls_value = 17;
 static void say(const char *s) { DWORD n; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s, (DWORD)strlen(s), &n, NULL); }
 
 /* mode: 0 legacy, 1 legacy+CBV, 2 paired, 3 multi. case: valid,
-   out-of-view read, out-of-view store, dynamic read, dynamic store. */
+   out-of-view read, out-of-view store, indexed read, indexed store. */
 int main(int argc, char **argv) {
     if (argc != 3) return 90;
     int mode = atoi(argv[1]), test = atoi(argv[2]);
@@ -93,17 +96,26 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < count; ++i)
         for (unsigned j = 0; j < (mode < 2 ? 4u : 32u); ++j)
             if (data[i][j] != 10000 * (i + 1) + j) return 11;
+    void *fence = NULL;
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!event || SLOT(dev,0x120,CreateFence)(dev, 0, 0, &IID_ID3D12Fence, &fence) != S_OK || !fence ||
+        SLOT(fence,0x48,FenceEvent)(fence, 1, event) != S_OK) return 15;
     say("D3D12X bounds dispatch armed\r\n");
     ID3D12CommandList *submit[] = {(ID3D12CommandList *)list};
     ID3D12CommandQueue_ExecuteCommandLists(queue, 1, submit);
-    if (test != 0) { say("D3D12X unsafe dispatch returned\r\n"); return 12; }
+    if (test >= 3) { say("D3D12X unsafe dispatch returned\r\n"); return 12; }
+    if (SLOT(queue,0x70,QueueSignal)(queue, fence, 1) != S_OK || WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) return 16;
+    CloseHandle(event);
     for (unsigned i = 0; i < count; ++i) {
         for (unsigned j = 0; j < (mode < 2 ? 4u : 32u); ++j) {
             unsigned expected = 10000 * (i + 1) + j;
-            if (mode < 2 && i == 0 && j == 0) expected = 10001 + (mode == 1 ? 7 : 0);
-            if (mode == 2 && i == 1 && j == 10) expected = 10005;
+            if (mode < 2 && i == 0 && j == 0 && test != 2)
+                expected = (test == 1 ? 0 : 10001) + (mode == 1 ? 7 : 0);
+            if (mode == 2 && i == 1 && j == 10 && test != 2)
+                expected = test == 1 ? 0 : 10005;
             if (mode == 3 && i == 0 && j == 10) expected = 20005;
-            if (mode == 3 && i == 2 && j == 11) expected = 40006;
+            if (mode == 3 && i == 2 && j == 11 && test != 2)
+                expected = test == 1 ? 0 : 40006;
             if (data[i][j] != expected) return 13;
         }
     }

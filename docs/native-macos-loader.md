@@ -90,11 +90,11 @@ supported. The command retains the resource and reads its current contents
 at submission. Missing, misaligned, aliased or undersized bindings are rejected;
 root SRV/UAV and graphics CBV bindings remain unsupported. The synthetic PE
 tests readback, an offset binding, lifetime, late writes, and invalid inputs.
-The index-zero UAV must be a whole-buffer view. Only dword loads and stores
-with static immediate byte offsets are accepted; dynamic or indexed buffer
-addresses are rejected, and each access must fit the buffer before dispatch.
-This is a restricted implementation, not D3D out-of-bounds zero/drop semantics
-or a sandbox guarantee.
+The index-zero UAV must be a whole-buffer view. Translated raw dword loads and
+stores support dynamic byte offsets and guard each component against the view:
+out-of-range reads return zero, writes are discarded, and overflowing offsets
+are out of range. Indexed buffer addresses remain unsupported. This is a
+restricted implementation, not a sandbox guarantee.
 
 The native graphics fixture exercises a restricted vertex/pixel pipeline,
 render-target clear, two triangle draws with different root constants, and a

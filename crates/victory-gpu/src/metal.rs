@@ -17,8 +17,6 @@ pub(crate) struct Prepared {
     root_cbv: Option<(u8, u64, usize)>,
     raw_views: bool,
     raw_accesses: Vec<(usize, ResourceType)>,
-    raw_required: Vec<(usize, usize)>,
-    uav_required: usize,
     threads: [u32; 3],
 }
 
@@ -70,8 +68,6 @@ impl Prepared {
             return Err("invalid descriptor table root".into());
         }
         let mut raw_accesses = Vec::new();
-        let mut raw_required: Vec<(usize, usize)> = Vec::new();
-        let mut uav_required = 0;
         if raw_views {
             if root.slot == 0 || root.slot >= 64 || traced.scalar.is_empty()
                 || p.used.iter().any(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
@@ -117,23 +113,11 @@ impl Prepared {
                     return Err("unsupported raw buffer access".into());
                 }
                 let victory_shader::gfx10::Fields::Buffer {
-                    data: Some(victory_shader::gfx10::Operand::Vector { dwords, .. }),
-                    soffset, offset: byte_offset, offen: false, idxen: false,
-                    format: None, lds: false, tfe: false, ..
+                    data: Some(victory_shader::gfx10::Operand::Vector { .. }),
+                    idxen: false, format: None, lds: false, tfe: false, ..
                 } = &inst.fields else {
-                    return Err("dynamic or unsupported raw buffer addressing".into());
+                    return Err("unsupported raw buffer addressing".into());
                 };
-                if !matches!(soffset, victory_shader::gfx10::Operand::Const(128)
-                    | victory_shader::gfx10::Operand::Scalar { code: victory_shader::gfx10::NULL, .. }) {
-                    return Err("dynamic raw buffer offset is unsupported".into());
-                }
-                let required = usize::from(*byte_offset) + usize::from(*dwords) * 4;
-                let index = (offset / 32) as usize;
-                if let Some((_, n)) = raw_required.iter_mut().find(|(i, _)| *i == index) {
-                    *n = (*n).max(required);
-                } else {
-                    raw_required.push((index, required));
-                }
                 let access = ((offset / 32) as usize, used.kind);
                 if raw_accesses.iter().any(|&(index, kind)| index == access.0 && kind != access.1) {
                     return Err("conflicting raw descriptor metadata".into());
@@ -161,17 +145,11 @@ impl Prepared {
                         return Err("unsupported UAV buffer access".into());
                     }
                     let victory_shader::gfx10::Fields::Buffer {
-                        data: Some(victory_shader::gfx10::Operand::Vector { dwords, .. }),
-                        soffset, offset, offen: false, idxen: false,
-                        format: None, lds: false, tfe: false, ..
+                        data: Some(victory_shader::gfx10::Operand::Vector { .. }),
+                        idxen: false, format: None, lds: false, tfe: false, ..
                     } = &inst.fields else {
-                        return Err("dynamic or unsupported UAV buffer addressing".into());
+                        return Err("unsupported UAV buffer addressing".into());
                     };
-                    if !matches!(soffset, victory_shader::gfx10::Operand::Const(128)
-                        | victory_shader::gfx10::Operand::Scalar { code: victory_shader::gfx10::NULL, .. }) {
-                        return Err("dynamic UAV buffer offset is unsupported".into());
-                    }
-                    uav_required = uav_required.max(usize::from(*offset) + usize::from(*dwords) * 4);
                 }
                 continue;
             }
@@ -213,7 +191,7 @@ impl Prepared {
             cbv_required = cbv_required.max(end);
             cbv_slot = Some(cbv_root.slot);
         }
-        let host = emit::translate(container).map_err(|e| e.to_string())?;
+        let host = emit::translate_guarded_raw_buffers(container).map_err(|e| e.to_string())?;
         if !host.samplers.is_empty()
             || host.root_cbvs.as_slice() != cbv_slot.as_slice()
             || !host.root_srvs.is_empty()
@@ -243,8 +221,6 @@ impl Prepared {
             table_slot: root.slot,
             raw_views,
             raw_accesses,
-            raw_required,
-            uav_required,
             root_cbv,
             threads: io.threads,
         })
@@ -309,12 +285,6 @@ impl WineMetalCompute {
                 return Err("raw descriptor kind mismatch".into());
             }
         }
-        for &(index, required) in &p.raw_required {
-            if base.checked_add(index).and_then(|i| resources.get(i))
-                .is_none_or(|view| view.length < required) {
-                return Err("raw descriptor range is too small for shader access".into());
-            }
-        }
         let table_offset = table_base.checked_mul(32).ok_or("table offset overflow")?;
         let mut constants = vec![0; p.dwords];
         for u in &p.user_data {
@@ -349,8 +319,6 @@ impl WineMetalCompute {
             || root_constants.len() > 64 || groups.contains(&0)
             || srv.1 == 0 || srv.0.checked_add(srv.1).is_none_or(|end| end > input.len())
             || uav.1 == 0 || uav.0.checked_add(uav.1).is_none_or(|end| end > output.len())
-            || p.raw_required.iter().any(|&(index, required)|
-                match index { 0 => srv.1 < required, 1 => uav.1 < required, _ => true })
         {
             return Err("invalid raw view compute request".into());
         }
@@ -396,9 +364,6 @@ impl WineMetalCompute {
             return Err("invalid compute request dimensions or lengths".into());
         }
         let p = &mut self.prepared;
-        if buffer.len() < p.uav_required {
-            return Err("UAV range is too small for shader access".into());
-        }
         let cbv = match (p.root_cbv, cbv) {
             (None, None) => None,
             (Some((expected, required, offset)), Some((slot, bytes)))
@@ -1482,10 +1447,6 @@ impl State {
         let resource = resource as This;
         if resource.is_null() || crate::resource::buffer_bytes(resource).is_none() {
             return Err("UAV is not a buffer".into());
-        }
-        if crate::resource::buffer_bytes(resource)
-            .is_none_or(|(_, size)| size < p.uav_required as u64) {
-            return Err("UAV range is too small for shader access".into());
         }
         let cbv = if let Some((slot, required, _)) = p.root_cbv {
             let Some(Root::Cbv { resource: cbv, offset, size }) = self.roots.get(slot as usize) else {

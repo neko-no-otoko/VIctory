@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
         for (unsigned j = 0; j < 32; ++j) data[i][j] = 10000 * (i + 1) + j;
     }
     data[3][5] = 3; data[5][14] = 5;
-    if (test != VALID) say("D3D12X invalid multi views armed\r\n");
+    if (test != VALID && test != SHORT_VIEW) say("D3D12X invalid multi views armed\r\n");
     for (unsigned i = 0; i < 6; ++i) {
         U64 dst = handle + stride * i;
         if (i == 2 || i == 4) {
@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
             SLOT(dev,0x90,CreateSrv)(dev, resources[i], &view, dst);
         }
     }
-    if (test != VALID) say("D3D12X invalid descriptors accepted\r\n");
+    if (test != VALID && test != SHORT_VIEW) say("D3D12X invalid descriptors accepted\r\n");
     ComputeDesc pd = {NULL, {shader, sizeof(shader)}};
     if (SLOT(dev,0x58,CreatePipeline)(dev, &pd, &IID_ID3D12PipelineState, &pipeline) != S_OK || !pipeline) return 7;
     ID3D12CommandAllocator *allocator = NULL;
@@ -129,16 +129,17 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 6; ++i) SLOT(resources[i],0x10,Release)(resources[i]);
     SLOT(heap,0x10,Release)(heap);
     ID3D12CommandList *submit[] = {(ID3D12CommandList *)lists[0]};
-    if (test != VALID) say("D3D12X invalid dispatch armed\r\n");
+    if (test != VALID && test != SHORT_VIEW) say("D3D12X invalid dispatch armed\r\n");
     ID3D12CommandQueue_ExecuteCommandLists(queue, 1, submit);
-    if (test != VALID) return 13;
+    if (test != VALID && test != SHORT_VIEW) return 13;
     if (data[2][10] != 41 || data[4][21] != (test == SHORT_VIEW ? 0u : 53u)) {
         char message[128];
         snprintf(message, sizeof(message), "multi outputs: %u %u (case %u)\r\n", data[2][10], data[4][21], test);
         say(message); return 14;
     }
     for (unsigned i = 0; i < 32; ++i)
-        if ((i != 10 && data[2][i] != 30000 + i) || (i != 21 && data[4][i] != 50000 + i)) return 15;
+        if ((i != 10 && data[2][i] != 30000 + i) || (i != 21 && data[4][i] != 50000 + i) ||
+            data[5][i] != (i == 14 ? 53u : 60000 + i)) return 15;
     void *gate = NULL, *done = NULL;
     HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!event || SLOT(dev,0x120,CreateFence)(dev,0,0,&IID_ID3D12Fence,&gate) != S_OK ||
@@ -152,7 +153,8 @@ int main(int argc, char **argv) {
     if (SLOT(gate,0x50,FenceSignal)(gate,1) != S_OK || WaitForSingleObject(event,10000) != WAIT_OBJECT_0 ||
         data[2][10] != 83 || data[4][21] != (test == SHORT_VIEW ? 0u : 97u) || tls_value != 29) return 18;
     for (unsigned i = 0; i < 32; ++i)
-        if ((i != 10 && data[2][i] != 30000 + i) || (i != 21 && data[4][i] != 50000 + i)) return 19;
+        if ((i != 10 && data[2][i] != 30000 + i) || (i != 21 && data[4][i] != 50000 + i) ||
+            data[5][i] != (i == 14 ? 97u : 60000 + i)) return 19;
     CloseHandle(event); SLOT(gate,0x10,Release)(gate); SLOT(done,0x10,Release)(done);
     SLOT(queue,0x10,Release)(queue); SLOT(lists[1],0x10,Release)(lists[1]); SLOT(lists[0],0x10,Release)(lists[0]);
     SLOT(allocator,0x10,Release)(allocator); SLOT(pipeline,0x10,Release)(pipeline); SLOT(dev,0x10,Release)(dev);
