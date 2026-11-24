@@ -745,6 +745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-metal"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tempfile",
+ "victory-shader",
+]
+
+[[package]]
 name = "victory-pe"
 version = "0.1.0"
 dependencies = [
