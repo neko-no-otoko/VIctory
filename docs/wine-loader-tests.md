@@ -334,7 +334,7 @@ must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
 This remains restricted: no partial clears, cross-process shared fences,
-tiled textures, BGRA or uncompressed sRGB formats through this proxy, BC2
+other tiled layouts, BGRA or uncompressed sRGB formats through this proxy, BC2
 and other compressed formats, stencil, arbitrary sampler/address modes, or
 general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
@@ -342,7 +342,7 @@ Unsupported combinations fail or trap rather than being ignored. Limits are
 and 64 MiB per request. Shader translation and drawing use the existing
 native Metal path, not MetalVulkan.
 
-Sampled multi-mip textures use 2D `TEXTURE_LAYOUT_UNKNOWN`, one array layer,
+Linear sampled multi-mip textures use 2D `TEXTURE_LAYOUT_UNKNOWN`, one array layer,
 one sample, explicit nonzero mip count and no render/depth flags. Null SRVs
 cover all levels; explicit matching-format Texture2D SRVs support a validated
 first mip and count, including `UINT_MAX` for the remaining levels, with default
@@ -354,6 +354,24 @@ and 256-byte row pitches; partial regions and per-subresource barriers are
 rejected. Packed mip bytes in the internal transport are not console tiling.
 This incompatible mip-aware batch uses opcode 5; old opcode 3 is rejected
 rather than misdecoded.
+
+RGBA8_UNORM sampled textures additionally accept explicit console swizzles
+`SW_4KB_S` (`0x105`) and `SW_64KB_D` (`0x10a`), with one array slice,
+one sample, nonzero mips and no render/depth flags. Map subresource zero to
+access the complete tiled allocation, including the shared mip tail; mapping
+other subresources fails. The retained bytes are detiled per mip before
+transport to Metal. Tiled copy operations and tiled render targets are not
+supported; neither BC nor XOR layouts are accepted in this tiled path.
+For compatibility with the existing Wine proxy, layout zero remains linear
+and does not select the native loader's default tiled layout.
+
+On an M3 Max with Wine 11 under Rosetta and the Apple converter, a normally
+launched guest populated independent tiled texel offsets, sampled both
+layouts and their mip tails via translated shaders, and checked Metal pixel
+readback, including odd edge dimensions. Invalid layouts and subresource maps
+were rejected. With the launcher test environment below, run `cargo test
+--locked -p victory --target x86_64-apple-darwin --test wine_tiled -- --ignored
+--nocapture`. This does not establish support for other console swizzles.
 
 BC sampling supports `BC1_UNORM`, `BC1_UNORM_SRGB`, `BC3_UNORM` and
 `BC3_UNORM_SRGB`, with top-level width and height multiples of four. Typed

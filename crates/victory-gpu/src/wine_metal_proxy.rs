@@ -109,7 +109,7 @@ impl Buffer {
 // the guest, as with an ordinary persistently mapped D3D resource.
 unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
-struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>> }
+struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Option<Srv>>>;
@@ -119,13 +119,26 @@ type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 enum GraphicsResource { Buffer(Arc<Buffer>), Texture(Arc<Texture>) }
 impl GraphicsResource {
     fn id(&self) -> u64 { match self { Self::Buffer(b) => b.id, Self::Texture(t) => t.id } }
-    fn snapshot(&self) -> Resource {
-        match self {
+    fn snapshot(&self) -> Result<Resource, String> {
+        Ok(match self {
             Self::Buffer(b) => Resource { id: b.id, state: *b.state.lock().unwrap(), kind: ResourceKind::Buffer,
                 bytes: unsafe { std::slice::from_raw_parts(b.ptr(), b.len()) }.to_vec() },
-            Self::Texture(t) => Resource { id: t.id, state: *t.state.lock().unwrap(),
-                kind: ResourceKind::Texture { width: t.width, height: t.height, format: t.format, mips: t.mips }, bytes: t.bytes.lock().unwrap().clone() },
-        }
+            Self::Texture(t) => {
+                let bytes = if let Some((memory, layout)) = &t.tiled {
+                    let source = unsafe { std::slice::from_raw_parts(memory.ptr(), memory.len()) };
+                    let mut bytes = vec![0; wine_transport::texture_size(t.format, t.width, t.height, t.mips).ok_or("invalid texture size")?];
+                    for mip in 0..t.mips {
+                        let (width, height, offset, size) = wine_transport::mip_layout(t.format, t.width, t.height, t.mips, mip).ok_or("invalid mip")?;
+                        let (row, rows) = wine_transport::block_geometry(t.format, width, height).ok_or("invalid texture format")?;
+                        let end = offset.checked_add(size).ok_or("invalid mip size")?;
+                        layout.planes.first().ok_or("missing texture plane")?.layout.detile(source, mip, 0, bytes.get_mut(offset..end).ok_or("invalid mip range")?, row, row.checked_mul(rows).ok_or("invalid mip size")?).map_err(|e| format!("texture detile failed: {e:?}"))?;
+                    }
+                    bytes
+                } else { t.bytes.lock().unwrap().clone() };
+                Resource { id: t.id, state: *t.state.lock().unwrap(),
+                    kind: ResourceKind::Texture { width: t.width, height: t.height, format: t.format, mips: t.mips }, bytes }
+            }
+        })
     }
 }
 #[derive(Clone)]
@@ -524,10 +537,12 @@ extern "system" fn copyable_footprints(
         if r.width > MAX_BUFFER as u64 || r.height != 1 || r.mips != 1 || r.format != 0
             || r.layout != 1 || !matches!(r.flags, 0 | 4) { return; }
     } else if r.dimension == 3 {
+        let tiled = matches!(r.layout, 0x105 | 0x10a);
         if r.width > u32::MAX as u64 || wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)).is_none_or(|n| n > MAX_BUFFER)
-            || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1)
-            || (r.mips != 1 && (r.flags != 0 || r.layout != 0))
-            || (matches!(r.format, 71 | 72 | 77 | 78) && (r.width % 4 != 0 || r.height % 4 != 0 || r.layout != 0 || r.flags != 0))
+            || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
+            || (tiled && (r.flags != 0 || r.format != 28))
+            || (r.mips != 1 && (r.flags != 0 || (r.layout != 0 && !tiled)))
+            || (matches!(r.format, 71 | 72 | 77 | 78) && (r.width % 4 != 0 || r.height % 4 != 0 || (r.layout != 0 && !tiled) || r.flags != 0))
             || (r.format == 28 && !matches!(r.flags, 0 | 1))
             || (r.format == 40 && (r.mips != 1 || r.flags != 2)) { return; }
     } else { return; }
@@ -573,14 +588,26 @@ extern "system" fn create_resource(
         if r.width > u32::MAX as u64 { return E_INVALIDARG; }
         let Some(size) = wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)) else { return E_INVALIDARG; };
         let bc = matches!(r.format, 71 | 72 | 77 | 78);
-        if size > MAX_BUFFER || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1)
-            || (r.mips != 1 && (r.flags != 0 || r.layout != 0))
-            || (bc && (r.width % 4 != 0 || r.height % 4 != 0 || r.layout != 0 || r.flags != 0 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
+        let tiled = matches!(r.layout, 0x105 | 0x10a);
+        if size > MAX_BUFFER || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
+            || (tiled && (r.flags != 0 || r.format != 28 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
+            || (r.mips != 1 && (r.flags != 0 || (r.layout != 0 && !tiled)))
+            || (bc && (r.width % 4 != 0 || r.height % 4 != 0 || (r.layout != 0 && !tiled) || r.flags != 0 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
             || (r.format == 28 && (!matches!(r.flags, 0 | 1) || !matches!(state, 0 | 4 | 0x400 | 0x800 | 0x80)))
             || (r.format == 40 && (r.mips != 1 || r.flags != 2 || !matches!(state, 0 | 0x10 | 0x800))) {
             return E_INVALIDARG;
         }
-        return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), state: Mutex::new(state), bytes: Mutex::new(vec![0; size]) })), &BUFFER_TABLE, iid, RESOURCE, out);
+        let tiled = if tiled {
+            // SAFETY: the two repr(C) descriptions have identical fields.
+            let desc = unsafe { &*(rd.cast::<crate::resource::ResourceDesc>()) };
+            let Some(layout) = crate::resource::texture_layout(desc) else { return E_INVALIDARG; };
+            let Ok(len) = usize::try_from(layout.size) else { return E_INVALIDARG; };
+            if len == 0 || len > MAX_BUFFER || layout.planes.len() != 1 { return E_INVALIDARG; }
+            let bytes = (0..len).map(|_| UnsafeCell::new(0)).collect::<Vec<_>>().into_boxed_slice();
+            Some((Buffer { id: 0, state: Mutex::new(state), bytes }, layout))
+        } else { None };
+        let bytes = if tiled.is_some() { Vec::new() } else { vec![0; size] };
+        return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), state: Mutex::new(state), bytes: Mutex::new(bytes), tiled })), &BUFFER_TABLE, iid, RESOURCE, out);
     }
     if r.dimension != 1 || r.mips != 1 || r.width > MAX_BUFFER as u64 || r.height != 1 || r.format != 0
         || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 0x400 | 0x800) {
@@ -599,20 +626,27 @@ extern "system" fn map(this: This, sub: u32, range: *const Range, out: *mut *mut
         return E_INVALIDARG;
     }
     unsafe { *out = std::ptr::null_mut(); }
-    if let Some(Data::Buffer(b)) = data(this) {
-        if let Some(r) = unsafe { range.as_ref() } {
-            if r.begin > r.end || r.end > b.len() {
-                return E_INVALIDARG;
+    let backing = match data(this) {
+        Some(Data::Buffer(b)) => {
+            if let Some(r) = unsafe { range.as_ref() } {
+                if r.begin > r.end || r.end > b.len() { return E_INVALIDARG; }
             }
+            b.ptr()
         }
-        unsafe { *out = b.ptr().cast(); }
-        S_OK
-    } else {
-        E_INVALIDARG
-    }
+        Some(Data::Texture(t)) => {
+            let Some((b, _)) = &t.tiled else { return E_INVALIDARG; };
+            if let Some(r) = unsafe { range.as_ref() } {
+                if r.begin > r.end || r.end > b.len() { return E_INVALIDARG; }
+            }
+            b.ptr()
+        }
+        _ => return E_INVALIDARG,
+    };
+    unsafe { *out = backing.cast(); }
+    S_OK
 }
 extern "system" fn unmap(this: This, sub: u32, _range: *const c_void) {
-    if sub != 0 || !matches!(data(this), Some(Data::Buffer(_))) {
+    if sub != 0 || !match data(this) { Some(Data::Buffer(_)) => true, Some(Data::Texture(t)) => t.tiled.is_some(), _ => false } {
         trap("invalid Unmap");
     }
 }
@@ -1188,7 +1222,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
 }
 extern "system" fn create_rtv(this: This, resource: This, desc: *const c_void, handle: u64) {
     let (Some(Data::Texture(t)), Some(Data::Rtv(h))) = (data(resource), data(handle as This)) else { trap("invalid RTV"); };
-    if device(this).is_none() || !desc.is_null() || t.format != 28 { trap("unsupported RTV"); }
+    if device(this).is_none() || !desc.is_null() || t.format != 28 || t.tiled.is_some() { trap("unsupported RTV"); }
     let mut d = h.lock().unwrap();
     d.0 = Some(t);
     d.1 = d.1.checked_add(1).unwrap_or_else(|| trap("RTV revision overflow"));
@@ -1374,7 +1408,7 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
         (Some(Data::Texture(t)), Some(Data::Buffer(b))) => (b,t,s,d,true),
         _ => { l.invalid = true; return; }
     };
-    if subresource.kind != 0 || footprint.kind != 1 { l.invalid = true; return; }
+    if texture.tiled.is_some() || subresource.kind != 0 || footprint.kind != 1 { l.invalid = true; return; }
     // Read only the active member: a subresource index does not initialize
     // the rest of the D3D12_TEXTURE_COPY_LOCATION union.
     let mip = unsafe { subresource.data.subresource };
@@ -1421,7 +1455,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }
         commands.push(j.command.clone());
     }
-    let batch = Batch { resources: resources.values().map(GraphicsResource::snapshot).collect(), pipelines: pipelines.into_values().collect(), commands };
+    let batch = Batch { resources: resources.values().map(GraphicsResource::snapshot).collect::<Result<Vec<_>, _>>()?, pipelines: pipelines.into_values().collect(), commands };
     let payload = wine_transport::encode_batch(&batch)?;
     let payload_len = u32::try_from(payload.len()).map_err(|_| "batch too large")?;
     let mut s = TcpStream::connect_timeout(&c.addr, Duration::from_secs(10)).map_err(|e| e.to_string())?;
@@ -1451,7 +1485,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     for r in results {
         match resources.get(&r.id).unwrap() {
             GraphicsResource::Buffer(b) => { unsafe { std::ptr::copy_nonoverlapping(r.bytes.as_ptr(), b.ptr(), r.bytes.len()); } *b.state.lock().unwrap() = r.state; },
-            GraphicsResource::Texture(t) => { *t.bytes.lock().unwrap() = r.bytes; *t.state.lock().unwrap() = r.state; },
+            GraphicsResource::Texture(t) => { if t.tiled.is_none() { *t.bytes.lock().unwrap() = r.bytes; } *t.state.lock().unwrap() = r.state; },
         }
     }
     tracing::info!("Wine Metal proxy connected");
