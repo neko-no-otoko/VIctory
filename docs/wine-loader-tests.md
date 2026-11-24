@@ -687,13 +687,13 @@ On x86-64 macOS (including Rosetta on Apple Silicon), `victory wine-run`
 launches a trusted PE as a normal Wine process and starts a separate native
 Metal host. Supply the Wine executable, `winepath`, Metal host, Apple
 converter, Wine prefix and HLE DLL directory explicitly. The directory must
-contain `d3d12_xs.dll`, `xg_xs.dll` and `xgameruntime.dll`. For example,
-after the toolchain and Wine setup above:
+contain `d3d12_xs.dll`, `xg_xs.dll`, `xgameruntime.dll`, `xmem.dll` and the
+private `victory_xmem_backend.dll`. For example, after the setup above:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/victory-launcher-target
 cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
-  --target x86_64-pc-windows-gnullvm
+  -p victory-xmem-dll -p victory-xmem-backend --target x86_64-pc-windows-gnullvm
 cargo build --locked -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
 cargo build --locked -p victory --target x86_64-apple-darwin
 export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
@@ -712,7 +712,7 @@ child environments, not printed. Other same-user processes may be able to
 read those environments; the token is not a sandbox or a boundary against
 such processes. The launcher preserves unrelated environment settings,
 prepends the selected DLL directory to `WINEPATH`, and requires native loading
-for those three providers; conflicting existing provider overrides are
+for those four providers; conflicting existing provider overrides are
 rejected. `VICTORY_WINE_METAL_PRESENT=1` remains an inherited opt-in for the
 existing presentation path.
 
@@ -726,7 +726,7 @@ Windows, System, System32 and SysWOW64 directories. Unreadable directories,
 ambiguous Windows directory components and dangling provider links fail the
 check. These are snapshots, not pinned opens.
 
-Direct executable imports from the three providers are checked against their
+Direct executable imports from the four providers are checked against their
 named exports; provider ordinal imports are rejected. Transitive and dynamic
 imports, activation contexts, Known DLLs, loaded modules, path-specific
 registry overrides, guest-controlled search paths and changes after preflight
@@ -770,3 +770,38 @@ TLS-bearing Wine PE called the provider DLLs and verified Metal readback 42;
 unacknowledged search and known shadow DLLs were rejected; host exit and
 signal paths cleaned up the host; and two simultaneous launches used distinct
 loopback ports and tokens. This uses synthetic files, not a configured game.
+
+## Normal Wine XMem HLE DLL
+
+`xmem.dll` exports the 13 named functions in the existing Windows XMem HLE
+registry. Their linker-assigned ordinals are not console ordinal mappings;
+unknown names are absent and the launcher rejects XMem ordinal imports.
+Calls forward to the existing implementation, including title executable
+`__XMemAllocationHooks__`, allocator alignment, virtual queries, budget
+transfers and physical-page state. `victory_xmem_backend.dll` is a private
+companion, loaded beside the provider and pinned for the process lifetime.
+The D3D12.X DLL uses the same backend for its allocator and page-mapper
+callbacks; the backend's `VIctoryXMemMapAlias` is a VIctory-private interface,
+not an Xbox export.
+
+This carries forward the upstream HLE's limitations: memory budgets use its
+current console setting, virtual queries report committed memory as
+graphics-accessible, and not every console page/commit behavior is modelled.
+The Wine Metal proxy has its own restricted GPU API coverage; XMem page
+aliases do not establish GPU tiled-resource or DirectStorage support. A
+matching companion is required even for the D3D12.X DLL, and none of these
+DLLs or the Wine prefix are sandboxed.
+
+With the launcher test environment above, run the XMem fixtures with:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_xmem -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, both tests passed. The normal TLS-bearing synthetic
+PE exercised all named imports, per-thread allocations and title hooks,
+virtual memory, physical-page aliasing and the local D3D12.X queue's page
+mapping callback against the same backend. It rejected an unknown import and
+the launcher rejected XMem and companion collisions. The queue check selects
+the local HLE path; the separate Metal launcher regression performs actual GPU
+compute readback, not a Metal tiled-page-mapping test.

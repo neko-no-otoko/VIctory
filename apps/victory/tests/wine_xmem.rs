@@ -101,7 +101,23 @@ impl Fixture {
         self.checked(&mut clang);
         exe
     }
-    fn execute(&self, exe: &Path, xmem: &str, backend: &str) -> Output {
+    fn build_ordinal(&self) -> PathBuf {
+        let dir = self.temp.path();
+        let def = dir.join("ordinal.def");
+        let lib = dir.join("ordinal.lib");
+        let source = dir.join("ordinal.c");
+        let exe = dir.join("ordinal.exe");
+        fs::write(&def, "LIBRARY xmem.dll\nEXPORTS\n XMemIsToolsMemAvailable @1 NONAME\n").unwrap();
+        fs::write(&source, "#include <windows.h>\n__declspec(dllimport) BOOL WINAPI XMemIsToolsMemAvailable(void);\nint main(void) { return XMemIsToolsMemAvailable(); }\n").unwrap();
+        let mut tool = Command::new(self.llvm.join("bin/llvm-dlltool"));
+        tool.args(["-m", "i386:x86-64", "-d"]).arg(def).arg("-l").arg(&lib);
+        self.checked(&mut tool);
+        let mut clang = Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"));
+        clang.arg(source).arg(lib).arg("-o").arg(&exe);
+        self.checked(&mut clang);
+        exe
+    }
+    fn execute(&self, exe: &Path, xmem: &str, backend: &str, d3d: &str) -> Output {
         let wrapper = self.temp.path().join("host-wrapper");
         fs::write(&wrapper, format!("#!/bin/sh\necho $$ > {}\nexec {} \"$@\"\n", quote(&self.host_pid), quote(&self.host))).unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
@@ -112,7 +128,8 @@ impl Fixture {
             .arg("--wine-prefix").arg(&self.prefix).arg("--allow-unverified-dll-search")
             .current_dir(self.temp.path()).env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .env("WINEDEBUG", "-all").env("VICTORY_WINE_METAL_PRESENT", "0")
-            .env("VICTORY_EXPECT_XMEM_DLL", xmem).env("VICTORY_EXPECT_XMEM_BACKEND_DLL", backend);
+            .env("VICTORY_EXPECT_XMEM_DLL", xmem).env("VICTORY_EXPECT_XMEM_BACKEND_DLL", backend)
+            .env("VICTORY_EXPECT_D3D12X_DLL", d3d);
         run(&mut cmd, self.temp.path())
     }
 }
@@ -148,11 +165,42 @@ fn wine_launcher_imports_xmem_and_shares_backend_page_state() {
     let unsupported = fixture.build(true);
     let dll = fixture.winepath(&fixture.dll_dir.join("xmem.dll"));
     let backend = fixture.winepath(&fixture.dll_dir.join("victory_xmem_backend.dll"));
-    let out = fixture.execute(&exe, &dll, &backend);
+    let d3d = fixture.winepath(&fixture.dll_dir.join("d3d12_xs.dll"));
+    let out = fixture.execute(&exe, &dll, &backend, &d3d);
     assert_eq!(out.status.code(), Some(0), "{}\n{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("XMem named imports, TLS, hooks, virtual memory and shared physical aliases passed"), "{}\n{}", out.stdout, out.stderr);
-    let wrong = fixture.execute(&exe, "Z:\\wrong\\xmem.dll", &backend);
+    let wrong = fixture.execute(&exe, "Z:\\wrong\\xmem.dll", &backend, &d3d);
     assert!(!wrong.status.success(), "wrong module identity accepted: {}\n{}", wrong.stdout, wrong.stderr);
-    let missing = fixture.execute(&unsupported, &dll, &backend);
-    assert!(!missing.status.success(), "unsupported import unexpectedly succeeded: {}\n{}", missing.stdout, missing.stderr);
+    let missing = fixture.execute(&unsupported, &dll, &backend, &d3d);
+    assert!(!missing.status.success() && missing.stderr.contains("does not export VIctoryUnsupportedImport"),
+        "unsupported import unexpectedly succeeded or failed for another reason: {}\n{}", missing.stdout, missing.stderr);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, XMem provider DLLs and Metal host/converter"]
+fn xmem_and_backend_collisions_fail_before_metal_host() {
+    let mut fixture = Fixture::new();
+    let exe = fixture.build(false);
+    for name in ["xmem.dll", "victory_xmem_backend.dll"] {
+        let shadow = fixture.temp.path().join(name);
+        fs::copy(fixture.dll_dir.join(name), &shadow).unwrap();
+        let out = fixture.execute(&exe, "unused", "unused", "unused");
+        assert!(!out.status.success() && out.stderr.contains("provider DLL conflict"),
+            "collision accepted for {name}: {}\n{}", out.stdout, out.stderr);
+        assert!(!fixture.host_pid.exists(), "host started with {name} collision");
+        fs::remove_file(shadow).unwrap();
+    }
+    let ordinal = fixture.build_ordinal();
+    let out = fixture.execute(&ordinal, "unused", "unused", "unused");
+    assert!(!out.status.success() && out.stderr.contains("ordinal"), "{}", out.stderr);
+    assert!(!fixture.host_pid.exists(), "host started with XMem ordinal import");
+    let incomplete = fixture.temp.path().join("incomplete-providers");
+    fs::create_dir(&incomplete).unwrap();
+    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll"] {
+        fs::copy(fixture.dll_dir.join(name), incomplete.join(name)).unwrap();
+    }
+    fixture.dll_dir = incomplete;
+    let out = fixture.execute(&exe, "unused", "unused", "unused");
+    assert!(!out.status.success() && out.stderr.contains("victory_xmem_backend.dll"), "{}", out.stderr);
+    assert!(!fixture.host_pid.exists(), "host started without the XMem companion");
 }

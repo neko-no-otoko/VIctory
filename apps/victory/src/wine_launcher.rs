@@ -18,7 +18,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol, layout};
 
-const PROVIDERS: [&str; 3] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll"];
+const PROVIDERS: [&str; 4] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll"];
+const XMEM_BACKEND: &str = "victory_xmem_backend.dll";
+const XMEM_EXPORTS: [&str; 13] = [
+    "XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
+    "XMemIsToolsMemAvailable", "XMemAllocatePhysicalPages", "XMemFreePhysicalPages",
+    "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc",
+    "XMemVirtualQuery", "XMemGetWorkingSetStatistics", "XMemTransferMemory",
+];
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
@@ -248,8 +255,8 @@ fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Resul
     }
 }
 fn wine_overrides() -> Result<OsString> {
-    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime"];
-    let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime=n");
+    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem"];
+    let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime,xmem=n");
     if let Some(existing) = std::env::var_os("WINEDLLOVERRIDES") {
         for entry in existing.as_bytes().split(|b| *b == b';') {
             let Some(eq) = entry.iter().position(|b| *b == b'=') else { continue };
@@ -289,6 +296,21 @@ fn image(path: &Path, is_dll: bool) -> Result<(ImageInfo, usize)> {
     Ok((info, data.len()))
 }
 
+fn require_export(provider: &ImageInfo, file_len: usize, dll: &str, name: &str) -> Result<()> {
+    let export = provider.exports.iter().find(|export| export.name.as_deref() == Some(name))
+        .with_context(|| format!("{dll} does not export {name}"))?;
+    let rva = export.rva.filter(|rva| *rva != 0 && export.forward.is_none())
+        .with_context(|| format!("{dll} export {name} is forwarded or unbacked"))?;
+    let backed = provider.sections.iter().any(|section| {
+        rva.checked_sub(section.rva).is_some_and(|offset| {
+            offset < section.file_size
+                && (u64::from(section.file_offset) + u64::from(offset)) < file_len as u64
+        })
+    });
+    if !backed { bail!("{dll} export {name} is not file-backed"); }
+    Ok(())
+}
+
 // This checks only imports in the executable, not dynamically loaded symbols
 // or imports of other DLLs. Wine remains authoritative about DLL selection.
 fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
@@ -296,6 +318,10 @@ fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
     let mut providers = Vec::new();
     for name in PROVIDERS {
         providers.push(image(&dll_dir.join(name), true)?);
+    }
+    let (backend, backend_len) = image(&dll_dir.join(XMEM_BACKEND), true)?;
+    for name in XMEM_EXPORTS.into_iter().chain(std::iter::once("VIctoryXMemMapAlias")) {
+        require_export(&backend, backend_len, XMEM_BACKEND, name)?;
     }
     for module in guest.imports.iter().chain(&guest.delay_imports) {
         let Some(index) = PROVIDERS.iter().position(|name| module.dll.eq_ignore_ascii_case(name)) else { continue };
@@ -305,17 +331,7 @@ fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
                 ImportSymbol::Name { name, .. } => name,
                 ImportSymbol::Ordinal(ordinal) => bail!("{} imports {} by ordinal #{ordinal}; provider ordinals are not a stable ABI", exe.display(), module.dll),
             };
-            let export = provider.exports.iter().find(|export| export.name.as_deref() == Some(name))
-                .with_context(|| format!("{} does not export {name}", module.dll))?;
-            let rva = export.rva.filter(|rva| *rva != 0 && export.forward.is_none())
-                .with_context(|| format!("{} export {name} is forwarded or unbacked", module.dll))?;
-            let backed = provider.sections.iter().any(|section| {
-                rva.checked_sub(section.rva).is_some_and(|offset| {
-                    offset < section.file_size
-                        && (u64::from(section.file_offset) + u64::from(offset)) < *file_len as u64
-                })
-            });
-            if !backed { bail!("{} export {name} is not file-backed", module.dll); }
+            require_export(provider, *file_len, &module.dll, name)?;
         }
     }
     Ok(())
@@ -326,7 +342,8 @@ fn reject_shadow_dlls(dir: &Path, selected: &[PathBuf]) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("reading DLL search directory {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("reading DLL search directory {}", dir.display()))?;
-        if let Some(index) = PROVIDERS.iter().position(|name| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
+        if let Some(index) = PROVIDERS.iter().copied().chain(std::iter::once(XMEM_BACKEND))
+            .position(|name| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
             let resolved = fs::canonicalize(entry.path())
                 .with_context(|| format!("resolving possible provider DLL conflict {}", entry.path().display()))?;
             if resolved != selected[index] {
@@ -363,7 +380,8 @@ fn windows_child_directory(parent: &Path, name: &str) -> Result<Option<PathBuf>>
 }
 
 fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path) -> Result<()> {
-    let selected: Vec<_> = PROVIDERS.iter().map(|name| regular_file(&dll_dir.join(name), name)).collect::<Result<_>>()?;
+    let selected: Vec<_> = PROVIDERS.iter().copied().chain(std::iter::once(XMEM_BACKEND))
+        .map(|name| regular_file(&dll_dir.join(name), name)).collect::<Result<_>>()?;
     reject_shadow_dlls(dll_dir, &selected)?;
     reject_shadow_dlls(exe.parent().context("guest executable has no parent directory")?, &selected)?;
     reject_shadow_dlls(&std::env::current_dir().context("reading current directory")?, &selected)?;

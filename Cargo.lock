@@ -695,6 +695,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "windows-sys",
 ]
 
 [[package]]
@@ -852,6 +853,21 @@ name = "victory-xgameruntime-dll"
 version = "0.1.0"
 dependencies = [
  "victory-hle",
+]
+
+[[package]]
+name = "victory-xmem-backend"
+version = "0.1.0"
+dependencies = [
+ "victory-hle",
+ "windows-sys",
+]
+
+[[package]]
+name = "victory-xmem-dll"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

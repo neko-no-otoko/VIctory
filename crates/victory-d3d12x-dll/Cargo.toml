@@ -16,6 +16,7 @@ victory-gpu.workspace = true
 victory-hle.workspace = true
 victory-loader.workspace = true
 victory-pe.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
 [lints]
 workspace = true

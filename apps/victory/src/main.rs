@@ -167,7 +167,7 @@ enum Command {
         /// Apple Metal Shader Converter dylib.
         #[arg(long)]
         converter: PathBuf,
-        /// Directory containing the three named VIctory HLE DLLs.
+        /// Directory containing the VIctory HLE DLLs and private XMem backend.
         #[arg(long)]
         dll_dir: PathBuf,
         /// Existing, explicitly selected Wine prefix directory.

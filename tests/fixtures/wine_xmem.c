@@ -145,6 +145,35 @@ int main(void) {
     CHECK(dest[0] == 0x12 && dest[65536] == 0x34);
     dest[65536] = 0x56; CHECK(source[65536] == 0x56);
     CHECK(alias((uint64_t)(uintptr_t)dest, 0, 131072));
+    /* Exercise the local D3D12.X queue callback against this same XMem
+       backend. The separate launcher regression exercises the Metal proxy;
+       this deliberately selects the local HLE path for the queue ABI. */
+    CHECK(SetEnvironmentVariableA("VICTORY_WINE_METAL_ADDR", NULL));
+    HMODULE d3d = LoadLibraryW(L"d3d12_xs.dll");
+    CHECK(module_path(d3d, L"VICTORY_EXPECT_D3D12X_DLL"));
+    typedef HRESULT (WINAPI *CreateDevice)(const void *, const unsigned *, const GUID *, void **);
+    CreateDevice create_device = (CreateDevice)GetProcAddress(d3d, "D3D12XboxCreateDevice");
+    const GUID device_iid = {0x189819f1, 0x1db6, 0x4b57, {0xbe,0x54,0x18,0x21,0x33,0x9b,0x85,0xf7}};
+    const GUID queue_iid = {0x0ec870a6, 0x5d7e, 0x4c22, {0x8c,0xfc,0x5b,0xaa,0xe0,0x76,0x16,0xed}};
+    unsigned version = 0x00020004;
+    void *device = NULL, *queue = NULL;
+    CHECK(create_device && create_device(NULL, &version, &device_iid, &device) == 0 && device);
+    struct QueueDesc { unsigned kind; int priority; unsigned flags, nodes; } queue_desc = {0,0,0,1};
+    typedef HRESULT (WINAPI *CreateQueue)(void *, const struct QueueDesc *, const GUID *, void **);
+    CreateQueue create_queue = (CreateQueue)(*(void ***)device)[8];
+    CHECK(create_queue(device, &queue_desc, &queue_iid, &queue) == 0 && queue);
+    struct PageRange { unsigned kind, start, count; } range = {0, 0, 2};
+    struct PageBatch { uint64_t destination; unsigned count; const struct PageRange *ranges; } batch = {(uint64_t)(uintptr_t)dest, 1, &range};
+    typedef HRESULT (WINAPI *CopyPages)(void *, unsigned, const struct PageBatch *, uint64_t, unsigned, unsigned);
+    CopyPages copy_pages = (CopyPages)(*(void ***)queue)[29];
+    CHECK(copy_pages(queue, 1, &batch, (uint64_t)(uintptr_t)source, 2, 0) == 0);
+    CHECK(dest[0] == 0x12 && dest[65536] == 0x56);
+    range.kind = 2;
+    CHECK(copy_pages(queue, 1, &batch, 0, 0, 0) == 0);
+    CHECK(XMemVirtualQuery(GetCurrentProcess(), dest, &info) && info.host.State == MEM_RESERVE);
+    typedef ULONG (WINAPI *Release)(void *);
+    ((Release)(*(void ***)queue)[2])(queue);
+    ((Release)(*(void ***)device)[2])(device);
     CHECK(XMemMapPhysicalPages(source, 2, NULL) == source);
     void *addresses[2] = {source, source + 65536};
     CHECK(XMemMapPhysicalPagesScatter(addresses, 2, pages));
