@@ -45,6 +45,7 @@ unsafe extern "C" {
         vertex_count: u32,
         fragment_constants: *const u32,
         pixels: *mut u8,
+        preserve: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -191,11 +192,33 @@ impl Renderer {
 
     /// Draw a triangle list with the configured fragment b0 constants.
     /// The exact configured number of dwords must be supplied on every draw.
+    /// Pixels not covered by the triangles are cleared to transparent black.
     pub fn draw(
         &mut self,
         vertices: &[[f32; 4]],
         fragment_constants: &[u32],
         pixels: &mut [u8],
+    ) -> Result<(), RenderError> {
+        self.draw_inner(vertices, fragment_constants, pixels, false)
+    }
+
+    /// Draw a triangle list over the existing tightly packed RGBA8 pixels.
+    /// Pixels not covered by the triangles retain their original values.
+    pub fn draw_preserving(
+        &mut self,
+        vertices: &[[f32; 4]],
+        fragment_constants: &[u32],
+        pixels: &mut [u8],
+    ) -> Result<(), RenderError> {
+        self.draw_inner(vertices, fragment_constants, pixels, true)
+    }
+
+    fn draw_inner(
+        &mut self,
+        vertices: &[[f32; 4]],
+        fragment_constants: &[u32],
+        pixels: &mut [u8],
+        preserve: bool,
     ) -> Result<(), RenderError> {
         if vertices.is_empty()
             || vertices.len() % 3 != 0
@@ -222,6 +245,7 @@ impl Renderer {
                 count,
                 fragment_constants.as_ptr(),
                 pixels.as_mut_ptr(),
+                preserve,
                 error.as_mut_ptr(),
                 error.len(),
             )

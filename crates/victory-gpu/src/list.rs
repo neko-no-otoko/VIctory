@@ -619,7 +619,30 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
-    reject_metal!(this, "texture copies are unsupported on Metal");
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the caller supplies both copy locations.
+        let (Some(dst), Some(src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
+            return with_metal(this, |s| s.reject("null texture copy location"));
+        };
+        // The subresource index occupies the first four bytes of the source union.
+        let subresource = unsafe { (&raw const src.footprint).cast::<u32>().read_unaligned() };
+        if dst.kind != 1
+            || src.kind != 0
+            || subresource != 0
+            || x != 0
+            || y != 0
+            || z != 0
+            || !source_box.is_null()
+        {
+            return with_metal(this, |s| {
+                s.reject("only whole texture-to-buffer readback is supported")
+            });
+        }
+        return with_metal(this, |s| {
+            s.read_texture(src.resource, dst.resource, dst.footprint)
+        });
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -725,6 +748,10 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    #[cfg(target_os = "macos")]
+    if _flags != 0 {
+        return with_metal(this, |s| s.reject("texture copy flags are unsupported"));
+    }
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1301,6 +1328,66 @@ mod state {
         super::count_dispatch();
         with_metal(this, |s| s.dispatch([x, y, z]));
     }
+    pub(super) extern "system" fn topology(this: This, value: u32) {
+        with_metal(this, |s| s.set_topology(value));
+    }
+    pub(super) extern "system" fn viewports(
+        this: This,
+        count: u32,
+        values: *const crate::metal::Viewport,
+    ) {
+        if count != 1 || values.is_null() {
+            return with_metal(this, |s| s.reject("expected one viewport"));
+        }
+        // SAFETY: caller supplies one viewport.
+        with_metal(this, |s| s.set_viewport(unsafe { *values }));
+    }
+    pub(super) extern "system" fn scissors(
+        this: This,
+        count: u32,
+        values: *const crate::metal::Scissor,
+    ) {
+        if count != 1 || values.is_null() {
+            return with_metal(this, |s| s.reject("expected one scissor"));
+        }
+        // SAFETY: caller supplies one rectangle.
+        with_metal(this, |s| s.set_scissor(unsafe { *values }));
+    }
+    pub(super) extern "system" fn vertex_buffers(
+        this: This,
+        start: u32,
+        count: u32,
+        views: *const crate::metal::VertexView,
+    ) {
+        if start != 0 || count != 1 || views.is_null() {
+            return with_metal(this, |s| s.reject("expected vertex buffer slot zero"));
+        }
+        // SAFETY: caller supplies one vertex view.
+        with_metal(this, |s| s.set_vertex(unsafe { *views }));
+    }
+    pub(super) extern "system" fn targets(
+        this: This,
+        count: u32,
+        handles: *const u64,
+        _one_range: i32,
+        depth: *const u64,
+    ) {
+        if count != 1 || handles.is_null() || !depth.is_null() {
+            return with_metal(this, |s| s.reject("expected one color target and no depth"));
+        }
+        // SAFETY: caller supplies one handle.
+        with_metal(this, |s| s.set_target(unsafe { *handles }));
+    }
+    pub(super) extern "system" fn draw(
+        this: This,
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    ) {
+        super::count_draw();
+        with_metal(this, |s| s.draw(vertices, instances, first, first_instance));
+    }
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_view;
     pub(super) use super::ignored_state as graphics_constant;
@@ -1308,13 +1395,7 @@ mod state {
     pub(super) use super::ignored_state as graphics_table;
     pub(super) use super::ignored_state as graphics_view;
     pub(super) use super::ignored_state as index_buffer;
-    pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as targets;
-    pub(super) use super::ignored_state as topology;
-    pub(super) use super::ignored_state as vertex_buffers;
-    pub(super) use super::ignored_state as viewports;
-    pub(super) use super::ignored_state as draw;
     pub(super) use super::ignored_state as draw_indexed;
     pub(super) use super::ignored_state as dispatch_mesh;
     pub(super) use super::ignored_state as dispatch_mesh_x;

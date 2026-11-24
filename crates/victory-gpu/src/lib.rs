@@ -34,6 +34,10 @@ mod indirect;
 pub mod list;
 #[cfg(target_os = "macos")]
 mod metal;
+#[cfg(target_os = "macos")]
+mod metal_graphics;
+#[cfg(all(test, target_os = "macos"))]
+mod metal_graphics_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod metal_tests;
 pub mod object;

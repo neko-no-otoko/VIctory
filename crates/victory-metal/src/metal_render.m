@@ -155,7 +155,8 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, co
 }
 
 bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
-                        const uint32_t *constants, uint8_t *pixels, char *error, size_t error_len) {
+                        const uint32_t *constants, uint8_t *pixels, bool preserve,
+                        char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
@@ -166,12 +167,25 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
         memcpy(r.vertices.contents, vertices, size);
         if (r.fragmentConstants)
             memcpy(r.fragmentConstants.contents, constants, r.fragmentConstantBytes);
+        id<MTLCommandBuffer> command = [r.queue commandBuffer];
+        if (!command) return fail(error, error_len, @"render command creation failed");
+        if (preserve) {
+            size_t row = (size_t)r.width * 4;
+            for (uint32_t y = 0; y < r.height; ++y)
+                memcpy((uint8_t *)r.readback.contents + (size_t)y * r.stride, pixels + (size_t)y * row, row);
+            id<MTLBlitCommandEncoder> upload = [command blitCommandEncoder];
+            if (!upload) return fail(error, error_len, @"upload blit command creation failed");
+            [upload copyFromBuffer:r.readback sourceOffset:0 sourceBytesPerRow:r.stride
+               sourceBytesPerImage:r.stride * r.height sourceSize:MTLSizeMake(r.width, r.height, 1)
+                         toTexture:r.texture destinationSlice:0 destinationLevel:0
+                 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [upload endEncoding];
+        }
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = r.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].loadAction = preserve ? MTLLoadActionLoad : MTLLoadActionClear;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLCommandBuffer> command = [r.queue commandBuffer];
         id<MTLRenderCommandEncoder> render = [command renderCommandEncoderWithDescriptor:pass];
         if (!command || !render) return fail(error, error_len, @"render command creation failed");
         [render setRenderPipelineState:r.pipeline];

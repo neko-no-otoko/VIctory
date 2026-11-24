@@ -129,61 +129,133 @@ impl Drop for HeapRef {
 }
 
 const COMMON: u32 = 0;
+const VERTEX_BUFFER: u32 = 1;
+const RENDER_TARGET: u32 = 4;
 const UAV: u32 = 0x8;
 const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
 
-fn supported_state(state: u32) -> bool {
-    matches!(state, COMMON | UAV | COPY_DEST | COPY_SOURCE)
+fn state_of(resource: This) -> Result<(bool, u32), String> {
+    if let Some(state) =
+        crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
+    {
+        return Ok((false, state));
+    }
+    crate::resource::metal_texture_state(resource, |s| (true, s.load(Ordering::Relaxed)))
+        .ok_or_else(|| "unsupported resource for Metal state tracking".into())
 }
-
+fn store_state(resource: This, texture: bool, state: u32) {
+    if texture {
+        crate::resource::metal_texture_state(resource, |s| s.store(state, Ordering::Relaxed));
+    } else {
+        crate::resource::metal_buffer_state(resource, |s| s.store(state, Ordering::Relaxed));
+    }
+}
+fn supports_state(texture: bool, state: u32) -> bool {
+    if texture {
+        matches!(state, COMMON | RENDER_TARGET | COPY_SOURCE)
+    } else {
+        matches!(
+            state,
+            COMMON | VERTEX_BUFFER | UAV | COPY_DEST | COPY_SOURCE
+        )
+    }
+}
+fn can_promote(texture: bool, state: u32) -> bool {
+    !texture || matches!(state, COMMON | COPY_SOURCE)
+}
+struct Touched {
+    resource: ResourceRef,
+    texture: bool,
+    decay: bool,
+}
 /// All lists in one ExecuteCommandLists call share promotions and decay together.
 #[derive(Default)]
 pub(crate) struct Submission {
-    touched: HashMap<usize, ResourceRef>,
+    touched: HashMap<usize, Touched>,
 }
 impl Submission {
     fn access(&mut self, resource: This, required: u32) -> Result<(), String> {
-        let current = crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
-            .ok_or("only committed default-heap buffers are supported")?;
-        if current != COMMON && current != required {
+        let (texture, current) = state_of(resource)?;
+        if current != required && !(current == COMMON && can_promote(texture, required)) {
             return Err(format!(
-                "buffer state {current:#x} does not permit {required:#x}"
+                "resource state {current:#x} does not permit {required:#x}"
             ));
         }
-        self.touch(resource);
+        let decay = !texture || (current == COMMON && required == COPY_SOURCE);
+        self.touched
+            .entry(resource as usize)
+            .or_insert_with(|| Touched {
+                resource: ResourceRef::new(resource),
+                texture,
+                decay,
+            });
         if current == COMMON {
-            crate::resource::metal_buffer_state(resource, |s| s.store(required, Ordering::Relaxed));
+            store_state(resource, texture, required);
         }
         Ok(())
     }
     fn transition(&mut self, resource: This, before: u32, after: u32) -> Result<(), String> {
-        let current = crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
-            .ok_or("only committed default-heap buffers are supported")?;
-        if current != COMMON && current != before {
+        let (texture, current) = state_of(resource)?;
+        if current != before && !(current == COMMON && can_promote(texture, before)) {
             return Err(format!(
                 "transition expected {before:#x}, found {current:#x}"
             ));
         }
-        self.touch(resource);
-        crate::resource::metal_buffer_state(resource, |s| s.store(after, Ordering::Relaxed));
-        Ok(())
-    }
-    fn touch(&mut self, resource: This) {
-        self.touched
+        let touched = self
+            .touched
             .entry(resource as usize)
-            .or_insert_with(|| ResourceRef::new(resource));
+            .or_insert_with(|| Touched {
+                resource: ResourceRef::new(resource),
+                texture,
+                decay: !texture,
+            });
+        if texture {
+            touched.decay = false;
+        }
+        store_state(resource, texture, after);
+        Ok(())
     }
 }
 impl Drop for Submission {
     fn drop(&mut self) {
-        // D3D12 buffers decay to COMMON after the entire submission completes.
-        for resource in self.touched.values() {
-            crate::resource::metal_buffer_state(resource.ptr(), |s| {
-                s.store(COMMON, Ordering::Relaxed)
-            });
+        for touched in self.touched.values() {
+            if touched.decay {
+                store_state(touched.resource.ptr(), touched.texture, COMMON);
+            }
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VertexView {
+    pub address: u64,
+    pub size: u32,
+    pub stride: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min: f32,
+    pub max: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Scissor {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+struct VertexBuffer {
+    resource: ResourceRef,
+    offset: u64,
+    size: u32,
 }
 
 #[derive(Default)]
@@ -194,6 +266,19 @@ enum Root {
     Table(u64),
 }
 enum Command {
+    Draw {
+        pipeline: Arc<Mutex<crate::metal_graphics::Prepared>>,
+        vertex: ResourceRef,
+        vertex_offset: u64,
+        vertices: u32,
+        target: ResourceRef,
+    },
+    ReadTexture {
+        target: ResourceRef,
+        buffer: ResourceRef,
+        offset: u64,
+        pitch: u32,
+    },
     Transition {
         resource: ResourceRef,
         before: u32,
@@ -222,6 +307,13 @@ enum Command {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: Option<Arc<Mutex<Prepared>>>,
+    graphics: Option<Arc<Mutex<crate::metal_graphics::Prepared>>>,
+    vertex: Option<VertexBuffer>,
+    target: Option<ResourceRef>,
+    viewport: Option<Viewport>,
+    scissor: Option<Scissor>,
+    triangle_list: bool,
+    scratch: Vec<u8>,
     heap: Option<Arc<HeapRef>>,
     roots: Vec<Root>,
     local_states: HashMap<usize, u32>,
@@ -243,8 +335,9 @@ impl State {
         self.error.is_none()
     }
     fn use_state(&mut self, resource: This, required: u32) -> Result<(), String> {
-        if crate::resource::metal_buffer_state(resource, |_| ()).is_none() {
-            return Err("only committed default-heap buffers are supported".into());
+        let (texture, _) = state_of(resource)?;
+        if !supports_state(texture, required) {
+            return Err("unsupported resource state".into());
         }
         if required == UAV && !crate::resource::metal_buffer_allows_uav(resource) {
             return Err("buffer was not created for unordered access".into());
@@ -253,7 +346,7 @@ impl State {
             .local_states
             .entry(resource as usize)
             .or_insert(required);
-        if *state != COMMON && *state != required {
+        if *state != required && !(*state == COMMON && can_promote(texture, required)) {
             return Err(format!(
                 "recorded buffer state {:#x} does not permit {required:#x}",
                 *state
@@ -266,16 +359,16 @@ impl State {
         if !self.open() {
             return;
         }
+        let Ok((texture, _)) = state_of(resource) else {
+            self.reject("unsupported resource for transition");
+            return;
+        };
         if subresource != u32::MAX
-            || !supported_state(before)
-            || !supported_state(after)
+            || !supports_state(texture, before)
+            || !supports_state(texture, after)
             || before == after
         {
-            self.reject("unsupported buffer transition");
-            return;
-        }
-        if crate::resource::metal_buffer_state(resource, |_| ()).is_none() {
-            self.reject("transitions support only committed default-heap buffers");
+            self.reject("unsupported resource transition");
             return;
         }
         if (before == UAV || after == UAV) && !crate::resource::metal_buffer_allows_uav(resource) {
@@ -285,7 +378,9 @@ impl State {
         if self
             .local_states
             .get(&(resource as usize))
-            .is_some_and(|state| *state != COMMON && *state != before)
+            .is_some_and(|state| {
+                *state != before && !(*state == COMMON && can_promote(texture, before))
+            })
         {
             self.reject("transition before-state does not match earlier commands");
             return;
@@ -301,10 +396,200 @@ impl State {
         if !self.open() {
             return;
         }
-        match crate::pipeline::metal_compute(pipeline) {
-            Ok(p) => self.pipeline = Some(p),
-            Err(e) => self.reject(&e),
+        self.pipeline = None;
+        self.graphics = None;
+        if crate::pipeline::metal_is_graphics(pipeline) {
+            match crate::pipeline::metal_graphics(pipeline) {
+                Ok(p) => self.graphics = Some(p),
+                Err(e) => self.reject(&e),
+            }
+        } else {
+            match crate::pipeline::metal_compute(pipeline) {
+                Ok(p) => self.pipeline = Some(p),
+                Err(e) => self.reject(&e),
+            }
         }
+    }
+    pub(crate) fn set_topology(&mut self, topology: u32) {
+        if !self.open() {
+            return;
+        }
+        if topology != 4 {
+            self.reject("only triangle-list topology is supported");
+            return;
+        }
+        self.triangle_list = true;
+    }
+    pub(crate) fn set_viewport(&mut self, viewport: Viewport) {
+        if !self.open() {
+            return;
+        }
+        if viewport.x != 0.0
+            || viewport.y != 0.0
+            || !viewport.width.is_finite()
+            || !viewport.height.is_finite()
+            || viewport.width <= 0.0
+            || viewport.height <= 0.0
+            || viewport.min != 0.0
+            || viewport.max != 1.0
+        {
+            self.reject("only full-target viewports are supported");
+            return;
+        }
+        self.viewport = Some(viewport);
+    }
+    pub(crate) fn set_scissor(&mut self, scissor: Scissor) {
+        if !self.open() {
+            return;
+        }
+        if scissor.left != 0 || scissor.top != 0 || scissor.right <= 0 || scissor.bottom <= 0 {
+            self.reject("only full-target scissors are supported");
+            return;
+        }
+        self.scissor = Some(scissor);
+    }
+    pub(crate) fn set_vertex(&mut self, view: VertexView) {
+        if !self.open() {
+            return;
+        }
+        if view.stride != 16 || view.size == 0 || view.address % 4 != 0 {
+            self.reject("expected an aligned float4 vertex buffer");
+            return;
+        }
+        let Some((resource, offset)) =
+            crate::resource::metal_buffer_at(view.address, u64::from(view.size))
+        else {
+            self.reject("vertex buffer address is not a live committed buffer");
+            return;
+        };
+        // metal_buffer_at returned an owned reference.
+        self.vertex = Some(VertexBuffer {
+            resource: ResourceRef(resource as usize),
+            offset,
+            size: view.size,
+        });
+    }
+    pub(crate) fn set_target(&mut self, handle: u64) {
+        if !self.open() {
+            return;
+        }
+        let Some(rtv) = descriptor::rtv_record(handle) else {
+            self.reject("invalid render-target descriptor");
+            return;
+        };
+        if !rtv.metal_rgba8() || crate::resource::metal_texture(rtv.resource).is_none() {
+            self.reject("expected a linear RGBA8 render target");
+            return;
+        }
+        self.target = Some(ResourceRef::new(rtv.resource));
+    }
+    pub(crate) fn draw(&mut self, count: u32, instances: u32, first: u32, first_instance: u32) {
+        if !self.open() {
+            return;
+        }
+        if let Err(error) = self.record_draw(count, instances, first, first_instance) {
+            self.reject(&error);
+        }
+    }
+    fn record_draw(
+        &mut self,
+        count: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    ) -> Result<(), String> {
+        if !self.triangle_list
+            || count == 0
+            || count % 3 != 0
+            || instances != 1
+            || first_instance != 0
+        {
+            return Err("only nonempty, non-instanced triangle lists are supported".into());
+        }
+        let pipeline = self.graphics.clone().ok_or("no graphics pipeline")?;
+        let vertex = self.vertex.as_ref().ok_or("no vertex buffer")?;
+        let first = u64::from(first)
+            .checked_mul(16)
+            .ok_or("vertex offset overflow")?;
+        let bytes = u64::from(count)
+            .checked_mul(16)
+            .ok_or("vertex size overflow")?;
+        if first.checked_add(bytes).ok_or("vertex range overflow")? > u64::from(vertex.size) {
+            return Err("draw exceeds vertex buffer view".into());
+        }
+        let vertex_offset = vertex
+            .offset
+            .checked_add(first)
+            .ok_or("vertex offset overflow")?;
+        let vertex = ResourceRef::new(vertex.resource.ptr());
+        let target = ResourceRef::new(self.target.as_ref().ok_or("no render target")?.ptr());
+        let (_, width, height, _) =
+            crate::resource::metal_texture(target.ptr()).ok_or("invalid render target")?;
+        let viewport = self.viewport.ok_or("missing viewport")?;
+        let scissor = self.scissor.ok_or("missing scissor")?;
+        if viewport.width != width as f32
+            || viewport.height != height as f32
+            || scissor.right != width as i32
+            || scissor.bottom != height as i32
+        {
+            return Err("viewport and scissor must cover the entire render target".into());
+        }
+        self.use_state(vertex.ptr(), VERTEX_BUFFER)?;
+        self.use_state(target.ptr(), RENDER_TARGET)?;
+        self.commands.push(Command::Draw {
+            pipeline,
+            vertex,
+            vertex_offset,
+            vertices: count,
+            target,
+        });
+        Ok(())
+    }
+    pub(crate) fn read_texture(
+        &mut self,
+        target: This,
+        buffer: This,
+        footprint: crate::resource::PlacedFootprint,
+    ) {
+        if !self.open() {
+            return;
+        }
+        let Some((_, width, height, _)) = crate::resource::metal_texture(target) else {
+            self.reject("unsupported texture readback");
+            return;
+        };
+        let bytes = u64::from(footprint.row_pitch)
+            .checked_mul(u64::from(height.saturating_sub(1)))
+            .and_then(|n| n.checked_add(u64::from(width) * 4));
+        let size = crate::resource::buffer_bytes(buffer).map(|(_, size)| size);
+        if footprint.format != 28
+            || footprint.width != width
+            || footprint.height != height
+            || footprint.depth != 1
+            || footprint.row_pitch % 256 != 0
+            || u64::from(footprint.row_pitch) < u64::from(width) * 4
+            || footprint.offset % 512 != 0
+            || bytes
+                .and_then(|n| footprint.offset.checked_add(n))
+                .zip(size)
+                .is_none_or(|(end, size)| end > size)
+        {
+            self.reject("invalid texture readback footprint");
+            return;
+        }
+        if let Err(error) = self
+            .use_state(target, COPY_SOURCE)
+            .and_then(|()| self.use_state(buffer, COPY_DEST))
+        {
+            self.reject(&error);
+            return;
+        }
+        self.commands.push(Command::ReadTexture {
+            target: ResourceRef::new(target),
+            buffer: ResourceRef::new(buffer),
+            offset: footprint.offset,
+            pitch: footprint.row_pitch,
+        });
     }
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         if !self.open() {
@@ -477,6 +762,99 @@ impl State {
         }
         for command in &mut self.commands {
             match command {
+                Command::Draw {
+                    pipeline,
+                    vertex,
+                    vertex_offset,
+                    vertices,
+                    target,
+                } => {
+                    submission.access(vertex.ptr(), VERTEX_BUFFER)?;
+                    submission.access(target.ptr(), RENDER_TARGET)?;
+                    let (buffer, size) = crate::resource::buffer_bytes(vertex.ptr())
+                        .ok_or("invalid vertex buffer")?;
+                    let vertex_bytes = u64::from(*vertices) * 16;
+                    if vertex_offset
+                        .checked_add(vertex_bytes)
+                        .is_none_or(|end| end > size)
+                    {
+                        return Err("vertex buffer range changed".into());
+                    }
+                    let (texture, width, height, pitch) =
+                        crate::resource::metal_texture(target.ptr())
+                            .ok_or("invalid render target")?;
+                    let row =
+                        usize::try_from(u64::from(width) * 4).map_err(|_| "image row overflow")?;
+                    let len = row
+                        .checked_mul(height as usize)
+                        .ok_or("image size overflow")?;
+                    self.scratch.resize(len, 0);
+                    for y in 0..height as usize {
+                        // SAFETY: texture layout and tightly packed staging ranges were checked.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                texture.add(y * pitch),
+                                self.scratch.as_mut_ptr().add(y * row),
+                                row,
+                            )
+                        };
+                    }
+                    // SAFETY: the buffer is retained, the offset is aligned and the range was checked.
+                    let verts = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer.add(*vertex_offset as usize).cast::<[f32; 4]>(),
+                            *vertices as usize,
+                        )
+                    };
+                    pipeline.lock().unwrap_or_else(|e| e.into_inner()).draw(
+                        width,
+                        height,
+                        verts,
+                        &mut self.scratch,
+                    )?;
+                    for y in 0..height as usize {
+                        // SAFETY: same checked texture and staging ranges as above.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                self.scratch.as_ptr().add(y * row),
+                                texture.add(y * pitch),
+                                row,
+                            )
+                        };
+                    }
+                }
+                Command::ReadTexture {
+                    target,
+                    buffer,
+                    offset,
+                    pitch,
+                } => {
+                    submission.access(target.ptr(), COPY_SOURCE)?;
+                    submission.access(buffer.ptr(), COPY_DEST)?;
+                    let (texture, width, height, texture_pitch) =
+                        crate::resource::metal_texture(target.ptr())
+                            .ok_or("invalid readback texture")?;
+                    let (dst, size) = crate::resource::buffer_bytes(buffer.ptr())
+                        .ok_or("invalid readback buffer")?;
+                    let row = u64::from(width) * 4;
+                    let end = offset
+                        .checked_add(u64::from(*pitch) * u64::from(height - 1))
+                        .and_then(|v| v.checked_add(row))
+                        .ok_or("readback range overflow")?;
+                    if end > size {
+                        return Err("readback exceeds buffer".into());
+                    }
+                    for y in 0..height as usize {
+                        // SAFETY: both resources are retained and all row ranges were checked.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                texture.add(y * texture_pitch),
+                                dst.add(*offset as usize + y * *pitch as usize),
+                                row as usize,
+                            )
+                        };
+                    }
+                }
                 Command::Transition {
                     resource,
                     before,

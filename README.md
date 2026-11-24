@@ -98,10 +98,10 @@ the converter's resource reflection, dispatches it on Metal and verifies
 `41 + 1` is written to a buffer without modifying its other words. This is
 one synthetic compute case, not a game compatibility or renderer test.
 
-The macOS `victory-gpu` command objects also have an experimental synchronous
-compute path: a recorded console compute dispatch translates the native
-shader, loads it through Apple's converter, and executes it on Metal when
-its command list is submitted. It supports a single shader-visible view
+The macOS `victory-gpu` command objects have an experimental synchronous
+compute path: a recorded console dispatch translates the native shader,
+loads it through Apple's converter, and executes it on Metal when its
+command list is submitted. Compute supports a single shader-visible view
 heap, a whole-buffer UAV at descriptor index zero, root constants, recorded
 buffer-to-buffer region copies, unsplit UAV barriers, and whole-buffer
 transitions among `COMMON`, `COPY_SOURCE`, `COPY_DEST` and
@@ -119,11 +119,11 @@ so GPU writes are visible to later copies and barriers. Copy ranges must be in
 bounds and non-overlapping, and source and destination must be distinct.
 Commands retain their resources until the list is reset or released. Placed or
 aliased resources, other heap types and state combinations, individual
-subresources, split or aliasing barriers, textures, other shader bindings,
-descriptor changes after recording, root-signature commands, graphics, waits
-and presentation are not implemented. Unsupported list commands reject the
-list; submission failures latch the queue and prevent later fence signals.
-The caller must not access a mapped buffer concurrently with submission.
+subresources, split or aliasing barriers, other shader bindings, descriptor
+changes after recording, root-signature commands, waits and presentation are
+not implemented. Unsupported list commands reject the list; submission
+failures latch the queue and prevent later fence signals.
+The caller must not access mapped resources concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
 
@@ -137,6 +137,24 @@ VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
 It records copy → transition → compute → transition → copy and checks unchanged
 pre-submit data, the post-submit value 42, surrounding bytes, resource lifetimes,
 batch-wide state tracking and decay, invalid transitions and queue failure.
+
+The same queue can execute a narrowly constrained offscreen draw: a validated
+graphics pipeline stream with resource-free translated vertex/pixel stages,
+one float4 vertex buffer, triangle-list topology, full-target viewport and
+scissor, and one committed linear single-sample RGBA8 render target. It supports
+whole-target readback to a buffer with a 256-byte row-pitched footprint after
+an explicit `RENDER_TARGET` to `COPY_SOURCE` transition. Drawing preserves
+pixels outside the triangle; GPU work and the host-memory copies complete in
+command order. Other graphics states, formats, textured or constant-bound
+shaders, depth, blending, instancing and presentation are rejected.
+
+```sh
+VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-gpu console_triangle_draw_preserves_target_and_copies_to_padded_buffer -- --ignored
+```
+
+The test uses a synthetic 5×4 target to check mapped row pitch, rendered and
+preserved pixels, readback padding, resource lifetime and texture state.
 
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle

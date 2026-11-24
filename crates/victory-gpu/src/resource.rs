@@ -317,11 +317,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -916,6 +916,62 @@ pub(crate) fn metal_buffer_allows_uav(this: This) -> bool {
     !this.is_null() && resource(this).desc.flags & 4 != 0
 }
 
+/// Only linear single-sample RGBA8 targets have a defined CPU-visible layout.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    let d = r.desc;
+    if d.dimension != 3
+        || d.format != 28
+        || d.width == 0
+        || d.height == 0
+        || d.depth_or_array_size != 1
+        || d.mip_levels != 1
+        || d.sample_count != 1
+        || d.sample_quality != 0
+        || d.layout != 1
+        || d.flags != 1
+        || r.heap.kind != 1
+        || !matches!(r.backing, Backing::Committed(_))
+    {
+        return None;
+    }
+    let width = u32::try_from(d.width).ok()?;
+    let pitch = usize::try_from(d.width.checked_mul(4)?.checked_next_multiple_of(256)?).ok()?;
+    Some((r.data(), width, d.height, pitch))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_texture_state<T>(
+    this: This,
+    f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T,
+) -> Option<T> {
+    metal_texture(this)?;
+    Some(f(&resource(this).state))
+}
+
+#[cfg(target_os = "macos")]
+static METAL_BUFFERS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Return an owned reference to the committed buffer containing a GPU address range.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_buffer_at(address: u64, len: u64) -> Option<(This, u64)> {
+    let address = usize::try_from(address).ok()?;
+    let buffers = METAL_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&base, &(object, size)) = buffers.range(..=address).next_back()?;
+    let offset = u64::try_from(address.checked_sub(base)?).ok()?;
+    if offset.checked_add(len)? > size {
+        return None;
+    }
+    let object = object as This;
+    object::add_ref(object);
+    Some((object, offset))
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {
@@ -976,7 +1032,28 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
-    object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+    #[cfg(target_os = "macos")]
+    let registration = (desc.dimension == BUFFER
+        && heap.kind == 1
+        && matches!(resource.backing, Backing::Committed(_)))
+    .then(|| {
+        (
+            resource.data() as usize,
+            std::ptr::from_ref::<Resource>(&resource) as usize,
+            desc.width,
+        )
+    });
+    let result = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    #[cfg(target_os = "macos")]
+    if result == S_OK
+        && let Some((address, object, size)) = registration
+    {
+        METAL_BUFFERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(address, (object, size));
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -1268,7 +1345,25 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
     )
 }
 pub(crate) extern "system" fn resource_release(this: This) -> u32 {
-    object::release_boxed::<Resource>(this)
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffers = METAL_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let r = resource(this);
+        let address = r.data() as usize;
+        let count = object::release_boxed::<Resource>(this);
+        if count == 0
+            && buffers
+                .get(&address)
+                .is_some_and(|(object, _)| *object == this as usize)
+        {
+            buffers.remove(&address);
+        }
+        count
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        object::release_boxed::<Resource>(this)
+    }
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.

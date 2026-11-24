@@ -572,7 +572,7 @@ fn console_compute_records_and_submits_on_metal() {
     assert_eq!(reset(list, allocator, null), S_OK);
     assert_eq!(release(a), 0);
     assert_eq!(release(b), 0);
-    slot::<extern "system" fn(This)>(list, 0x60)(list); // Unsupported draw poisons the list.
+    slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 2, 0, 0); // Instancing is unsupported.
     assert_eq!(
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
         object::E_NOTIMPL

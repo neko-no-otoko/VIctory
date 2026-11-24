@@ -167,6 +167,10 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(target_os = "macos")]
+    graphics: Result<(), String>,
+    #[cfg(target_os = "macos")]
+    metal_graphics: OnceLock<Result<Arc<Mutex<crate::metal_graphics::Prepared>>, String>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -207,6 +211,46 @@ pub(crate) fn metal_compute(this: This) -> Result<Arc<Mutex<crate::metal::Prepar
         .metal
         .get_or_init(|| {
             crate::metal::Prepared::new(&p.shaders[0].container).map(|p| Arc::new(Mutex::new(p)))
+        })
+        .clone()
+}
+
+/// Whether a pipeline contains any graphics stage, including unsupported stages.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_is_graphics(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this)
+            .shaders
+            .iter()
+            .any(|shader| shader.stage != "compute")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_graphics(
+    this: This,
+) -> Result<Arc<Mutex<crate::metal_graphics::Prepared>>, String> {
+    if this.is_null() {
+        return Err("no graphics pipeline bound".into());
+    }
+    let p = pipeline(this);
+    p.graphics.as_ref().map_err(Clone::clone)?;
+    if p.shaders.len() != 2 {
+        return Err("expected exactly vertex and pixel shaders".into());
+    }
+    let vertex = p
+        .shaders
+        .iter()
+        .find(|s| s.stage == "vertex")
+        .ok_or("missing vertex shader")?;
+    let pixel = p
+        .shaders
+        .iter()
+        .find(|s| s.stage == "pixel")
+        .ok_or("missing pixel shader")?;
+    p.metal_graphics
+        .get_or_init(|| {
+            crate::metal_graphics::Prepared::new(&vertex.container, &pixel.container)
+                .map(|prepared| Arc::new(Mutex::new(prepared)))
         })
         .clone()
 }
@@ -325,6 +369,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(target_os = "macos")] graphics: Result<(), String>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -338,6 +383,10 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(target_os = "macos")]
+        graphics,
+        #[cfg(target_os = "macos")]
+        metal_graphics: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -361,6 +410,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(target_os = "macos")]
+        Err("plain graphics descriptions are unsupported".into()),
         iid,
         out,
     )
@@ -381,6 +432,8 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        #[cfg(target_os = "macos")]
+        Err("compute pipeline is not a graphics stream".into()),
         iid,
         out,
     )
@@ -455,6 +508,8 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    #[cfg(target_os = "macos")]
+    let mut metal_state = crate::metal_graphics::StreamState::default();
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
@@ -466,6 +521,16 @@ pub(crate) extern "system" fn create_stream(
                 "pipeline subobject of unknown size; the rest is ignored"
             );
             break;
+        };
+        #[cfg(target_os = "macos")]
+        if size > desc.size - at {
+            metal_state.reject("truncated pipeline subobject");
+            break;
+        }
+        #[cfg(target_os = "macos")]
+        // SAFETY: the complete subobject is inside the caller's stream.
+        unsafe {
+            metal_state.read(kind, desc.stream.add(at), size)
         };
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
@@ -479,10 +544,16 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(target_os = "macos")]
+    if at != desc.size {
+        metal_state.reject("incomplete or unknown pipeline subobject");
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(target_os = "macos")]
+        metal_state.finish(),
         iid,
         out,
     )
