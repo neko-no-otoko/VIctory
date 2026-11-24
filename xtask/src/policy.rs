@@ -18,6 +18,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 ];
 const ALLOWED_NAMES: &[&str] = &[
     "d3d12-probe.c",
+    "metal_compute_probe.m",
     "rosetta-avx-probe.c",
     ".gitignore",
     ".gitattributes",
@@ -196,6 +197,13 @@ mod tests {
     #[test]
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
+        assert!(
+            check(
+                "apps/victory/tests/metal_compute_probe.m",
+                b"int main() {}\n"
+            )
+            .is_empty()
+        );
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
     }

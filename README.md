@@ -85,6 +85,19 @@ and this command does not create a Metal renderer. To exercise the converter
 integration test, set `VICTORY_TEST_METAL_CONVERTER` to the dylib path and run
 `cargo test -p victory --test shader_offline`.
 
+An opt-in GPU test requires a Metal device with argument buffers tier 2,
+Xcode command-line tools and the converter library:
+
+```sh
+VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory --test metal_compute -- --ignored
+```
+
+It emits DXIL from a synthetic one-thread GFX10 shader, converts it, checks
+the converter's resource reflection, dispatches it on Metal and verifies
+`41 + 1` is written to a buffer without modifying its other words. This is
+one synthetic compute case, not a game compatibility or renderer test.
+
 Input files are supplied by the user; see [the asset policy](docs/asset-policy.md).
 
 ## Getting started
