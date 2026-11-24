@@ -102,12 +102,17 @@ The macOS `victory-gpu` command objects also have an experimental synchronous
 compute path: a recorded console compute dispatch translates the native
 shader, loads it through Apple's converter, and executes it on Metal when
 its command list is submitted. It supports a single shader-visible view
-heap, a whole-buffer UAV at descriptor index zero, and root constants;
-other shader bindings, descriptor changes after recording, root-signature
-commands, graphics, resource barriers, copies, waits and presentation are
-not implemented. Unsupported list commands reject the list; a submission
-failure latches the queue and prevents later fence signals. Dispatches retain
-their pipeline, heap and resource until the list is reset or released.
+heap, a whole-buffer UAV at descriptor index zero, root constants, recorded
+buffer-to-buffer region copies, and unsplit UAV barriers for buffers (or all
+UAVs). Copies use the buffers' host memory at submission; each dispatch is
+waited for before the next command, so GPU writes are visible to later copies
+and UAV barriers are satisfied by that synchronous ordering. Copy ranges must
+be in bounds and must not overlap, and source and destination must be distinct
+resources. Commands retain their resources until the list is reset or released.
+Other shader bindings, descriptor changes after recording, root-signature
+commands, graphics, transition and split barriers, texture copies, waits and
+presentation are not implemented. Unsupported list commands reject the list;
+a submission failure latches the queue and prevents later fence signals.
 The caller must not access a mapped buffer concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
@@ -119,9 +124,10 @@ VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
   cargo test -p victory-gpu console_compute_records_and_submits_on_metal -- --ignored
 ```
 
-It checks the buffer is unchanged before submission, runs two ordered
-dispatches with different constants, verifies the result is 42, and checks
-that a rejected list prevents the queue from signalling its fence.
+It records an offset buffer copy, dispatches a translated shader that reads the
+copied word, then copies the result to a different offset. It checks unchanged
+pre-submit data, post-submit value 42 and untouched surrounding bytes, resource
+lifetimes, rejected copy ranges and barriers, and queue failure signalling.
 
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle

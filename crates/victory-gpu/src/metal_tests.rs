@@ -49,19 +49,28 @@ struct ResourceDesc {
     layout: u32,
     flags: u32,
 }
+#[repr(C)]
+struct Barrier {
+    kind: u32,
+    flags: u32,
+    resource: This,
+    reserved: [u64; 2],
+}
 
 fn iid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Iid {
     object::guid(a, b, c, d)
 }
 
-// Synthetic FSSM console compute container: 1 thread writes s0 + 1 to UAV 0.
+// Synthetic FSSM compute: load UAV word 1, add s0, store in UAV word 0.
 fn shader() -> Vec<u8> {
     let words = [
         0xbe85_0380u32,
         0xf408_0202,
         0xfa00_0000,
-        0x7e00_0200,
-        0x4a00_0081,
+        0xe030_0004,
+        0x8002_0000,
+        0xbf8c_0070,
+        0x4a00_0000,
         0xe070_0000,
         0x8002_0000,
         0xbf81_0000,
@@ -224,6 +233,38 @@ fn console_compute_records_and_submits_on_metal() {
         ),
         S_OK
     );
+    let mut source = null;
+    let mut target = null;
+    for out in [&mut source, &mut target] {
+        assert_eq!(
+            make_resource(
+                dev,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                out
+            ),
+            S_OK
+        );
+    }
+    let map = slot::<extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT>(
+        resource, 0x40,
+    );
+    let mut input = std::ptr::null_mut();
+    let mut output = std::ptr::null_mut();
+    assert_eq!(map(source, 0, null.cast(), &mut input), S_OK);
+    assert_eq!(map(target, 0, null.cast(), &mut output), S_OK);
+    // SAFETY: both mapped buffers have 64 bytes.
+    unsafe {
+        std::ptr::write_bytes(input, 0x55, 64);
+        std::ptr::write_bytes(output, 0x77, 64);
+        for (i, value) in [0u32, 22, 33, 44].into_iter().enumerate() {
+            input.add(8 + i * 4).cast::<u32>().write_unaligned(value);
+        }
+    }
     let mut mapped = std::ptr::null_mut();
     assert_eq!(
         slot::<extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT>(
@@ -301,11 +342,23 @@ fn console_compute_records_and_submits_on_metal() {
     slot::<extern "system" fn(This, u32, u64)>(list, 0x118)(list, 1, handle);
     let constants = slot::<extern "system" fn(This, u32, u32, *const u32, u32)>(list, 0x138);
     let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x70);
+    let copy = slot::<extern "system" fn(This, This, u64, This, u64, u64)>(list, 0x78);
+    let barrier = slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0);
+    let uav_barrier = Barrier {
+        kind: 2,
+        flags: 0,
+        resource,
+        reserved: [0; 2],
+    };
+    copy(list, resource, 4, source, 8, 16);
     constants(list, 0, 4, [8, 0, 0, 0].as_ptr(), 0);
     dispatch(list, 1, 1, 1);
+    assert_eq!(barrier(list, 1, &uav_barrier), 0);
     slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
     constants(list, 0, 4, [41, 0, 0, 0].as_ptr(), 0);
     dispatch(list, 1, 1, 1);
+    assert_eq!(barrier(list, 1, &uav_barrier), 0);
+    copy(list, target, 12, resource, 0, 20);
     let closed = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
     assert_eq!(
         closed,
@@ -315,7 +368,16 @@ fn console_compute_records_and_submits_on_metal() {
     );
     // SAFETY: list holds the resource alive through submission.
     assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 0x12345678);
-    assert_eq!(release(resource), 2);
+    // SAFETY: the recorded copies retain both mapped buffers.
+    assert_eq!(
+        unsafe { output.add(12).cast::<u32>().read_unaligned() },
+        0x77777777
+    );
+    // SAFETY: the source is mapped and retained; submission has not begun.
+    unsafe { input.add(8).cast::<u32>().write_unaligned(1) };
+    assert_eq!(release(source), 1);
+    assert_eq!(release(target), 1);
+    assert_eq!(release(resource), 6);
     assert_eq!(release(heap), 1);
     assert_eq!(release(pipeline), 0);
     let queue_iid = iid(
@@ -340,6 +402,19 @@ fn console_compute_records_and_submits_on_metal() {
     slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
     // SAFETY: list still holds the resource reference.
     assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 42);
+    // SAFETY: the list still owns the destination through its copy command.
+    let copied: Vec<u32> = (0..5)
+        .map(|i| unsafe { output.add(12 + i * 4).cast::<u32>().read_unaligned() })
+        .collect();
+    assert_eq!(copied, [42, 1, 22, 33, 44]);
+    assert_eq!(
+        unsafe { output.add(8).cast::<u32>().read_unaligned() },
+        0x77777777
+    );
+    assert_eq!(
+        unsafe { output.add(32).cast::<u32>().read_unaligned() },
+        0x77777777
+    );
     let mut fence = null;
     assert_eq!(
         slot::<extern "system" fn(This, u64, u32, *const Iid, *mut This) -> HRESULT>(dev, 0x120)(
@@ -378,6 +453,43 @@ fn console_compute_records_and_submits_on_metal() {
         slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null),
         S_OK
     );
+    let mut a = null;
+    let mut b = null;
+    for out in [&mut a, &mut b] {
+        assert_eq!(
+            make_resource(
+                dev,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                out
+            ),
+            S_OK
+        );
+    }
+    let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+    let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+    for (dst, dst_offset, src, src_offset, length) in
+        [(a, 61, b, 0, 4), (a, 0, b, u64::MAX, 2), (a, 0, a, 4, 4)]
+    {
+        copy(list, dst, dst_offset, src, src_offset, length);
+        assert_eq!(close(list), object::E_NOTIMPL);
+        assert_eq!(reset(list, allocator, null), S_OK);
+    }
+    let split = Barrier {
+        kind: 2,
+        flags: 1,
+        resource: a,
+        reserved: [0; 2],
+    };
+    barrier(list, 1, &split);
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    assert_eq!(release(a), 0);
+    assert_eq!(release(b), 0);
     slot::<extern "system" fn(This)>(list, 0x60)(list); // Unsupported draw poisons the list.
     assert_eq!(
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),

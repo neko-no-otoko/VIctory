@@ -431,10 +431,25 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(target_os = "macos")]
-    if count != 0 {
-        with_metal(this, |s| {
-            s.reject("resource barriers are unsupported on Metal")
-        });
+    {
+        if count != 0 && barriers.is_null() {
+            with_metal(this, |s| s.reject("null barrier array"));
+            return 0;
+        }
+        if count != 0 {
+            // SAFETY: the caller supplies count barrier descriptions.
+            let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+            with_metal(this, |s| {
+                for barrier in barriers {
+                    if barrier.kind != 2 || barrier.flags != 0 {
+                        s.reject("only unsplit UAV buffer barriers are supported on Metal");
+                        break;
+                    }
+                    s.uav_barrier(barrier.first);
+                }
+            });
+        }
+        return 0;
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
@@ -510,7 +525,10 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
-    reject_metal!(this, "buffer copies are unsupported on Metal");
+    #[cfg(target_os = "macos")]
+    with_metal(this, |s| {
+        s.copy_buffer(dst, dst_offset, src, src_offset, len)
+    });
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)

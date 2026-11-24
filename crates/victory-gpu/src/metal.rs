@@ -38,14 +38,19 @@ impl Prepared {
         }
         let program = ir::build(&p.code, p.wave64, p.vgprs).map_err(|e| e.to_string())?;
         let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
-        let [descriptor] = traced.descriptors.as_slice() else {
-            return Err("expected one descriptor access".into());
+        let Some(descriptor) = traced.descriptors.first() else {
+            return Err("expected a UAV descriptor access".into());
         };
         let resource::Source::Loaded { load, first: 0 } = descriptor.source else {
             return Err("only loaded UAV descriptors are supported".into());
         };
-        if descriptor.role != resource::Role::Resource || traced.scalar.len() != 1 {
-            return Err("unsupported resource access".into());
+        if traced.scalar.len() != 1
+            || traced
+                .descriptors
+                .iter()
+                .any(|d| d.role != resource::Role::Resource || d.source != descriptor.source)
+        {
+            return Err("only accesses to the same UAV descriptor are supported".into());
         }
         let Some((_, addr)) = traced.scalar.iter().find(|(site, _)| *site == load) else {
             return Err("missing UAV load".into());
@@ -129,6 +134,16 @@ enum Root {
     Table(u64),
 }
 enum Command {
+    Copy {
+        dst: ResourceRef,
+        dst_offset: u64,
+        src: ResourceRef,
+        src_offset: u64,
+        len: u64,
+    },
+    Barrier {
+        _resource: Option<ResourceRef>,
+    },
     Dispatch {
         pipeline: Arc<Mutex<Prepared>>,
         _heap: Arc<HeapRef>,
@@ -222,6 +237,41 @@ impl State {
             *word = Some(*value);
         }
     }
+    pub(crate) fn copy_buffer(
+        &mut self,
+        dst: This,
+        dst_offset: u64,
+        src: This,
+        src_offset: u64,
+        len: u64,
+    ) {
+        if !self.open() {
+            return;
+        }
+        if let Err(error) = copy_ranges(dst, dst_offset, src, src_offset, len) {
+            self.reject(&error);
+            return;
+        }
+        self.commands.push(Command::Copy {
+            dst: ResourceRef::new(dst),
+            dst_offset,
+            src: ResourceRef::new(src),
+            src_offset,
+            len,
+        });
+    }
+    pub(crate) fn uav_barrier(&mut self, resource: This) {
+        if !self.open() {
+            return;
+        }
+        if !resource.is_null() && crate::resource::buffer_bytes(resource).is_none() {
+            self.reject("UAV barriers support only buffers");
+            return;
+        }
+        self.commands.push(Command::Barrier {
+            _resource: (!resource.is_null()).then(|| ResourceRef::new(resource)),
+        });
+    }
     pub(crate) fn dispatch(&mut self, groups: [u32; 3]) {
         if !self.open() {
             return;
@@ -294,6 +344,20 @@ impl State {
         }
         for command in &mut self.commands {
             match command {
+                Command::Copy {
+                    dst,
+                    dst_offset,
+                    src,
+                    src_offset,
+                    len,
+                } => {
+                    let (to, from, len) =
+                        copy_ranges(dst.ptr(), *dst_offset, src.ptr(), *src_offset, *len)?;
+                    // SAFETY: checked ranges are live and non-overlapping; submission is synchronous.
+                    unsafe { std::ptr::copy_nonoverlapping(from, to, len) };
+                }
+                // Each preceding dispatch has already completed, so the barrier's ordering is met.
+                Command::Barrier { .. } => {}
                 Command::Dispatch {
                     pipeline,
                     _heap: _,
@@ -320,4 +384,37 @@ impl State {
         }
         Ok(())
     }
+}
+
+fn copy_ranges(
+    dst: This,
+    dst_offset: u64,
+    src: This,
+    src_offset: u64,
+    len: u64,
+) -> Result<(*mut u8, *const u8, usize), String> {
+    if dst == src {
+        return Err("same-resource buffer copies are unsupported".into());
+    }
+    let range = |resource, offset: u64| -> Result<(*mut u8, usize, usize), String> {
+        let (base, size) =
+            crate::resource::buffer_bytes(resource).ok_or("copy requires buffer resources")?;
+        let end = offset.checked_add(len).ok_or("copy range overflow")?;
+        if end > size {
+            return Err("copy range exceeds buffer".into());
+        }
+        let offset = usize::try_from(offset).map_err(|_| "copy offset is too large")?;
+        let count = usize::try_from(len).map_err(|_| "copy length is too large")?;
+        let start = (base as usize)
+            .checked_add(offset)
+            .ok_or("copy address overflow")?;
+        let end = start.checked_add(count).ok_or("copy address overflow")?;
+        Ok((start as *mut u8, start, end))
+    };
+    let (to, a, b) = range(dst, dst_offset)?;
+    let (from, c, d) = range(src, src_offset)?;
+    if len != 0 && a < d && c < b {
+        return Err("overlapping buffer copies are unsupported".into());
+    }
+    Ok((to, from.cast_const(), len as usize))
 }
