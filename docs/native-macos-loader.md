@@ -96,6 +96,13 @@ out-of-range reads return zero, writes are discarded, and overflowing offsets
 are out of range. Indexed buffer addresses remain unsupported. This is a
 restricted implementation, not a sandbox guarantee.
 
+The `native_group_barrier` synthetic PE also passed on an M3 Max: 64 threads
+exchange values through group-shared memory across a barrier while guarded
+dynamic raw loads and stores cover valid, out-of-range and overflowing offsets.
+This native path uses a whole-buffer UAV. The XOR-32 exchange crosses SIMD
+groups on 32-wide hardware but not necessarily on 64-wide hardware; it does
+not establish general synchronization behavior.
+
 The native graphics fixture exercises a restricted vertex/pixel pipeline,
 render-target clear, two triangle draws with different root constants, and a
 texture-to-buffer copy with padded rows through the same CLI. It checks the

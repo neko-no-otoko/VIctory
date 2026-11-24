@@ -305,6 +305,14 @@ The `wine_compute_bounds` and `wine_dynamic_bounds` fixtures exercise legacy,
 paired-view and multi-view accesses using translated shaders, including
 dynamic offsets, partial vectors, overflow and adjacent resource bytes.
 
+The `wine_group_barrier` fixture exercises 64 threads in a group: each lane
+loads through guarded raw views, exchanges data through group-shared memory
+across a barrier, and stores through a bounded UAV. It checks divergent valid,
+out-of-view and overflow offsets plus untouched adjacent bytes. This passed
+on the M3 Max under Wine 11 with the Apple converter; the XOR-32 exchange
+crosses SIMD groups on 32-wide hardware, but not necessarily on 64-wide
+hardware. It does not establish general synchronization behavior.
+
 On an M3 Max under Rosetta with Wine 11 and Apple's converter, a normally
 launched TLS guest sampled a nonzero-offset raw SRV and wrote a nonzero-offset
 raw UAV through translated Metal compute. It checked changed input after a
