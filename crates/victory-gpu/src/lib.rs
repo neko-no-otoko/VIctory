@@ -64,6 +64,8 @@ mod watch;
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub use metal::WineMetalCompute;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub use metal_graphics::WineMetalGraphics;
 
 #[cfg(windows)]
 pub use host::on_failure;

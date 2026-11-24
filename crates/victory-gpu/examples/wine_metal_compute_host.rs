@@ -1,4 +1,4 @@
-//! Opt-in loopback server for the restricted Wine Metal compute protocol.
+//! Opt-in loopback server for the restricted Wine Metal compute and graphics protocols.
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod host {
@@ -34,31 +34,15 @@ mod host {
         u32::from_le_bytes(bytes.try_into().expect("four-byte word"))
     }
 
-    fn request(
+    fn compute_request(
         stream: &mut TcpStream,
-        expected_token: &[u8; 16],
+        fields: [u32; 8],
         cache: &mut Option<(Vec<u8>, victory_gpu::WineMetalCompute)>,
     ) -> Result<Vec<u8>, String> {
-        let mut header = [0; 32];
-        stream.read_exact(&mut header).map_err(|e| e.to_string())?;
-        let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || fields[1] != 1 {
-            return Err("invalid protocol header".into());
-        }
         let shader_len = fields[2] as usize;
         let buffer_len = fields[3] as usize;
         let count = fields[4] as usize;
         let groups = [fields[5], fields[6], fields[7]];
-        if shader_len == 0 || shader_len > MAX_SHADER || buffer_len == 0
-            || buffer_len > MAX_BUFFER || count > 64 || groups.contains(&0)
-        {
-            return Err("invalid request lengths or dispatch dimensions".into());
-        }
-        let mut supplied_token = [0; 16];
-        stream.read_exact(&mut supplied_token).map_err(|e| e.to_string())?;
-        if supplied_token.iter().zip(expected_token).fold(0u8, |diff, (a, b)| diff | (a ^ b)) != 0 {
-            return Err("authentication failed".into());
-        }
         let mut shader = vec![0; shader_len];
         let mut buffer = vec![0; buffer_len];
         let mut constant_bytes = vec![0; count * 4];
@@ -74,6 +58,75 @@ mod host {
         }
         cache.as_mut().expect("pipeline was prepared").1.dispatch(&mut buffer, &constants, groups)?;
         Ok(buffer)
+    }
+
+    fn graphics_request(stream: &mut TcpStream, fields: [u32; 8]) -> Result<Vec<u8>, String> {
+        let vs_len = fields[2] as usize;
+        let ps_len = fields[3] as usize;
+        let width = fields[4];
+        let height = fields[5];
+        let vertex_count = fields[6] as usize;
+        let count = fields[7] as usize;
+        let image_len = (width as usize).checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4)).ok_or("image size overflow")?;
+        if vs_len == 0 || vs_len > MAX_SHADER || ps_len == 0 || ps_len > MAX_SHADER
+            || width == 0 || height == 0 || image_len > MAX_BUFFER
+            || vertex_count != 3 || count > 64
+        {
+            return Err("invalid graphics request dimensions or lengths".into());
+        }
+        let mut clear_bytes = [0; 16];
+        stream.read_exact(&mut clear_bytes).map_err(|e| e.to_string())?;
+        let clear = std::array::from_fn(|i| f32::from_bits(word(&clear_bytes[i * 4..i * 4 + 4])));
+        let mut vertex_shader = vec![0; vs_len];
+        let mut pixel_shader = vec![0; ps_len];
+        let mut vertex_bytes = [0; 48];
+        let mut constant_bytes = vec![0; count * 4];
+        stream.read_exact(&mut vertex_shader).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut pixel_shader).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut vertex_bytes).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut constant_bytes).map_err(|e| e.to_string())?;
+        let vertices: [[f32; 4]; 3] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                let offset = (i * 4 + j) * 4;
+                f32::from_bits(word(&vertex_bytes[offset..offset + 4]))
+            })
+        });
+        let constants: Vec<u32> = constant_bytes.chunks_exact(4).map(word).collect();
+        let mut pipeline = victory_gpu::WineMetalGraphics::new(&vertex_shader, &pixel_shader)?;
+        pipeline.draw(width, height, clear, &vertices, &constants)
+    }
+
+    fn request(
+        stream: &mut TcpStream,
+        expected_token: &[u8; 16],
+        cache: &mut Option<(Vec<u8>, victory_gpu::WineMetalCompute)>,
+    ) -> Result<Vec<u8>, String> {
+        let mut header = [0; 32];
+        stream.read_exact(&mut header).map_err(|e| e.to_string())?;
+        let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2) {
+            return Err("invalid protocol header".into());
+        }
+        if fields[1] == 1 {
+            let shader_len = fields[2] as usize;
+            let buffer_len = fields[3] as usize;
+            if shader_len == 0 || shader_len > MAX_SHADER || buffer_len == 0
+                || buffer_len > MAX_BUFFER || fields[4] > 64 || fields[5..8].contains(&0)
+            {
+                return Err("invalid request lengths or dispatch dimensions".into());
+            }
+        }
+        let mut supplied_token = [0; 16];
+        stream.read_exact(&mut supplied_token).map_err(|e| e.to_string())?;
+        if supplied_token.iter().zip(expected_token).fold(0u8, |diff, (a, b)| diff | (a ^ b)) != 0 {
+            return Err("authentication failed".into());
+        }
+        match fields[1] {
+            1 => compute_request(stream, fields, cache),
+            2 => graphics_request(stream, fields),
+            _ => unreachable!(),
+        }
     }
 
     fn respond(stream: &mut TcpStream, result: Result<Vec<u8>, String>) -> io::Result<()> {

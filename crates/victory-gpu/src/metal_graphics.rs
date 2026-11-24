@@ -122,6 +122,83 @@ impl Prepared {
         Ok(())
     }
 }
+/// A restricted offscreen Wine graphics pipeline with POSITION-only vertices.
+///
+/// Only pixel shader root constants at slot 3 are supported; descriptor
+/// tables, depth, blending and textures are not supported.
+#[cfg(target_arch = "x86_64")]
+pub struct WineMetalGraphics {
+    prepared: Prepared,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl WineMetalGraphics {
+    /// Translate and prepare the console vertex and pixel shaders.
+    pub fn new(vertex: &[u8], pixel: &[u8]) -> Result<Self, String> {
+        for (bytes, stage) in [(vertex, HwStage::Vs), (pixel, HwStage::Ps)] {
+            if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
+                return Err("invalid graphics shader length".into());
+            }
+            let container = Container::parse(bytes).map_err(|e| e.to_string())?;
+            let dxil = container.part(FourCC::DXIL).ok_or("missing DXIL part")?;
+            let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
+            if programs.len() != 1 || programs[0].stage != stage
+                || !programs[0].used.is_empty()
+                || programs[0].layout.iter().any(|root| {
+                    stage != HwStage::Ps || root.root != native::RootType::Constants || root.slot != 3
+                })
+            {
+                return Err("unsupported graphics shader resource layout".into());
+            }
+        }
+        let prepared = Prepared::new(vertex, pixel, GraphicsState {
+            depth: None,
+            blend: victory_metal::BlendState { enabled: false, write_mask: 15, alpha_source: false },
+            input_uv: false,
+            color_format: victory_metal::ColorFormat::Rgba8,
+        })?;
+        if prepared.texture_slot.is_some() || prepared.sampler_slot.is_some()
+            || prepared.user_data.iter().any(|u| u.root != native::RootType::Constants || u.slot != 3)
+        {
+            return Err("unsupported graphics shader bindings".into());
+        }
+        Ok(Self { prepared })
+    }
+
+    /// Clear and draw one triangle, returning tightly packed RGBA8 pixels.
+    pub fn draw(
+        &mut self,
+        width: u32,
+        height: u32,
+        clear: [f32; 4],
+        vertices: &[[f32; 4]],
+        root_constants: &[u32],
+    ) -> Result<Vec<u8>, String> {
+        let pitch = (width as usize).checked_mul(4).ok_or("image row overflow")?;
+        let len = pitch.checked_mul(height as usize).ok_or("image size overflow")?;
+        if width == 0 || height == 0 || len > 16 * 1024 * 1024
+            || vertices.len() != 3 || root_constants.len() > 64
+        {
+            return Err("invalid graphics request dimensions or lengths".into());
+        }
+        let mut constants = vec![0; self.prepared.dwords];
+        for u in &self.prepared.user_data {
+            constants[u.index as usize] = *root_constants.get(u.dword as usize)
+                .ok_or("missing graphics root constant dword")?;
+        }
+        let mut pixels = vec![0; len];
+        victory_metal::clear_color_float(
+            victory_metal::ColorFormat::Rgba8, width, height, pitch, &mut pixels, clear, &[],
+        ).map_err(|e| e.to_string())?;
+        self.prepared.draw(
+            width, height, Vertices::Position(vertices), None,
+            [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
+            [0, 0, width, height], None, &constants, None, &mut pixels,
+        )?;
+        Ok(pixels)
+    }
+}
+
 
 fn word(data: &[u8], at: usize) -> Result<u32, String> {
     let bytes = data
