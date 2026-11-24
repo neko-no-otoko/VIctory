@@ -959,3 +959,113 @@ unsigned entry(void) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
 }
+
+#[test]
+fn native_fixture_maps_only_scoped_game_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    let save = dir.path().join("save");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::create_dir(&save).unwrap();
+    let data: Vec<u8> = (0..131_195usize).map(|i| ((i * 37 + i / 65536 * 71 + 11) % 256) as u8).collect();
+    std::fs::write(game.join("data.bin"), &data).unwrap();
+    std::fs::write(game.join("empty.bin"), b"").unwrap();
+    std::fs::write(save.join("save.bin"), b"save data").unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateFileW\nCreateFileMappingW\nMapViewOfFile\nUnmapViewOfFile\nCloseHandle\nGetLastError\n").unwrap();
+    std::fs::write(dir.path().join("mapping.c"), r#"
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef unsigned long long SIZE_T;
+typedef unsigned short WCHAR;
+typedef int BOOL;
+__declspec(dllimport) HANDLE CreateFileW(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE);
+__declspec(dllimport) HANDLE CreateFileMappingW(HANDLE, void *, DWORD, DWORD, DWORD, const WCHAR *);
+__declspec(dllimport) void *MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+__declspec(dllimport) BOOL UnmapViewOfFile(const void *);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) DWORD GetLastError(void);
+#define INVALID ((HANDLE)-1)
+#define READ 0x80000000UL
+#define PAGE_READONLY 2
+#define FILE_MAP_READ 4
+static const WCHAR game[] = {'C',':','\\','d','a','t','a','.','b','i','n',0};
+static const WCHAR empty[] = {'C',':','\\','e','m','p','t','y','.','b','i','n',0};
+static const WCHAR save[] = {'T',':','\\','s','a','v','e','.','b','i','n',0};
+static const WCHAR name[] = {'n','a','m','e',0};
+int mapping_marker = 7;
+int *volatile mapping_relocation = &mapping_marker;
+static unsigned char expected(unsigned i) {
+    return (unsigned char)(i * 37 + i / 65536 * 71 + 11);
+}
+unsigned entry(void) {
+    HANDLE file, mapping, limited, other;
+    unsigned char *first, *tail, *part;
+    unsigned i;
+    if (*mapping_relocation != 7) return 1;
+    file = CreateFileW(game, READ, 1, 0, 3, 0x80, 0);
+    if (!file || file == INVALID) return 2;
+    if (CreateFileMappingW(file, 0, PAGE_READONLY, 0, 131196, 0)) return 3;
+    if (CreateFileMappingW(file, 0, PAGE_READONLY, 1, 0, 0)) return 4;
+    if (CreateFileMappingW(file, 0, 4, 0, 0, 0)) return 5;
+    if (CreateFileMappingW(file, 0, PAGE_READONLY, 0, 0, name)) return 6;
+    if (CreateFileMappingW(file, (void *)1, PAGE_READONLY, 0, 0, 0)) return 7;
+    if (CreateFileMappingW(INVALID, 0, PAGE_READONLY, 0, 4096, 0)) return 8;
+    if (CreateFileMappingW((HANDLE)12345, 0, PAGE_READONLY, 0, 0, 0)) return 9;
+    other = CreateFileW(empty, READ, 1, 0, 3, 0x80, 0);
+    if (!other || other == INVALID) return 10;
+    if (CreateFileMappingW(other, 0, PAGE_READONLY, 0, 0, 0) || GetLastError() != 1006) return 11;
+    if (!CloseHandle(other)) return 12;
+    other = CreateFileW(save, READ, 3, 0, 3, 0x80, 0);
+    if (!other || other == INVALID) return 13;
+    if (CreateFileMappingW(other, 0, PAGE_READONLY, 0, 0, 0)) return 14;
+    if (!CloseHandle(other)) return 15;
+    limited = CreateFileMappingW(file, 0, PAGE_READONLY, 0, 65550, 0);
+    if (!limited) return 16;
+    part = (unsigned char *)MapViewOfFile(limited, FILE_MAP_READ, 0, 65536, 0);
+    if (!part) return 17;
+    for (i = 0; i < 14; ++i) if (part[i] != expected(65536 + i)) return 18;
+    if (MapViewOfFile(limited, FILE_MAP_READ, 0, 65536, 15)) return 19;
+    if (MapViewOfFile(limited, FILE_MAP_READ, 0, 131072, 0)) return 20;
+    if (!UnmapViewOfFile(part) || !CloseHandle(limited)) return 21;
+    mapping = CreateFileMappingW(file, 0, PAGE_READONLY, 0, 0, 0);
+    if (!mapping) return 22;
+    if (MapViewOfFile(mapping, 2, 0, 0, 1)) return 23;
+    if (MapViewOfFile(mapping, 0, 0, 0, 1)) return 24;
+    if (MapViewOfFile(mapping, FILE_MAP_READ | 2, 0, 0, 1)) return 25;
+    if (MapViewOfFile(mapping, FILE_MAP_READ, 0, 1, 1) || GetLastError() != 1132) return 26;
+    if (MapViewOfFile(mapping, FILE_MAP_READ, 1, 0, 1)) return 27;
+    if (MapViewOfFile(mapping, FILE_MAP_READ, 0, 131072, 124)) return 28;
+    if (MapViewOfFile((HANDLE)12345, FILE_MAP_READ, 0, 0, 1)) return 29;
+    if (MapViewOfFile(file, FILE_MAP_READ, 0, 0, 1)) return 30;
+    first = (unsigned char *)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 65537);
+    tail = (unsigned char *)MapViewOfFile(mapping, FILE_MAP_READ, 0, 65536, 0);
+    if (!first || !tail) return 31;
+#ifdef FAULT_READONLY
+    *(volatile unsigned char *)first = 0xff;
+    return 99;
+#endif
+    if (UnmapViewOfFile(first + 1) || UnmapViewOfFile(0) || UnmapViewOfFile(&mapping_marker)) return 32;
+    if (!CloseHandle(file) || !CloseHandle(mapping)) return 33;
+    if (CloseHandle(file) || CloseHandle(mapping)) return 34;
+    if (MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 1)) return 35;
+    for (i = 0; i < 65537; ++i) if (first[i] != expected(i)) return 36;
+    for (i = 0; i < 65659; ++i) if (tail[i] != expected(65536 + i)) return 37;
+    if (!UnmapViewOfFile(first) || !UnmapViewOfFile(tail)) return 38;
+    if (UnmapViewOfFile(first) || UnmapViewOfFile(tail)) return 39;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "mapping.c", "-o", "mapping.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:mapping.exe", "mapping.obj", "kernel32.lib"]);
+    let exe = dir.path().join("mapping.exe");
+    let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-DFAULT_READONLY", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "mapping.c", "-o", "fault.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:fault.exe", "fault.obj", "kernel32.lib"]);
+    let fault = dir.path().join("fault.exe");
+    let output = cli(&["native-fixture".as_ref(), fault.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+    use std::os::unix::process::ExitStatusExt;
+    assert!(matches!(output.status.signal(), Some(10 | 11)), "fault status {:?}", output.status);
+}

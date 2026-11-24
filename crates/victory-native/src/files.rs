@@ -38,6 +38,9 @@ const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_NO_MORE_FILES: u32 = 18;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+const ERROR_FILE_INVALID: u32 = 1006;
+const ERROR_MAPPED_ALIGNMENT: u32 = 1132;
 const INVALID_HANDLE: usize = usize::MAX;
 
 struct Context {
@@ -45,12 +48,32 @@ struct Context {
     save: Option<File>,
     handles: HashMap<usize, GuestFile>,
     searches: HashMap<usize, std::vec::IntoIter<FindData>>,
+    mappings: HashMap<usize, GuestMapping>,
+    views: HashMap<usize, GuestView>,
 }
 
 struct GuestFile {
     file: File,
     readable: bool,
     writable: bool,
+    save: bool,
+}
+
+struct GuestMapping {
+    file: File,
+    size: u64,
+}
+
+struct GuestView {
+    base: *mut c_void,
+    size: usize,
+}
+
+impl Drop for GuestView {
+    fn drop(&mut self) {
+        // SAFETY: this object exclusively owns the successful mmap.
+        unsafe { libc::munmap(self.base, self.size); }
+    }
 }
 
 thread_local! {
@@ -102,7 +125,7 @@ impl FileScope {
             } else {
                 None
             };
-            *slot = Some(Context { root: root_file, save: save_file, handles: HashMap::new(), searches: HashMap::new() });
+            *slot = Some(Context { root: root_file, save: save_file, handles: HashMap::new(), searches: HashMap::new(), mappings: HashMap::new(), views: HashMap::new() });
             Ok(Self { _thread_bound: PhantomData })
         })
     }
@@ -139,6 +162,9 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
         "FlushFileBuffers" => flush_file_buffers as *const () as usize,
         "SetFilePointerEx" => set_file_pointer_ex as *const () as usize,
         "GetFileSizeEx" => get_file_size_ex as *const () as usize,
+        "CreateFileMappingW" => create_file_mapping_w as *const () as usize,
+        "MapViewOfFile" => map_view_of_file as *const () as usize,
+        "UnmapViewOfFile" => unmap_view_of_file as *const () as usize,
         "CloseHandle" => close_handle as *const () as usize,
         _ => return None,
     })
@@ -524,7 +550,7 @@ unsafe extern "win64" fn create_file_w(
         let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             (value != INVALID_HANDLE).then(|| value + 1)
         }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
-        context.handles.insert(handle, GuestFile { file, readable, writable });
+        context.handles.insert(handle, GuestFile { file, readable, writable, save });
         Ok((handle, created))
     });
     match result {
@@ -646,8 +672,77 @@ unsafe extern "win64" fn get_file_size_ex(handle: usize, size: *mut i64) -> i32 
 }
 
 extern "win64" fn close_handle(handle: usize) -> i32 {
-    let closed = CONTEXT.with(|slot| slot.borrow_mut().as_mut().and_then(|c| c.handles.remove(&handle)).is_some());
+    let closed = CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.as_mut().is_some_and(|c| c.handles.remove(&handle).is_some() || c.mappings.remove(&handle).is_some())
+    });
     if closed { 1 } else { fail(ERROR_INVALID_HANDLE); 0 }
+}
+
+unsafe extern "win64" fn create_file_mapping_w(
+    handle: usize, security: *const c_void, protection: u32, size_high: u32, size_low: u32, name: *const u16,
+) -> usize {
+    if !security.is_null() || !name.is_null() || protection != 2 {
+        fail(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    let result = CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let context = slot.as_mut().ok_or(ERROR_INVALID_HANDLE)?;
+        let file = context.handles.get(&handle).ok_or(ERROR_INVALID_HANDLE)?;
+        if !file.readable || file.save { return Err(ERROR_ACCESS_DENIED); }
+        let length = file.file.metadata().map_err(|e| error_code(&e, false))?.len();
+        let requested = (u64::from(size_high) << 32) | u64::from(size_low);
+        let size = if requested == 0 { length } else { requested };
+        if size == 0 { return Err(ERROR_FILE_INVALID); }
+        if size > length { return Err(ERROR_ACCESS_DENIED); }
+        let file = file.file.try_clone().map_err(|e| error_code(&e, false))?;
+        let mapping = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            (value != INVALID_HANDLE).then(|| value + 1)
+        }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        context.mappings.insert(mapping, GuestMapping { file, size });
+        Ok(mapping)
+    });
+    match result {
+        Ok(handle) => handle,
+        Err(code) => { fail(code); 0 }
+    }
+}
+
+unsafe extern "win64" fn map_view_of_file(
+    handle: usize, access: u32, offset_high: u32, offset_low: u32, size: usize,
+) -> *mut c_void {
+    if access != 4 { fail(ERROR_NOT_SUPPORTED); return std::ptr::null_mut(); }
+    let result = CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let context = slot.as_mut().ok_or(ERROR_INVALID_HANDLE)?;
+        let mapping = context.mappings.get(&handle).ok_or(ERROR_INVALID_HANDLE)?;
+        let offset = (u64::from(offset_high) << 32) | u64::from(offset_low);
+        if offset & 0xffff != 0 { return Err(ERROR_MAPPED_ALIGNMENT); }
+        if offset >= mapping.size { return Err(ERROR_ACCESS_DENIED); }
+        let remaining = mapping.size - offset;
+        let length = if size == 0 { usize::try_from(remaining).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)? } else { size };
+        if u64::try_from(length).map_err(|_| ERROR_INVALID_PARAMETER)? > remaining {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        let offset = libc::off_t::try_from(offset).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        // SAFETY: the descriptor is open and the checked range is within the mapping.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_PRIVATE, mapping.file.as_raw_fd(), offset) };
+        if base == libc::MAP_FAILED { return Err(error_code(&io::Error::last_os_error(), false)); }
+        context.views.insert(base as usize, GuestView { base, size: length });
+        Ok(base)
+    });
+    match result {
+        Ok(base) => base,
+        Err(code) => { fail(code); std::ptr::null_mut() }
+    }
+}
+
+unsafe extern "win64" fn unmap_view_of_file(base: *const c_void) -> i32 {
+    let removed = CONTEXT.with(|slot| {
+        slot.borrow_mut().as_mut().and_then(|c| c.views.remove(&(base as usize))).is_some()
+    });
+    if removed { 1 } else { fail(ERROR_INVALID_ADDRESS); 0 }
 }
 
 #[repr(C)]
@@ -889,6 +984,66 @@ mod tests {
     unsafe fn open(path: &str) -> usize {
         // SAFETY: the UTF-16 buffer stays alive for the call.
         unsafe { create_file_w(wide(path).as_ptr(), 0x8000_0000, 1, null(), 3, 0x80, null_mut()) }
+    }
+
+    #[test]
+    fn read_only_mappings_obey_bounds_and_lifetimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        let mut data = vec![0u8; 0x20010];
+        data[0x10000] = 42;
+        std::fs::write(game.join("data"), &data).unwrap();
+        std::fs::write(game.join("empty"), []).unwrap();
+        std::fs::write(save.join("data"), b"save").unwrap();
+        let scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            let file = open("data");
+            let mapping = create_file_mapping_w(file, null(), 2, 0, 0, null());
+            assert_ne!(mapping, 0);
+            assert_eq!(close_handle(file), 1);
+            assert!(map_view_of_file(mapping, 2, 0, 0, 1).is_null());
+            assert!(map_view_of_file(mapping, 4, 0, 1, 1).is_null());
+            assert_eq!(get_last_error(), ERROR_MAPPED_ALIGNMENT);
+            assert!(map_view_of_file(mapping, 4, 0, 0x20000, 17).is_null());
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert!(map_view_of_file(mapping, 4, u32::MAX, 0xffff0000, 0).is_null());
+            let view = map_view_of_file(mapping, 4, 0, 0x10000, 0);
+            assert!(!view.is_null());
+            assert_eq!(*(view as *const u8), 42);
+            assert_eq!(close_handle(mapping), 1);
+            assert_eq!(*(view as *const u8), 42);
+            assert_eq!(unmap_view_of_file((view as *const u8).add(1).cast()), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_ADDRESS);
+            assert_eq!(unmap_view_of_file(view), 1);
+            assert_eq!(unmap_view_of_file(view), 0);
+
+            let file = open("data");
+            assert_eq!(create_file_mapping_w(file, null(), 4, 0, 0, null()), 0);
+            assert_eq!(create_file_mapping_w(file, 1usize as *const c_void, 2, 0, 0, null()), 0);
+            assert_eq!(create_file_mapping_w(file, null(), 2, 0, 0, wide("name").as_ptr()), 0);
+            assert_eq!(create_file_mapping_w(file, null(), 2, 0, 0x20011, null()), 0);
+            let limited = create_file_mapping_w(file, null(), 2, 0, 0x10001, null());
+            assert_ne!(limited, 0);
+            assert!(map_view_of_file(limited, 4, 0, 0x10000, 2).is_null());
+            let remaining = map_view_of_file(limited, 4, 0, 0x10000, 0);
+            assert!(!remaining.is_null());
+            assert_eq!(*(remaining as *const u8), 42);
+            assert_eq!(close_handle(limited), 1);
+            assert_eq!(close_handle(file), 1);
+            let empty = open("empty");
+            assert_eq!(create_file_mapping_w(empty, null(), 2, 0, 0, null()), 0);
+            assert_eq!(get_last_error(), ERROR_FILE_INVALID);
+            assert_eq!(close_handle(empty), 1);
+            let save_file = create_file_w(wide("T:\\data").as_ptr(), 0x8000_0000, 3, null(), 3, 0x80, null_mut());
+            assert_eq!(create_file_mapping_w(save_file, null(), 2, 0, 0, null()), 0);
+            assert_eq!(close_handle(save_file), 1);
+            assert_eq!(create_file_mapping_w(INVALID_HANDLE, null(), 2, 0, 0, null()), 0);
+            drop(scope);
+            assert_eq!(unmap_view_of_file(remaining), 0);
+        }
     }
 
     #[test]

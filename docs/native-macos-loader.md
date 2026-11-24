@@ -257,6 +257,16 @@ processes; Windows sharing restrictions against other host processes are not
 enforced. Truncation, other creation modes and flags, and overlapped I/O are
 not supported.
 
+`CreateFileMappingW`, `MapViewOfFile`, and `UnmapViewOfFile` support unnamed,
+read-only mappings of nonempty game-root files only. Mapping size may be zero
+(whole file) or no larger than the file; view offsets must be 64-KiB aligned,
+and zero view length means the remainder. Views are real read-only mappings
+and survive closing the original file and mapping handles; the owning
+thread's scope unmaps remaining views at exit. Named, pagefile-backed, save,
+and writable mappings are rejected. The host must not change or truncate a
+mapped file while it is in use. `VirtualQuery` and `VirtualProtect` only
+operate on their own tracked allocations, not these views.
+
 `GetFileAttributesExW` (standard information level), `FindFirstFileW`,
 `FindNextFileW`, and `FindClose` provide thread-scoped discovery of regular
 files and directories. They return host creation/access/write times and file
