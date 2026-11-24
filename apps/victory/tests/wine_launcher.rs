@@ -124,6 +124,10 @@ impl Fixture {
     }
 
     fn command(&self, exe: &Path, host: &Path) -> Command {
+        self.command_with_ack(exe, host, true)
+    }
+
+    fn command_with_ack(&self, exe: &Path, host: &Path, acknowledge: bool) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_victory"));
         cmd.arg("wine-run").arg(exe).arg("--wine").arg(&self.wine)
             .arg("--winepath").arg(&self.winepath).arg("--metal-host").arg(host)
@@ -135,6 +139,7 @@ impl Fixture {
             .env("VICTORY_WINE_METAL_TOKEN", "invalid-inherited-token")
             .env("VICTORY_WINE_METAL_PRESENT", "0")
             .env("VICTORY_TEST_LAUNCHER_INHERITED", "preserved");
+        if acknowledge { cmd.arg("--allow-unverified-dll-search"); }
         cmd
     }
 
@@ -198,6 +203,55 @@ fn launcher_runs_real_provider_tls_and_metal_compute() {
         assert!(out.stdout.contains(marker), "missing {marker}\n{}\n{}", out.stdout, out.stderr);
     }
     f.assert_host_gone();
+}
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn rejects_unverified_search_and_known_shadows_before_host_start() {
+    let f = Fixture::new();
+    let exe = f.build();
+    let host = f.tracked_host();
+    let out = run(&mut f.command_with_ack(&exe, &host, false), f.temp.path());
+    assert!(!out.status.success(), "unverified DLL search was accepted without acknowledgement");
+    assert!(out.stderr.contains("--allow-unverified-dll-search"), "{}", out.stderr);
+    assert!(!f.host_pid.exists(), "host started without acknowledgement");
+
+    let cwd = f.temp.path().join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let cwd_shadow = cwd.join("XG_XS.DLL");
+    fs::write(&cwd_shadow, b"shadow").unwrap();
+    let out = run(f.command(&exe, &host).current_dir(&cwd), f.temp.path());
+    assert!(!out.status.success() && out.stderr.contains("provider DLL conflict"), "{}", out.stderr);
+    assert!(!f.host_pid.exists(), "host started with current-directory shadow");
+    fs::remove_file(&cwd_shadow).unwrap();
+
+    let windows = f.prefix.join("drive_c/Windows");
+    for component in ["", "System32", "System", "SysWOW64"] {
+        let directory = windows.join(component);
+        fs::create_dir_all(&directory).unwrap();
+        let shadow = directory.join("XG_XS.DLL");
+        fs::write(&shadow, b"shadow").unwrap();
+        let out = run(&mut f.command(&exe, &host), f.temp.path());
+        assert!(!out.status.success() && out.stderr.contains("provider DLL conflict"), "{}", out.stderr);
+        assert!(!f.host_pid.exists(), "host started with prefix shadow in {component}");
+        fs::remove_file(&shadow).unwrap();
+    }
+
+    let mapped_drive = f.temp.path().join("mapped-drive");
+    let mapped_system = mapped_drive.join("windows/system32");
+    fs::create_dir_all(&mapped_system).unwrap();
+    fs::create_dir_all(f.prefix.join("dosdevices")).unwrap();
+    std::os::unix::fs::symlink(&mapped_drive, f.prefix.join("dosdevices/c:")).unwrap();
+    let mapped_shadow = mapped_system.join("d3d12_xs.dll");
+    fs::write(&mapped_shadow, b"shadow").unwrap();
+    let out = run(&mut f.command(&exe, &host), f.temp.path());
+    assert!(!out.status.success() && out.stderr.contains("provider DLL conflict"), "{}", out.stderr);
+    assert!(!f.host_pid.exists(), "host started with mapped-drive shadow");
+    fs::remove_file(&mapped_shadow).unwrap();
+    std::os::unix::fs::symlink(f.temp.path().join("missing-target"), &mapped_shadow).unwrap();
+    let out = run(&mut f.command(&exe, &host), f.temp.path());
+    assert!(!out.status.success() && out.stderr.contains("possible provider DLL conflict"), "{}", out.stderr);
+    assert!(!f.host_pid.exists(), "host started with dangling provider link");
 }
 
 #[test]

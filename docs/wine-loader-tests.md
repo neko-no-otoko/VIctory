@@ -641,10 +641,10 @@ after the toolchain and Wine setup above:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/victory-launcher-target
-cargo build -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
+cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
   --target x86_64-pc-windows-gnullvm
-cargo build -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
-cargo build -p victory --target x86_64-apple-darwin
+cargo build --locked -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
+cargo build --locked -p victory --target x86_64-apple-darwin
 export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
 mkdir -p /tmp/victory-launch-prefix
 "$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/victory" wine-run /path/to/trusted-guest.exe \
@@ -652,7 +652,7 @@ mkdir -p /tmp/victory-launch-prefix
   --metal-host "$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/examples/wine_metal_compute_host" \
   --converter /path/to/libmetalirconverter.dylib \
   --dll-dir "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug" \
-  --wine-prefix /tmp/victory-launch-prefix -- --guest-argument
+  --wine-prefix /tmp/victory-launch-prefix --allow-unverified-dll-search -- --guest-argument
 ```
 
 The launcher generates a 128-bit token from `/dev/urandom`; the host binds an
@@ -665,15 +665,33 @@ for those three providers; conflicting existing provider overrides are
 rejected. `VICTORY_WINE_METAL_PRESENT=1` remains an inherited opt-in for the
 existing presentation path.
 
-Direct imports from these three provider DLLs are checked against their named
-exports; provider ordinal imports and an obvious same-named DLL conflict in
-the guest executable directory are rejected. This does not inspect transitive
-or dynamic imports and does not force Wine to use a particular module: Wine's
-other earlier DLL search locations may still win. The launcher prints the
-selected search directory and warns about this; verify loaded module paths.
-Wine, the executable, the converter and all DLLs must be trusted. The launcher
-does not modify or copy guest files, but the unsandboxed guest can modify files
-and Wine may write to the selected prefix.
+By default the launcher fails before starting Wine or the Metal host: it
+cannot bind Wine's provider basenames to exact files. The option above
+explicitly accepts that limitation for a trusted, stable guest, prefix,
+providers and search paths. In that opt-in mode it rejects conflicting
+case-insensitive provider names in the provider directory, executable
+directory, current directory, and the prefix's `drive_c` and mapped `c:`
+Windows, System, System32 and SysWOW64 directories. Unreadable directories,
+ambiguous Windows directory components and dangling provider links fail the
+check. These are snapshots, not pinned opens.
+
+Direct executable imports from the three providers are checked against their
+named exports; provider ordinal imports are rejected. Transitive and dynamic
+imports, activation contexts, Known DLLs, loaded modules, path-specific
+registry overrides, guest-controlled search paths and changes after preflight
+are not enforced. `WINEPATH` adds a search directory; it does not prove which
+file Wine loads. Check loaded module paths when possible, but a post-load
+check does not undo initialization. The launcher does not modify or copy
+guest files; the unsandboxed guest can modify files and Wine may write to the
+prefix.
+
+Wine's [loader](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/ntdll/loader.c#L3205-L3259)
+handles activation contexts and previously loaded modules before ordinary
+directory lookup. Its native/builtin
+[overrides](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/ntdll/unix/loadorder.c#L316-L423)
+select loading behavior, not an exact provider file. The launcher has no
+enforcement mechanism for those decisions. GameInput, if separately
+installed, is not provisioned or preflighted by this launcher.
 
 The host readiness signal confirms binding, not converter ABI or shader
 support; converter loading and shader errors can occur on first use. Wine and
@@ -693,11 +711,11 @@ export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
 export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/examples/wine_metal_compute_host"
 export VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
 export VICTORY_TEST_DLL_DIR="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug"
-cargo test -p victory --target x86_64-apple-darwin --test wine_launcher -- --ignored --nocapture
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_launcher -- --ignored --nocapture
 ```
 
-On Wine 11 under Rosetta on an M3 Max, the five tests passed: a real
+On Wine 11 under Rosetta on an M3 Max, all six tests passed: a real
 TLS-bearing Wine PE called the provider DLLs and verified Metal readback 42;
-failure, host exit and signal paths cleaned up the host; and two simultaneous
-launches used distinct loopback ports and tokens. This uses synthetic files,
-not a configured game.
+unacknowledged search and known shadow DLLs were rejected; host exit and
+signal paths cleaned up the host; and two simultaneous launches used distinct
+loopback ports and tokens. This uses synthetic files, not a configured game.

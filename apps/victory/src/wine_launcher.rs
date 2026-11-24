@@ -320,10 +320,69 @@ fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+// These are snapshot checks only: Wine performs its own later opens and also
+// supports activation contexts, registry overrides and guest-directed loads.
+fn reject_shadow_dlls(dir: &Path, selected: &[PathBuf]) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("reading DLL search directory {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading DLL search directory {}", dir.display()))?;
+        if let Some(index) = PROVIDERS.iter().position(|name| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
+            let resolved = fs::canonicalize(entry.path())
+                .with_context(|| format!("resolving possible provider DLL conflict {}", entry.path().display()))?;
+            if resolved != selected[index] {
+                bail!("provider DLL conflict in Wine search directory: {}", entry.path().display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn optional_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) if path.is_dir() => Ok(true),
+        Ok(_) => bail!("Wine search path is not a readable directory: {}", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("reading Wine search path {}", path.display())),
+    }
+}
+
+// Wine resolves Windows path components case-insensitively even when the host
+// volume does not. Reject ambiguous component spellings rather than guess.
+fn windows_child_directory(parent: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let mut found = None;
+    for entry in fs::read_dir(parent).with_context(|| format!("reading Wine directory {}", parent.display()))? {
+        let entry = entry.with_context(|| format!("reading Wine directory {}", parent.display()))?;
+        if entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes()) {
+            if found.is_some() { bail!("ambiguous Wine directory component {name} in {}", parent.display()); }
+            let path = entry.path();
+            if !path.is_dir() { bail!("Wine search path is not a readable directory: {}", path.display()); }
+            found = Some(path);
+        }
+    }
+    Ok(found)
+}
+
+fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path) -> Result<()> {
+    let selected: Vec<_> = PROVIDERS.iter().map(|name| regular_file(&dll_dir.join(name), name)).collect::<Result<_>>()?;
+    reject_shadow_dlls(dll_dir, &selected)?;
+    reject_shadow_dlls(exe.parent().context("guest executable has no parent directory")?, &selected)?;
+    reject_shadow_dlls(&std::env::current_dir().context("reading current directory")?, &selected)?;
+    for root in [prefix.join("drive_c"), prefix.join("dosdevices").join("c:")] {
+        if !optional_directory(&root)? { continue; }
+        let Some(windows) = windows_child_directory(&root, "windows")? else { continue };
+        reject_shadow_dlls(&windows, &selected)?;
+        for name in ["system32", "system", "syswow64"] {
+            if let Some(dir) = windows_child_directory(&windows, name)? {
+                reject_shadow_dlls(&dir, &selected)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -331,20 +390,13 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let converter = regular_file(converter, "Metal converter")?;
     let dll_dir = directory(dll_dir, "DLL directory")?;
     let wine_prefix = directory(wine_prefix, "Wine prefix")?;
-    for name in PROVIDERS { regular_file(&dll_dir.join(name), name)?; }
+    reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
     preflight(&exe, &dll_dir)?;
     let overrides = wine_overrides()?;
-    let guest_dir = exe.parent().context("guest executable has no parent directory")?;
-    for entry in fs::read_dir(guest_dir).context("reading guest executable directory")? {
-        let entry = entry.context("reading guest directory entry")?;
-        if let Some(name) = PROVIDERS.iter().find(|name| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
-            let same = fs::canonicalize(entry.path()).ok() == fs::canonicalize(dll_dir.join(name)).ok();
-            if !same {
-                bail!("provider DLL conflict in guest executable directory: {} (Wine searches there before WINEPATH)", entry.path().display());
-            }
-        }
+    if !allow_unverified_dll_search {
+        bail!("Wine cannot guarantee exact provider DLL identity; use --allow-unverified-dll-search only with a trusted, stable guest, prefix and search paths");
     }
-    eprintln!("Wine will search {} for VIctory provider DLLs; earlier Wine search paths can still take precedence. Verify loaded module paths and trust the guest and prefix.", dll_dir.display());
+    eprintln!("Warning: Wine provider DLL paths are not pinned; preflight cannot exclude activation contexts, registry overrides, guest-directed loads or file replacement. Trust the guest and prefix.");
     let _signals = SignalGuard::install()?;
     let mut path_command = Command::new(&winepath);
     path_command.arg("-w").arg(&dll_dir).env("WINEPREFIX", &wine_prefix).stdout(Stdio::piped());
@@ -410,8 +462,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

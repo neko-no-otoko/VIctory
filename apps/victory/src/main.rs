@@ -173,6 +173,9 @@ enum Command {
         /// Existing, explicitly selected Wine prefix directory.
         #[arg(long)]
         wine_prefix: PathBuf,
+        /// Accept that Wine's remaining DLL search rules and races cannot be pinned by this launcher.
+        #[arg(long)]
+        allow_unverified_dll_search: bool,
         /// Arguments passed to the guest after `--`.
         #[arg(last = true)]
         guest_args: Vec<std::ffi::OsString>,
@@ -263,8 +266,8 @@ fn main() -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Command::NativeCensus { file, file_root, save_root } => native_census::run(&file, file_root.as_deref(), save_root.as_deref()),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, guest_args } => {
-            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, &guest_args)?;
+        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, guest_args } => {
+            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, &guest_args)?;
             if code != 0 { std::process::exit(code); }
             Ok(())
         }
