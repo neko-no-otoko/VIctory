@@ -8,11 +8,77 @@
 #[allow(non_snake_case)]
 mod windows {
     use std::ffi::{c_char, c_void};
+    use std::path::Path;
+    use std::sync::LazyLock;
+
+    use victory_hle::modules::xasync::E_INVALIDARG;
+    use victory_hle::runtime::{self as title_runtime, Title};
 
     use victory_hle::modules::xgameruntime::{self as runtime, Guid, HRESULT};
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut *mut c_void) -> i32;
+    }
+
+    // Runtime objects and their methods may outlive a guest's FreeLibrary.
+    fn pin_for_objects() -> Result<(), HRESULT> {
+        static PIN: LazyLock<Result<(), HRESULT>> = LazyLock::new(|| {
+            let mut module = std::ptr::null_mut();
+            // FROM_ADDRESS interprets the function address as an address in
+            // this module; PIN keeps its tables and code for process lifetime.
+            let ok = unsafe { GetModuleHandleExW(0x4 | 0x1, pin_for_objects as *const () as *const u16, &mut module) };
+            if ok == 0 { Err(0x8000_4005_u32 as i32) } else { Ok(()) }
+        });
+        *PIN
+    }
+
+    fn configured_title(root: &Path, executable: &Path) -> Result<Title, HRESULT> {
+        if !root.is_absolute() || !root.is_dir() {
+            return Err(E_INVALIDARG);
+        }
+        let dir = executable.parent().ok_or(E_INVALIDARG)?;
+        let manifest = std::fs::read_to_string(dir.join("MicrosoftGame.config"))
+            .unwrap_or_default();
+        let mut title = Title::from_manifest(&manifest);
+        title.storage = root.join("storage");
+        Ok(title)
+    }
+
+    static INITIALIZED: LazyLock<Result<(), HRESULT>> = LazyLock::new(|| {
+        let executable = std::env::current_exe().ok();
+        let title = match std::env::var_os("VICTORY_WINE_TITLE_DATA") {
+            Some(root) => Some(configured_title(
+                Path::new(&root),
+                executable.as_deref().ok_or(E_INVALIDARG)?,
+            )?),
+            None => None,
+        };
+
+        // A null name asks Windows for the process image, not this DLL.
+        let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+        if base != 0 {
+            title_runtime::set_main_image(base);
+            if let Some(path) = executable.as_deref() {
+                title_runtime::set_image_path(base, path);
+            }
+        }
+        if let Some(title) = title {
+            title_runtime::set_wine_title(title);
+        }
+        Ok(())
+    });
+
+    fn initialize_title() -> Result<(), HRESULT> {
+        *INITIALIZED
+    }
+
     #[unsafe(no_mangle)]
     pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {
+        if let Err(hr) = initialize_title() {
+            return hr;
+        }
         runtime::XGameRuntimeInitialize()
     }
 
@@ -23,11 +89,17 @@ mod windows {
 
     #[unsafe(no_mangle)]
     pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
+        if let Err(hr) = initialize_title() {
+            return hr;
+        }
         runtime::InitializeApiImpl(version, build)
     }
 
     #[unsafe(no_mangle)]
     pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
+        if let Err(hr) = initialize_title() {
+            return hr;
+        }
         runtime::InitializeApiImplEx(version, build, flags)
     }
 
@@ -38,6 +110,9 @@ mod windows {
         flags: u64,
         options: *const c_void,
     ) -> HRESULT {
+        if let Err(hr) = initialize_title() {
+            return hr;
+        }
         runtime::InitializeApiImplEx2(version, build, flags, options)
     }
 
@@ -52,6 +127,12 @@ mod windows {
         iid: *const Guid,
         out: *mut *mut c_void,
     ) -> HRESULT {
+        if let Err(hr) = initialize_title() {
+            return hr;
+        }
+        if let Err(hr) = pin_for_objects() {
+            return hr;
+        }
         runtime::QueryApiImpl(provider, iid, out)
     }
 
@@ -65,6 +146,31 @@ mod windows {
         use super::*;
         use std::ptr;
         use victory_hle::modules::{xasync, xsystem, xuser};
+
+        #[test]
+        fn configured_root_uses_adjacent_manifest_without_creating_storage() {
+            let dir = std::env::temp_dir().join(format!(
+                "victory-wine-title-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let exe = dir.join("game.exe");
+            let default = configured_title(&dir, &exe).unwrap();
+            assert_eq!(default.id, 0);
+            assert_eq!(default.storage, dir.join("storage"));
+            assert_eq!(default.saves(), dir.join("saves"));
+            assert!(!default.storage.exists());
+            std::fs::write(dir.join("MicrosoftGame.config"), "<Game><TitleId>639AA8DD</TitleId></Game>").unwrap();
+            assert_eq!(configured_title(&dir, &exe).unwrap().id, 0x639A_A8DD);
+            assert_eq!(configured_title(Path::new("relative"), &exe), Err(E_INVALIDARG));
+            assert_eq!(configured_title(&dir.join("missing"), &exe), Err(E_INVALIDARG));
+            assert_eq!(configured_title(&dir.join("MicrosoftGame.config"), &exe), Err(E_INVALIDARG));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
 
         #[test]
         fn forwards_runtime_entry_points() {

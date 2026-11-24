@@ -199,7 +199,8 @@ fn directory(path: &Path, name: &str) -> Result<PathBuf> {
 
 fn clean_bridge_env(command: &mut Command) {
     command.env_remove("VICTORY_WINE_METAL_ADDR")
-        .env_remove("VICTORY_WINE_METAL_TOKEN");
+        .env_remove("VICTORY_WINE_METAL_TOKEN")
+        .env_remove("VICTORY_WINE_TITLE_DATA");
 }
 
 fn nonblocking(reader: &impl AsRawFd) -> Result<()> {
@@ -253,6 +254,35 @@ fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Resul
         if Instant::now() >= deadline { bail!("timed out waiting for {description}"); }
         std::thread::sleep(POLL);
     }
+}
+
+fn winepath_output(winepath: &Path, prefix: &Path, flag: &str, path: &OsStr) -> Result<Vec<u8>> {
+    let mut command = Command::new(winepath);
+    command.arg(flag).arg(path).env("WINEPREFIX", prefix).stdout(Stdio::piped());
+    clean_bridge_env(&mut command);
+    let mut child = ManagedChild::spawn(&mut command, "winepath")?;
+    let mut output = read_output(&mut child, false, "winepath")?;
+    while matches!(output.last(), Some(b'\r' | b'\n')) { output.pop(); }
+    if output.is_empty() || output.iter().any(|b| matches!(b, b'\0' | b'\r' | b'\n'))
+        || std::str::from_utf8(&output).is_err() {
+        bail!("winepath returned an invalid path");
+    }
+    // The exited leader can be reaped without signaling the shared Wine server.
+    child.child.try_wait().context("reaping winepath")?
+        .context("winepath unexpectedly still running")?;
+    child.reaped = true;
+    Ok(output)
+}
+
+fn lock_save_root(path: &Path) -> Result<(PathBuf, File)> {
+    let path = directory(path, "save root")?;
+    let lock = File::open(&path).with_context(|| format!("opening save root {}", path.display()))?;
+    // SAFETY: lock is a live descriptor. The nonblocking advisory lock is held
+    // until the launcher has stopped its children and drops this file.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error()).context("locking save root (another launcher may be using it)");
+    }
+    Ok((path, lock))
 }
 fn wine_overrides(gameinput: bool) -> Result<OsString> {
     let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem", b"acphal", b"xapu"];
@@ -553,7 +583,7 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -562,6 +592,12 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let dll_dir = directory(dll_dir, "DLL directory")?;
     let wine_prefix = directory(wine_prefix, "Wine prefix")?;
     let title_root = title_root.map(|root| checked_title_root(&wine_prefix, root)).transpose()?;
+    let save_root = save_root.map(lock_save_root).transpose()?;
+    if let (Some(title), Some((save, _))) = (&title_root, &save_root) {
+        if title.starts_with(save) || save.starts_with(title) {
+            bail!("title root and save root must be separate directories");
+        }
+    }
     reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
     preflight(&exe, &dll_dir, provision_gameinput)?;
     let overrides = wine_overrides(provision_gameinput)?;
@@ -577,21 +613,17 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     } else { (None, false) };
     eprintln!("Warning: Wine provider DLL paths are not pinned; preflight cannot exclude activation contexts, registry overrides, guest-directed loads or file replacement. Trust the guest and prefix.");
     let _signals = SignalGuard::install()?;
-    let mut path_command = Command::new(&winepath);
-    path_command.arg("-w").arg(&dll_dir).env("WINEPREFIX", &wine_prefix).stdout(Stdio::piped());
-    clean_bridge_env(&mut path_command);
-    let mut path_child = ManagedChild::spawn(&mut path_command, "winepath")?;
-    let mut windows_path = read_output(&mut path_child, false, "winepath")?;
-    while matches!(windows_path.last(), Some(b'\r' | b'\n')) { windows_path.pop(); }
-    if windows_path.is_empty() || windows_path.iter().any(|b| matches!(b, b'\0' | b'\r' | b'\n' | b';')) {
-        bail!("winepath returned an invalid DLL directory");
-    }
-    // Successful winepath may have started a shared prefix server; reap only
-    // the already-exited leader, without signaling its process group.
-    path_child.child.try_wait().context("reaping winepath")?
-        .context("winepath unexpectedly still running")?;
-    path_child.reaped = true;
-    drop(path_child);
+    let windows_path = winepath_output(&winepath, &wine_prefix, "-w", dll_dir.as_os_str())?;
+    if windows_path.contains(&b';') { bail!("winepath returned an invalid DLL directory"); }
+    let windows_save_root = if let Some((root, _)) = &save_root {
+        let windows = winepath_output(&winepath, &wine_prefix, "-w", root.as_os_str())?;
+        let host = winepath_output(&winepath, &wine_prefix, "-u", OsStr::from_bytes(&windows))?;
+        let host = PathBuf::from(OsString::from_vec(host));
+        if directory(&host, "Wine save root")? != *root {
+            bail!("winepath save-root mapping does not round-trip to the selected directory");
+        }
+        Some(OsString::from_vec(windows))
+    } else { None };
     if let Some(root) = &title_root { checked_title_root(&wine_prefix, root)?; }
     if let Some(provider) = &input_provider {
         if fresh_prefix { install_gameinput(&wine_prefix, provider)?; }
@@ -626,6 +658,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         .env("WINEPATH", wine_path).env("WINEDLLOVERRIDES", overrides);
     clean_bridge_env(&mut wine_command);
     wine_command.env("VICTORY_WINE_METAL_ADDR", address.to_string()).env("VICTORY_WINE_METAL_TOKEN", &token);
+    if let Some(root) = &windows_save_root { wine_command.env("VICTORY_WINE_TITLE_DATA", root); }
     let mut guest = ManagedChild::spawn(&mut wine_command, "Wine")?;
     loop {
         check_signal()?;
@@ -651,8 +684,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

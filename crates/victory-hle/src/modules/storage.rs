@@ -46,6 +46,9 @@ type This = *const Object;
 /// drive, so a host folder such as `C:\Users\..` would make it write to the
 /// root of `C:`. None (the path calls fail) before the title is set.
 fn folder() -> Option<String> {
+    if runtime::wine_title_configured() {
+        return None;
+    }
     let storage = runtime::title().storage;
     if storage.as_os_str().is_empty() {
         return None;
@@ -135,6 +138,9 @@ fn space() -> SpaceInfo {
 }
 
 extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+    if runtime::wine_title_configured() {
+        return NOT_SUPPORTED;
+    }
     put(out, space())
 }
 
@@ -143,7 +149,9 @@ static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
 extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
-    let hr = if bytes <= space().total_free {
+    let hr = if runtime::wine_title_configured() {
+        NOT_SUPPORTED
+    } else if bytes <= space().total_free {
         S_OK
     } else {
         E_ABORT

@@ -160,10 +160,35 @@ fn elements(text: &str) -> Vec<(String, String)> {
     out
 }
 
-static TITLE: Mutex<Option<Title>> = Mutex::new(None);
+#[derive(Default)]
+struct TitleState {
+    title: Option<Title>,
+    wine_configured: bool,
+}
+
+static TITLE: Mutex<TitleState> = Mutex::new(TitleState {
+    title: None,
+    wine_configured: false,
+});
 
 pub fn set_title(title: Title) {
-    *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
+    *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = TitleState {
+        title: Some(title),
+        wine_configured: false,
+    };
+}
+
+/// Installs the Wine title without exposing the custom loader's virtual drive.
+pub fn set_wine_title(title: Title) {
+    *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = TitleState {
+        title: Some(title),
+        wine_configured: true,
+    };
+}
+
+/// Whether this title runs under Wine's ordinary file imports.
+pub fn wine_title_configured() -> bool {
+    TITLE.lock().unwrap_or_else(|e| e.into_inner()).wine_configured
 }
 
 /// The running title; the default (id 0, no storage) until set.
@@ -171,6 +196,7 @@ pub fn title() -> Title {
     TITLE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .title
         .clone()
         .unwrap_or_default()
 }

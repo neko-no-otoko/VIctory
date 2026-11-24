@@ -918,6 +918,55 @@ unacknowledged search and known shadow DLLs were rejected; host exit and
 signal paths cleaned up the host; and two simultaneous launches used distinct
 loopback ports and tokens. This uses synthetic files, not a configured game.
 
+## Offline Wine XGameSave
+
+`wine-run --save-root /absolute/path/to/dedicated-data` enables the existing
+offline XGameSave HLE for the normal Wine process. The selected directory must
+already exist and must be dedicated to one title. The launcher converts it to
+a Wine path and checks that converting back resolves to the same directory;
+if `--title-root` is also supplied, the two directories must not overlap.
+It takes a nonblocking advisory lock on the directory for the launcher's
+lifetime, rejecting a second cooperating launcher using the same directory.
+
+The runtime DLL reads `MicrosoftGame.config` beside the actual executable
+using the upstream manifest parser, and stores its save data under
+`<save-root>/saves` using the upstream per-user and service-configuration
+layout. A missing manifest retains upstream's default title ID and quota;
+choose different save roots for different titles even if their IDs match.
+With no option the launcher removes any inherited
+`VICTORY_WINE_TITLE_DATA`, so XGameSave remains unconfigured and reports
+`NO_ACCESS` rather than writing in the working directory.
+
+This is the existing local, offline XGameSave implementation, not Xbox cloud
+sync. It implements its supported asynchronous operations and versioned
+container updates; blocking slots and other unimplemented methods remain
+unsupported. Persistent-local-storage path, space and prompt requests return
+unsupported in this mode instead of exposing VIctory's custom-loader virtual
+drive, which Wine's normal file imports cannot use.
+The runtime DLL pins itself when returning provider objects, so their method
+tables remain available if the guest releases its explicit DLL reference.
+
+The save root, Wine mappings and contents are trusted, not sandboxed or pinned.
+Symlinks and other processes can redirect or modify paths. The advisory lock
+coordinates only cooperating launchers that use the same directory; it does
+not prevent a guest, another program, a nested save root, or a detached child
+from accessing the data. Do not use the same save data concurrently outside
+that coordination. Wine and the guest can write elsewhere with the user's
+permissions.
+
+With the launcher test environment above:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_saves -- --ignored --nocapture --test-threads=1
+```
+
+On Wine 11 under Rosetta, two synthetic tests passed. A compiler-TLS PE wrote
+and reopened a binary save in separate launches, checked a second root was
+isolated, and exercised an explicitly loaded runtime object after
+`FreeLibrary`. The tests also checked unsupported slots and storage paths,
+unconfigured saves, invalid or locked roots, and overlapping title/save
+roots. A focused TLS/Metal launcher regression passed separately.
+
 ## Normal Wine XMem HLE DLL
 
 `xmem.dll` exports the 13 named functions in the existing Windows XMem HLE
