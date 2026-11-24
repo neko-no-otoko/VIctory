@@ -105,6 +105,7 @@ unsafe extern "C" {
         blend_enabled: bool,
         write_mask: u8,
         alpha_source: bool,
+        additive: bool,
         vertex_uv: bool,
         format: u32,
         error: *mut c_char,
@@ -280,12 +281,13 @@ pub struct DepthState {
     pub compare: u32,
 }
 
-/// Source-alpha blending and D3D RGBA channel write mask.
+/// Restricted source-alpha or additive blending and D3D RGBA channel write mask.
 #[derive(Clone, Copy, Debug)]
 pub struct BlendState {
     pub enabled: bool,
     pub write_mask: u8,
     pub alpha_source: bool,
+    pub additive: bool,
 }
 
 
@@ -339,7 +341,7 @@ impl Renderer {
     ) -> Result<Self, RenderError> {
         Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                              width, height, fragment_constant_dwords, fragment_texture, None,
-                             BlendState { enabled: false, write_mask: 15, alpha_source: false })
+                             BlendState { enabled: false, write_mask: 15, alpha_source: false, additive: false })
     }
 
     pub fn new_depth(
@@ -349,7 +351,7 @@ impl Renderer {
     ) -> Result<Self, RenderError> {
         Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                              width, height, fragment_constant_dwords, fragment_texture, Some(state),
-                             BlendState { enabled: false, write_mask: 15, alpha_source: false })
+                             BlendState { enabled: false, write_mask: 15, alpha_source: false, additive: false })
     }
 
     pub fn new_configured(
@@ -445,6 +447,7 @@ impl Renderer {
                 blend.enabled,
                 blend.write_mask,
                 blend.alpha_source,
+                blend.additive,
                 vertex_uv,
                 format.native_value(),
                 error.as_mut_ptr(),

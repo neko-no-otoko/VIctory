@@ -212,7 +212,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
-                           bool blend_enabled, uint8_t write_mask, bool alpha_source,
+                           bool blend_enabled, uint8_t write_mask, bool alpha_source, bool additive,
                            bool vertex_uv, uint32_t format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
@@ -258,10 +258,10 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         color.blendingEnabled = blend_enabled;
         color.rgbBlendOperation = MTLBlendOperationAdd;
         color.alphaBlendOperation = MTLBlendOperationAdd;
-        color.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        color.sourceRGBBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
+        color.destinationRGBBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
         color.sourceAlphaBlendFactor = alpha_source ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
-        color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        color.destinationAlphaBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
         if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");

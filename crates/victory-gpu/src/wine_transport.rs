@@ -73,7 +73,7 @@ pub struct PipelineDepth { pub write:bool, pub compare:u32 }
 #[derive(Clone, Debug)]
 pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend }
 #[derive(Clone, Debug)]
-pub struct Blend { pub enabled:bool, pub write_mask:u8, pub alpha_source:bool }
+pub struct Blend { pub enabled:bool, pub write_mask:u8, pub alpha_source:bool, pub additive:bool }
 #[derive(Clone, Debug)]
 pub struct CopyTexture {
     pub src: u64, pub dst: u64, pub offset: u64, pub pitch: u32,
@@ -148,7 +148,7 @@ pub fn decode_results(data:&[u8])->Result<Vec<Resource>,String> { if data.len()>
 pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
     validate_commands(&batch.resources,&batch.commands)?;
     let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?; count(&mut w,batch.pipelines.len())?;
-    let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(1);w.u32(z.write as u32);w.u32(z.compare);} else {w.u32(0);} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.alpha_source as u32);}
+    let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(1);w.u32(z.write as u32);w.u32(z.compare);} else {w.u32(0);} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.alpha_source as u32 | ((p.blend.additive as u32) << 1));}
     count(&mut w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
@@ -166,7 +166,7 @@ pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
 }
 pub fn decode_batch(data:&[u8])->Result<Batch,String> {
     if data.len()>MAX_PAYLOAD {return Err("wire payload exceeds limit".into());} let mut r=Reader {data,pos:0}; let resources=read_resources(&mut r)?;
-    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();for _ in 0..n {let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())} let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;let vertex_stride=r.u32()?;let format=r.u32()?;let depth=if r.boolean()? {Some(PipelineDepth {write:r.boolean()?,compare:r.u32()?})} else {None};let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())} let blend=Blend {enabled,write_mask:mask as u8,alpha_source:r.boolean()?};pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend});}
+    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();for _ in 0..n {let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())} let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;let vertex_stride=r.u32()?;let format=r.u32()?;let depth=if r.boolean()? {Some(PipelineDepth {write:r.boolean()?,compare:r.u32()?})} else {None};let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())} let flags=r.u32()?;if flags>3 || flags==3 {return Err("invalid blend flags".into())} let blend=Blend {enabled,write_mask:mask as u8,alpha_source:flags & 1 != 0,additive:flags & 2 != 0};pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend});}
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
@@ -235,7 +235,7 @@ mod tests {
     fn pipeline_and_draw_round_trip() {
         let mut b=batch();
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
-            depth:Some(PipelineDepth {write:true,compare:4}),blend:Blend {enabled:true,write_mask:15,alpha_source:false}});
+            depth:Some(PipelineDepth {write:true,compare:4}),blend:Blend {enabled:true,write_mask:15,alpha_source:false,additive:true}});
         b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),

@@ -405,9 +405,9 @@ multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT
 depth textures, and buffers.
 Graphics supports POSITION float4, optionally followed by TEXCOORD0
 float2; one color target and optional depth target per draw; the native depth
-comparison/write subset; source-alpha blending and color write masks; and a
-single sampled texture and point or linear clamp sampler. Shader constants
-must be contiguous and use one root slot. Texture copy row pitch is
+comparison/write subset; source-alpha or ONE-plus-ONE additive blending and
+color write masks; and a single sampled texture and point or linear clamp sampler.
+Shader constants must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
 This remains restricted: no partial clears, cross-process shared fences,
@@ -418,6 +418,11 @@ Unsupported combinations fail or trap rather than being ignored. Limits are
 4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
 and 64 MiB per request. Shader translation and drawing use the existing
 native Metal path, not MetalVulkan.
+
+Additive blending is limited to `ADD` with source and destination factors
+`ONE` for both RGB and alpha; other new blend combinations remain rejected.
+The launcher-driven `wine_mips` fixture includes two ordered additive draws,
+nonzero destination color, channel saturation and an invalid-factor case.
 
 Linear sampled multi-mip textures use 2D `TEXTURE_LAYOUT_UNKNOWN`, one array layer,
 one sample, explicit nonzero mip count and no render/depth flags. Null SRVs

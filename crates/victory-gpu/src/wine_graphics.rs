@@ -85,7 +85,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     if !prepared.contains_key(&d.pipeline) {
         let depth=if let Some(z)=&p.depth {if !(1..=8).contains(&z.compare) {return Err("unsupported depth comparison".into())} Some(DepthState {write:z.write,compare:z.compare})} else {None};
         if p.blend.write_mask>15 {return Err("invalid blend mask".into())}
-        let state=GraphicsState {depth,blend:BlendState {enabled:p.blend.enabled,write_mask:p.blend.write_mask,alpha_source:p.blend.alpha_source},input_uv:p.vertex_stride==24,color_format};
+        let state=GraphicsState {depth,blend:BlendState {enabled:p.blend.enabled,write_mask:p.blend.write_mask,alpha_source:p.blend.alpha_source,additive:p.blend.additive},input_uv:p.vertex_stride==24,color_format};
         prepared.insert(d.pipeline,Prepared::new(&p.vertex_shader,&p.pixel_shader,state)?);
     }
     let prepared=prepared.get_mut(&d.pipeline).unwrap();
