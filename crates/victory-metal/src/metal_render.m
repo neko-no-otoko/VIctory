@@ -16,6 +16,9 @@ static bool fail(char *dst, size_t len, NSString *message) {
 @property(nonatomic, strong) id<MTLTexture> texture;
 @property(nonatomic, strong) id<MTLBuffer> readback;
 @property(nonatomic, strong) id<MTLBuffer> vertices;
+@property(nonatomic, strong) id<MTLBuffer> fragmentConstants;
+@property(nonatomic, strong) id<MTLBuffer> fragmentArguments;
+@property(nonatomic) size_t fragmentConstantBytes;
 @property(nonatomic) uint32_t width;
 @property(nonatomic) uint32_t height;
 @property(nonatomic) size_t stride;
@@ -34,7 +37,8 @@ static id<MTLLibrary> loadLibrary(id<MTLDevice> device, const uint8_t *bytes,
 
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
-                           uint32_t width, uint32_t height, char *error, size_t error_len) {
+                           uint32_t width, uint32_t height, uint32_t constant_dwords,
+                           char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -75,6 +79,18 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         r.readback = [r.device newBufferWithLength:r.stride * height options:MTLResourceStorageModeShared];
         r.queue = [r.device newCommandQueue];
         if (!r.readback || !r.queue) FAIL(@"readback or queue allocation failed");
+        if (constant_dwords) {
+            r.fragmentConstantBytes = (size_t)constant_dwords * sizeof(uint32_t);
+            r.fragmentConstants = [r.device newBufferWithLength:r.fragmentConstantBytes options:MTLResourceStorageModeShared];
+            r.fragmentArguments = [r.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
+            if (!r.fragmentConstants || !r.fragmentArguments) FAIL(@"fragment constant allocation failed");
+            // Converter's automatic linear CBV descriptor: GPU address,
+            // unused texture ID, and buffer byte length in the low 32 bits.
+            uint64_t *entry = r.fragmentArguments.contents;
+            entry[0] = r.fragmentConstants.gpuAddress;
+            entry[1] = 0;
+            entry[2] = r.fragmentConstantBytes;
+        }
         r.width = width;
         r.height = height;
 #undef FAIL
@@ -82,8 +98,8 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
     }
 }
 
-bool victory_metal_draw(void *handle, const float *vertices, uint32_t count, uint8_t *pixels,
-                        char *error, size_t error_len) {
+bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
+                        const uint32_t *constants, uint8_t *pixels, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
@@ -92,6 +108,8 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count, uin
             r.vertices = [r.device newBufferWithLength:size options:MTLResourceStorageModeShared];
         if (!r.vertices) return fail(error, error_len, @"vertex buffer allocation failed");
         memcpy(r.vertices.contents, vertices, size);
+        if (r.fragmentConstants)
+            memcpy(r.fragmentConstants.contents, constants, r.fragmentConstantBytes);
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = r.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -102,6 +120,10 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count, uin
         if (!command || !render) return fail(error, error_len, @"render command creation failed");
         [render setRenderPipelineState:r.pipeline];
         [render setVertexBuffer:r.vertices offset:0 atIndex:6];
+        if (r.fragmentConstants) {
+            [render setFragmentBuffer:r.fragmentArguments offset:0 atIndex:2];
+            [render useResource:r.fragmentConstants usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        }
         [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
         [render endEncoding];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];

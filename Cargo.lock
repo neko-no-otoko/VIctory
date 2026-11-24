@@ -749,6 +749,7 @@ name = "victory-metal"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libloading",
  "tempfile",
  "victory-shader",
 ]

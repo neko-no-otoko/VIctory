@@ -1,8 +1,8 @@
 //! Native offscreen Metal triangle rendering, not a console GPU backend.
 //!
 //! `Renderer` retains its device, pipeline, render target and readback buffer
-//! across draws. Vertex input is one float4 attribute; other resource bindings
-//! and graphics state are not yet implemented.
+//! across draws. It supports one float4 vertex attribute and a fragment b0
+//! constant buffer using the converter's linear argument-buffer layout.
 
 #![cfg(target_os = "macos")]
 
@@ -31,6 +31,7 @@ unsafe extern "C" {
         fragment_entry: *const c_char,
         width: u32,
         height: u32,
+        fragment_constant_dwords: u32,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -38,6 +39,7 @@ unsafe extern "C" {
         renderer: *mut c_void,
         vertices: *const [f32; 4],
         vertex_count: u32,
+        fragment_constants: *const u32,
         pixels: *mut u8,
         error: *mut c_char,
         error_len: usize,
@@ -58,12 +60,14 @@ fn native_error(error: &[c_char]) -> RenderError {
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
 ///
 /// Both metallibs must be produced by Apple Metal Shader Converter. Vertex
-/// attribute 0 is a per-vertex float4 at buffer slot 6; shaders must not
-/// require other resources or function constants. The output is tightly
-/// packed RGBA8, top row first.
+/// attribute 0 is a per-vertex float4 at buffer slot 6. The only supported
+/// shader resource is fragment `b0, space0` at offset 0 in the converter's
+/// automatic linear argument buffer; the caller must verify that layout via
+/// converter reflection. The output is tightly packed RGBA8, top row first.
 pub struct Renderer {
     handle: NonNull<c_void>,
     pixel_len: usize,
+    fragment_constant_dwords: usize,
 }
 
 impl Renderer {
@@ -74,10 +78,16 @@ impl Renderer {
         fragment_entry: &str,
         width: u32,
         height: u32,
+        fragment_constant_dwords: u32,
     ) -> Result<Self, RenderError> {
         if width == 0 || height == 0 || vertex_metallib.is_empty() || fragment_metallib.is_empty() {
             return Err(RenderError(
                 "nonzero dimensions and both metallibs are required".into(),
+            ));
+        }
+        if fragment_constant_dwords % 4 != 0 || fragment_constant_dwords > u32::MAX / 4 {
+            return Err(RenderError(
+                "fragment constant size must be a multiple of 16 bytes and fit in 32 bits".into(),
             ));
         }
         let pixel_len = (width as usize)
@@ -101,19 +111,35 @@ impl Renderer {
                 fragment_entry.as_ptr(),
                 width,
                 height,
+                fragment_constant_dwords,
                 error.as_mut_ptr(),
                 error.len(),
             )
         };
         let handle = NonNull::new(ptr).ok_or_else(|| native_error(&error))?;
-        Ok(Self { handle, pixel_len })
+        Ok(Self {
+            handle,
+            pixel_len,
+            fragment_constant_dwords: fragment_constant_dwords as usize,
+        })
     }
 
-    /// Draw a triangle list from float4 positions into a caller-owned buffer.
-    pub fn draw(&mut self, vertices: &[[f32; 4]], pixels: &mut [u8]) -> Result<(), RenderError> {
-        if vertices.is_empty() || vertices.len() % 3 != 0 || pixels.len() != self.pixel_len {
+    /// Draw a triangle list with the configured fragment b0 constants.
+    /// The exact configured number of dwords must be supplied on every draw.
+    pub fn draw(
+        &mut self,
+        vertices: &[[f32; 4]],
+        fragment_constants: &[u32],
+        pixels: &mut [u8],
+    ) -> Result<(), RenderError> {
+        if vertices.is_empty()
+            || vertices.len() % 3 != 0
+            || pixels.len() != self.pixel_len
+            || fragment_constants.len() != self.fragment_constant_dwords
+        {
             return Err(RenderError(
-                "expected a nonempty triangle list and an exact-sized output buffer".into(),
+                "expected a nonempty triangle list and exact-sized constants and output buffers"
+                    .into(),
             ));
         }
         let count =
@@ -126,6 +152,7 @@ impl Renderer {
                 self.handle.as_ptr(),
                 vertices.as_ptr(),
                 count,
+                fragment_constants.as_ptr(),
                 pixels.as_mut_ptr(),
                 error.as_mut_ptr(),
                 error.len(),

@@ -101,10 +101,15 @@ one synthetic compute case, not a game compatibility or renderer test.
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle
 lists from a float4 vertex buffer into RGBA8 and reads the pixels back;
-device, pipeline, target and buffers are reused across draws. Its fixed input
-layout supports one per-vertex float4 and it binds no other shader resources.
-It does not implement a console GPU, presentation, or game rendering.
-To exercise synthetic translated GFX10 vertex and fragment shaders:
+device, pipeline, target and buffers are reused across synchronous draws.
+Its fixed input layout supports one per-vertex float4 and an optional fragment
+`b0, space0` constant buffer. Specify its size in dwords when creating the
+renderer (zero or a multiple of four) and supply that exact number per draw.
+The caller must verify using converter reflection that the fragment uses the
+automatic linear layout with b0 at byte offset zero, and that the supplied
+buffer is large enough. Other shader resources, console GPU semantics and
+presentation are not implemented. To exercise synthetic translated GFX10
+vertex and fragment shaders, including changing fragment constants:
 
 ```sh
 cargo build -p victory
