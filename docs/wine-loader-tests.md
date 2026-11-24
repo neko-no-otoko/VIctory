@@ -406,8 +406,18 @@ UNORM_SRGB color targets; single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT
 depth/stencil textures; and buffers.
 Graphics supports one color target and optional depth target per draw; the
 native depth comparison/write subset; restricted single-target D3D blending
-and color write masks; and a single sampled texture and point or linear clamp
-sampler.
+and color write masks; and multiple sampled textures with point or linear
+clamp samplers.
+The pixel-shader subset accepts up to 16 textures and 16 samplers, each in
+its own distinct root-parameter slot and single-descriptor table at index
+zero. Descriptor heaps hold up to 16 entries; tables can point at different
+entries, and recorded draws retain the referenced resources. Changing a
+referenced descriptor before execution is rejected. Array or dynamically
+indexed tables, nonzero table offsets/base registers, and comparison or
+non-clamp samplers remain unsupported. The decoded console metadata does not
+expose register spaces, so no additional register-space mapping is claimed.
+The converter's directly indexed heaps use its
+[documented descriptor-table encoding](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
 Color SRV and RTV views must match the resource's typed format exactly;
 typeless resources and typed reinterpretation are rejected. Copies preserve
 the resource's channel bytes. Metal samples sRGB RGB in linear space, blends

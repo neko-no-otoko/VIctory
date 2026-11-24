@@ -17,15 +17,16 @@ pub(crate) struct Prepared {
     pub(crate) dwords: usize,
     pub(crate) texture_slot: Option<u8>,
     pub(crate) sampler_slot: Option<u8>,
+    pub(crate) texture_slots: Vec<u8>,
+    pub(crate) sampler_slots: Vec<u8>,
     pub(crate) depth: Option<victory_metal::DepthState>,
     pub(crate) vertex_stride: u32,
     pub(crate) color_format: victory_metal::ColorFormat,
     pub(crate) blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
     input_renderer: Option<(u32, u32, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
-    pending_texture_identity: Option<SampledTextureIdentity>,
-    renderer_texture: Option<SampledTextureKey>,
-    input_renderer_texture: Option<SampledTextureKey>,
+    renderer_texture: [Option<SampledTextureKey>; 16],
+    input_renderer_texture: [Option<SampledTextureKey>; 16],
 }
 
 /// A supplied input-layout element and the Metal attribute assigned to it.
@@ -104,7 +105,7 @@ fn sampled_texture_cached(cached: Option<SampledTextureKey>, key: Option<Sampled
 }
 
 fn upload_sampled_texture(
-    renderer: &mut victory_metal::Renderer, texture: Texture<'_>,
+    renderer: &mut victory_metal::Renderer, index: u32, texture: &Texture<'_>,
     identity: Option<SampledTextureIdentity>, cached: &mut Option<SampledTextureKey>,
 ) -> Result<(), String> {
     let key = identity.map(|identity| SampledTextureKey::new(identity, &texture));
@@ -113,9 +114,8 @@ fn upload_sampled_texture(
     }
     // A failed upload must never leave a stale identity attached to a renderer.
     *cached = None;
-    renderer.set_fragment_texture_mips(
-        texture.width, texture.height, texture.levels, texture.pixels, texture.filter,
-        texture.format, texture.min_lod, texture.max_lod,
+    renderer.set_fragment_texture_mips_at(
+        index, texture.width, texture.height, texture.levels, texture.pixels, texture.format,
     ).map_err(|e| e.to_string())?;
     *cached = key;
     Ok(())
@@ -174,10 +174,10 @@ impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
         let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
         let (vertex_host, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None)?;
-        let (pixel_host, texture_slot, sampler_slot) =
+        let (pixel_host, texture_slots, sampler_slots) =
             validate(pixel, HwStage::Ps, &varying, false, None)?;
         let vertex = convert(&vertex_host, HwStage::Vs, false)?;
-        let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
+        let pixel = convert(&pixel_host, HwStage::Ps, !texture_slots.is_empty())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         let user_data = pixel_host.user_data;
         Ok(Self {
@@ -185,17 +185,17 @@ impl Prepared {
             pixel,
             user_data,
             dwords,
-            texture_slot,
-            sampler_slot,
+            texture_slot: texture_slots.first().copied(),
+            sampler_slot: sampler_slots.first().copied(),
+            texture_slots, sampler_slots,
             depth: graphics.depth,
             blend: graphics.blend,
             vertex_stride: if graphics.input_uv { 24 } else { 16 },
             color_format: graphics.color_format,
             renderer: None,
             input_renderer: None,
-            pending_texture_identity: None,
-            renderer_texture: None,
-            input_renderer_texture: None,
+            renderer_texture: [None; 16],
+            input_renderer_texture: [None; 16],
         })
     }
 
@@ -208,7 +208,7 @@ impl Prepared {
         let signatures = vertex_signatures(vertex, inputs)?;
         let varying = varying_signatures_for_stages(vertex, pixel)?;
         let (vertex_host, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures))?;
-        let (pixel_host, texture_slot, sampler_slot) =
+        let (pixel_host, texture_slots, sampler_slots) =
             validate(pixel, HwStage::Ps, &varying, false, None)?;
         let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
         let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(
@@ -228,22 +228,33 @@ impl Prepared {
                 .ok_or("reflected vertex attribute exceeds Metal vertex-fetch limits")?;
             resolved.push(ResolvedVertexInput { layout_index: sig.layout_index, attribute_index });
         }
-        let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
+        let pixel = convert(&pixel_host, HwStage::Ps, !texture_slots.is_empty())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         Ok((Self {
-            vertex, pixel, user_data: pixel_host.user_data, dwords, texture_slot, sampler_slot,
+            vertex, pixel, user_data: pixel_host.user_data, dwords,
+            texture_slot: texture_slots.first().copied(), sampler_slot: sampler_slots.first().copied(),
+            texture_slots, sampler_slots,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
             color_format: graphics.color_format, renderer: None, input_renderer: None,
-            pending_texture_identity: None, renderer_texture: None, input_renderer_texture: None,
+            renderer_texture: [None; 16], input_renderer_texture: [None; 16],
         }, resolved))
     }
 
-    /// Apply an identity to the next draw only; Wine owns its batch lifetime.
-    pub(crate) fn set_sampled_texture_identity(&mut self, identity: Option<SampledTextureIdentity>) {
-        self.pending_texture_identity = identity;
+    pub(crate) fn draw(
+        &mut self, width: u32, height: u32, vertices: Vertices<'_>,
+        indices: Option<(victory_metal::IndexData<'_>, i32)>, viewport: [f64; 6],
+        scissor: [u32; 4], depth: Option<&mut [f32]>, stencil: Option<&mut [u8]>,
+        stencil_reference: u32, constants: &[u32], texture: Option<Texture<'_>>,
+        pixels: &mut [u8],
+    ) -> Result<(), String> {
+        let identity = None;
+        let sampler = texture.as_ref().map(|t| (t.filter, t.min_lod, t.max_lod));
+        let textures = texture.map(|t| (t, identity));
+        self.draw_multi(width, height, vertices, indices, viewport, scissor, depth, stencil,
+            stencil_reference, constants, textures.as_slice(), sampler.as_slice(), pixels)
     }
 
-    pub(crate) fn draw(
+    pub(crate) fn draw_multi(
         &mut self,
         width: u32,
         height: u32,
@@ -255,16 +266,17 @@ impl Prepared {
         mut stencil: Option<&mut [u8]>,
         stencil_reference: u32,
         constants: &[u32],
-        texture: Option<Texture<'_>>,
+        textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
+        samplers: &[(victory_metal::TextureFilter, f32, f32)],
         pixels: &mut [u8],
     ) -> Result<(), String> {
-        let identity = self.pending_texture_identity.take();
+        if textures.len() != self.texture_slots.len() || samplers.len() != self.sampler_slots.len() {
+            return Err("texture or sampler binding count does not match pixel shader".into());
+        }
         if self.vertex_stride == 0 {
             return Err("generic input pipeline requires layout-aware rendering".into());
         }
-        if texture.is_some() != self.texture_slot.is_some() {
-            return Err("texture binding does not match pixel shader".into());
-        }
+        
         if depth.is_some() != self.depth.is_some() {
             return Err("depth attachment does not match pipeline".into());
         }
@@ -278,7 +290,7 @@ impl Prepared {
                 &self.vertex, "main", &self.pixel, "main", width, height,
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend, self.color_format,
             ).map_err(|e| e.to_string())?;
-            self.renderer_texture = None;
+            self.renderer_texture = [None; 16];
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
@@ -290,8 +302,11 @@ impl Prepared {
             renderer.stencil_pixels(pixels, true).map_err(|e| e.to_string())?;
             renderer.set_stencil_reference(stencil_reference);
         }
-        if let Some(texture) = texture {
-            upload_sampled_texture(renderer, texture, identity, &mut self.renderer_texture)?;
+        for (index, (texture, identity)) in textures.iter().enumerate() {
+            upload_sampled_texture(renderer, index as u32, texture, *identity, &mut self.renderer_texture[index])?;
+        }
+        for (index, &(filter, min_lod, max_lod)) in samplers.iter().enumerate() {
+            renderer.set_fragment_sampler_at(index as u32, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
         }
         match (vertices, indices) {
             (Vertices::Position(v), Some((indices, base))) => renderer.draw_indexed_preserving(v, indices, base, constants, pixels),
@@ -325,17 +340,18 @@ impl Prepared {
         mut stencil: Option<&mut [u8]>,
         stencil_reference: u32,
         constants: &[u32],
-        texture: Option<Texture<'_>>,
+        textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
+        samplers: &[(victory_metal::TextureFilter, f32, f32)],
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
-        let identity = self.pending_texture_identity.take();
+        if textures.len() != self.texture_slots.len() || samplers.len() != self.sampler_slots.len() {
+            return Err("texture or sampler binding count does not match pixel shader".into());
+        }
         if self.vertex_stride != 0 {
             return Err("layout-aware rendering requires a generic input pipeline".into());
         }
-        if texture.is_some() != self.texture_slot.is_some() {
-            return Err("texture binding does not match pixel shader".into());
-        }
+        
         if depth.is_some() != self.depth.is_some() {
             return Err("depth attachment does not match pipeline".into());
         }
@@ -354,7 +370,7 @@ impl Prepared {
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
                 self.color_format, attributes,
             ).map_err(|e| e.to_string())?;
-            self.input_renderer_texture = None;
+            self.input_renderer_texture = [None; 16];
             self.input_renderer = Some((width, height, attributes.to_vec(), renderer));
         }
         let renderer = &mut self.input_renderer.as_mut().unwrap().3;
@@ -366,8 +382,11 @@ impl Prepared {
             renderer.stencil_pixels(pixels, true).map_err(|e| e.to_string())?;
             renderer.set_stencil_reference(stencil_reference);
         }
-        if let Some(texture) = texture {
-            upload_sampled_texture(renderer, texture, identity, &mut self.input_renderer_texture)?;
+        for (index, (texture, identity)) in textures.iter().enumerate() {
+            upload_sampled_texture(renderer, index as u32, texture, *identity, &mut self.input_renderer_texture[index])?;
+        }
+        for (index, &(filter, min_lod, max_lod)) in samplers.iter().enumerate() {
+            renderer.set_fragment_sampler_at(index as u32, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
         }
         renderer.draw_buffers(
             buffers, indices, first_vertex, vertex_count, instance_count, start_instance,
@@ -664,7 +683,7 @@ fn validate(
     varying: &[Varying],
     input_uv: bool,
     vertex_signatures: Option<&[VertexSignature]>,
-) -> Result<(emit::HostShader, Option<u8>, Option<u8>), String> {
+) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
     let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
@@ -672,31 +691,33 @@ fn validate(
         return Err("expected exactly one native program of the requested stage".into());
     }
     let p = &programs[0];
-    let mut texture = None;
-    let mut sampler = None;
+    // Native metadata has no register-space field. Only its table-local
+    // register zero is established; do not infer additional register spaces.
+    let mut textures = Vec::new();
+    let mut samplers = Vec::new();
     for used in &p.used {
         let target = match used.kind {
-            native::ResourceType::Srv if used.dwords == 8 => &mut texture,
-            native::ResourceType::Sampler if used.dwords == 4 => &mut sampler,
+            native::ResourceType::Srv if used.dwords == 8 => &mut textures,
+            native::ResourceType::Sampler if used.dwords == 4 => &mut samplers,
             _ => return Err("unsupported pixel resource".into()),
         };
-        if stage != HwStage::Ps
-            || target.is_some()
-            || used.root != native::RootType::Table
-            || used.table_offset_dwords != 0
-            || used.lower_bound != 0
-            || used.stride != 0
-            || used.slot >= 64
+        if stage != HwStage::Ps || used.root != native::RootType::Table
+            || used.table_offset_dwords != 0 || used.lower_bound != 0
+            || used.stride != 0 || used.slot >= 64
+            || target.iter().any(|u: &&native::UsedResource| u.slot == used.slot)
         {
-            return Err("only one texture and sampler at table index zero are supported".into());
+            return Err("only distinct single-descriptor tables at index zero are supported".into());
         }
-        *target = Some(used);
+        target.push(used);
     }
-    if texture.is_some() != sampler.is_some()
-        || texture.zip(sampler).is_some_and(|(t, s)| t.slot == s.slot)
+    if textures.len() > 16 || samplers.len() > 16
+        || textures.is_empty() != samplers.is_empty()
+        || textures.iter().any(|t| samplers.iter().any(|s| t.slot == s.slot))
     {
-        return Err("texture and sampler must use distinct tables".into());
+        return Err("invalid texture and sampler tables".into());
     }
+    textures.sort_unstable_by_key(|u| u.slot);
+    samplers.sort_unstable_by_key(|u| u.slot);
     let mut constants_slot = None;
     for root in &p.layout {
         if stage == HwStage::Vs || root.slot >= 64 {
@@ -705,8 +726,8 @@ fn validate(
         match root.root {
             native::RootType::Constants => {
                 if constants_slot.is_some_and(|slot| slot != root.slot)
-                    || texture.is_some_and(|t| t.slot == root.slot)
-                    || sampler.is_some_and(|s| s.slot == root.slot)
+                    || textures.iter().any(|t| t.slot == root.slot)
+                    || samplers.iter().any(|s| s.slot == root.slot)
                 {
                     return Err("constants must use a distinct root slot".into());
                 }
@@ -716,9 +737,7 @@ fn validate(
                 if root.sgprs != 1
                     || root.table_offset_dwords != 0
                     || root.base_register != 0
-                    || ![texture, sampler]
-                        .into_iter()
-                        .flatten()
+                    || !textures.iter().chain(&samplers)
                         .any(|u| u.slot == root.slot && u.user_data == root.user_data)
                 {
                     return Err("unsupported descriptor table layout".into());
@@ -742,7 +761,7 @@ fn validate(
             return Err("overlapping or out-of-range root user data".into());
         }
     }
-    for used in [texture, sampler].into_iter().flatten() {
+    for used in textures.iter().chain(&samplers) {
         if p.layout
             .iter()
             .filter(|r| {
@@ -799,78 +818,49 @@ fn validate(
     }
     let program = ir::build(&p.patched_code(), p.wave64, p.vgprs).map_err(|e| e.to_string())?;
     let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
-    if texture.is_none() {
-        if !traced.scalar.is_empty() || !traced.descriptors.is_empty() {
-            return Err("shader accesses resources".into());
-        }
-    } else {
-        let mut loads = Vec::new();
-        for (role, used) in [
-            (resource::Role::Resource, texture.unwrap()),
-            (resource::Role::Sampler, sampler.unwrap()),
-        ] {
-            let mut source = None;
-            for descriptor in traced.descriptors.iter().filter(|d| d.role == role) {
-                let resource::Source::Loaded { load, first: 0 } = descriptor.source else {
-                    return Err("descriptor must be loaded directly from its table".into());
-                };
-                if source.is_some_and(|previous| previous != load) {
-                    return Err("multiple descriptor loads are unsupported".into());
-                }
-                let inst = &program.blocks[descriptor.site.0].insts[descriptor.site.1];
-                if !matches!(
-                    &inst.fields,
-                    victory_shader::gfx10::Fields::Image { dim: 1, .. }
-                ) || !matches!(
-                    inst.name(),
-                    "image_sample"
-                        | "image_sample_lz"
-                        | "image_sample_l"
-                        | "image_sample_b"
-                        | "image_sample_d"
-                ) {
-                    return Err("only non-comparison 2D texture sampling is supported".into());
-                }
-                source = Some(load);
-            }
-            let load = source.ok_or("missing texture or sampler access")?;
-            let load_inst = &program.blocks[load.0].insts[load.1];
-            let expected_load = if role == resource::Role::Resource {
-                "s_load_dwordx8"
-            } else {
-                "s_load_dwordx4"
-            };
-            if load_inst.name() != expected_load {
-                return Err("unsupported descriptor load width".into());
-            }
-            let (_, addr) = traced
-                .scalar
-                .iter()
-                .find(|(site, _)| *site == load)
-                .ok_or("missing descriptor load")?;
-            let root = p.layout.get(addr.param).ok_or("invalid descriptor table")?;
-            if addr.offset != 0
-                || addr.dynamic.is_some()
-                || root.root != native::RootType::Table
-                || root.slot != used.slot
-                || root.user_data != used.user_data
-            {
-                return Err("only static descriptor index zero is supported".into());
-            }
-            loads.push(load);
-        }
-        if loads[0] == loads[1]
-            || traced.scalar.len() != 2
-            || traced.scalar.iter().any(|(site, _)| !loads.contains(site))
-            || traced.descriptors.iter().any(|d| {
-                !traced
-                    .descriptors
-                    .iter()
-                    .any(|other| other.site == d.site && other.role != d.role)
-            })
+    let mut loads = Vec::new();
+    let mut seen = Vec::new();
+    for descriptor in &traced.descriptors {
+        let resource::Source::Loaded { load, first: 0 } = descriptor.source else {
+            return Err("descriptor must be loaded directly from its table".into());
+        };
+        let inst = &program.blocks[descriptor.site.0].insts[descriptor.site.1];
+        if !matches!(&inst.fields, victory_shader::gfx10::Fields::Image { dim: 1, .. })
+            || !matches!(inst.name(), "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d")
         {
-            return Err("unexpected shader resource access".into());
+            return Err("only non-comparison 2D texture sampling is supported".into());
         }
+        let expected_load = match descriptor.role {
+            resource::Role::Resource => "s_load_dwordx8",
+            resource::Role::Sampler => "s_load_dwordx4",
+            _ => return Err("unsupported descriptor role".into()),
+        };
+        if program.blocks[load.0].insts[load.1].name() != expected_load {
+            return Err("unsupported descriptor load width".into());
+        }
+        let (_, addr) = traced.scalar.iter().find(|(site, _)| *site == load)
+            .ok_or("missing descriptor load")?;
+        let root = p.layout.get(addr.param).ok_or("invalid descriptor table")?;
+        let used = match descriptor.role {
+            resource::Role::Resource => &textures,
+            resource::Role::Sampler => &samplers,
+            _ => unreachable!(),
+        };
+        if addr.offset != 0 || addr.dynamic.is_some() || root.root != native::RootType::Table
+            || !used.iter().any(|u| root.slot == u.slot && root.user_data == u.user_data)
+        {
+            return Err("only static descriptor index zero is supported".into());
+        }
+        if !loads.contains(&load) { loads.push(load); }
+        if !seen.contains(&root.slot) { seen.push(root.slot); }
+        if !traced.descriptors.iter().any(|other| other.site == descriptor.site && other.role != descriptor.role) {
+            return Err("unpaired texture sample".into());
+        }
+    }
+    if traced.scalar.iter().any(|(site, _)| !loads.contains(site))
+        || textures.iter().chain(&samplers).any(|u| !seen.contains(&u.slot))
+    {
+        return Err("unexpected or missing shader resource access".into());
     }
     let raised = io::raise(&program, p).map_err(|e| e.to_string())?;
     if raised.inputs.iter().any(|(_, input)| match stage {
@@ -963,13 +953,13 @@ fn validate(
                     native::RootType::Constants => Some(u.slot) != constants_slot,
                     native::RootType::Table => {
                         u.dword != 0
-                            || ![texture, sampler]
-                                .into_iter()
-                                .flatten()
-                                .any(|r| r.slot == u.slot)
+                            || !textures.iter().chain(&samplers).any(|r| r.slot == u.slot)
                     }
                     _ => true,
                 }
+        })
+        || textures.iter().chain(&samplers).any(|r| {
+            host.user_data.iter().filter(|u| u.root == native::RootType::Table && u.slot == r.slot && u.dword == 0).count() != 1
         })
         || !host.samplers.is_empty()
         || !host.static_samplers.is_empty()
@@ -982,7 +972,7 @@ fn validate(
     if dwords > 64 {
         return Err("fragment user-data buffer is too large".into());
     }
-    Ok((host, texture.map(|u| u.slot), sampler.map(|u| u.slot)))
+    Ok((host, textures.iter().map(|u| u.slot).collect(), samplers.iter().map(|u| u.slot).collect()))
 }
 
 fn convert(host: &emit::HostShader, stage: HwStage, sampled: bool) -> Result<Vec<u8>, String> {

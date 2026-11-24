@@ -82,7 +82,7 @@ struct Entry {
 enum Data {
     Device(Arc<Config>),
     Heap(Arc<Mutex<BufferHeap>>, TextureHeap),
-    Sampler(Arc<Mutex<Option<bool>>>),
+    Sampler(SamplerHeap),
     Buffer(Arc<Buffer>),
     Pipeline(Arc<Vec<u8>>),
     Allocator(u32),
@@ -130,6 +130,33 @@ fn buffer_handle(handle: u64) -> Option<(ComputeHeap, usize)> {
         } else { None }
     })
 }
+fn texture_handle(handle: u64) -> Option<(TextureHeap, usize)> {
+    let map = objects().lock().unwrap();
+    map.iter().find_map(|(&base, entry)| {
+        let Data::Heap(_, heap) = &entry.data else { return None; };
+        let index = usize::try_from(handle.checked_sub(base as u64)?).ok()?;
+        (index < heap.lock().unwrap().len()).then(|| (heap.clone(), index))
+    })
+}
+fn sampler_handle(handle: u64) -> Option<(SamplerHeap, usize)> {
+    let map = objects().lock().unwrap();
+    map.iter().find_map(|(&base, entry)| {
+        let Data::Sampler(heap) = &entry.data else { return None; };
+        let index = usize::try_from(handle.checked_sub(base as u64)?).ok()?;
+        (index < heap.lock().unwrap().len()).then(|| (heap.clone(), index))
+    })
+}
+fn clear_texture_descriptor(handle: u64) {
+    if let Some((heap,index)) = texture_handle(handle) { heap.lock().unwrap()[index] = None; }
+}
+fn clear_buffer_descriptor(handle: u64) {
+    if let Some((heap,index)) = buffer_handle(handle) {
+        let mut heap=heap.lock().unwrap();
+        if heap.entries[index].take().is_some() {
+            heap.generation=heap.generation.checked_add(1).expect("descriptor generation overflow");
+        }
+    }
+}
 fn raw_view(buffer: Arc<Buffer>, first: u64, elements: u32) -> Option<BufferView> {
     let offset = first.checked_mul(4)?;
     let length = u64::from(elements).checked_mul(4)?;
@@ -152,7 +179,8 @@ unsafe impl Sync for Buffer {}
 struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
-type TextureHeap = Arc<Mutex<Option<Srv>>>;
+type TextureHeap = Arc<Mutex<Vec<Option<Srv>>>>;
+type SamplerHeap = Arc<Mutex<Vec<Option<bool>>>>;
 struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
 type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 #[derive(Clone)]
@@ -193,8 +221,8 @@ struct GraphicsJob {
     command: Command, resources: Vec<GraphicsResource>, descriptor: Option<Rtv>,
     depth_descriptor: Option<Rtv>,
     pipeline: Option<Arc<GraphicsPipeline>>,
-    texture: Option<(TextureHeap, Srv)>,
-    sampler: Option<(Arc<Mutex<Option<bool>>>, bool)>,
+    textures: Vec<(TextureHeap, usize, Srv)>,
+    samplers: Vec<(SamplerHeap, usize, bool)>,
 }
 #[derive(Default)]
 struct GraphicsState {
@@ -205,8 +233,8 @@ struct GraphicsState {
     viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: bool,
     vertices: [Option<(Arc<Buffer>, usize, u32, u32)>; 16], constants: Vec<Option<u32>>,
     index: Option<(Arc<Buffer>, usize, u32, u32)>,
-    heaps: Vec<usize>, texture: Option<(u32, TextureHeap, Srv)>,
-    sampler: Option<(u32, Arc<Mutex<Option<bool>>>, bool)>, constant_slot: Option<u32>,
+    heaps: Vec<usize>, textures: Vec<(u32, TextureHeap, usize, Srv)>,
+    samplers: Vec<(u32, SamplerHeap, usize, bool)>, constant_slot: Option<u32>,
     jobs: Vec<GraphicsJob>,
 }
 #[derive(Clone)]
@@ -572,11 +600,11 @@ extern "system" fn create_heap(this: This, d: *const HeapDesc, iid: *const Iid, 
     if d.kind == 3 && d.flags == 0 && d.count == 1 {
         return new(Data::Dsv(Arc::new(Mutex::new((None, 0)))), &HEAP_TABLE, iid, HEAP, out);
     }
-    if d.kind == 1 && d.flags == 1 && d.count == 1 {
-        return new(Data::Sampler(Arc::new(Mutex::new(None))), &HEAP_TABLE, iid, HEAP, out);
+    if d.kind == 1 && d.flags == 1 {
+        return new(Data::Sampler(Arc::new(Mutex::new(vec![None; d.count as usize]))), &HEAP_TABLE, iid, HEAP, out);
     }
     if d.kind != 0 || d.flags != 1 { return E_INVALIDARG; }
-    new(Data::Heap(Arc::new(Mutex::new(BufferHeap { entries: vec![None; d.count as usize], generation: 0 })), Arc::new(Mutex::new(None))), &HEAP_TABLE, iid, HEAP, out)
+    new(Data::Heap(Arc::new(Mutex::new(BufferHeap { entries: vec![None; d.count as usize], generation: 0 })), Arc::new(Mutex::new(vec![None; d.count as usize]))), &HEAP_TABLE, iid, HEAP, out)
 }
 extern "system" fn heap_handle(this: This) -> u64 {
     if !matches!(data(this), Some(Data::Heap(..)) | Some(Data::Sampler(_)) | Some(Data::Rtv(_)) | Some(Data::Dsv(_))) {
@@ -762,6 +790,7 @@ extern "system" fn create_uav(
         || d.stride != 0 || d.counter != 0 || d.flags != 1
     { trap("unsupported UAV view"); }
     let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid UAV range"); };
+    clear_texture_descriptor(handle);
     write_buffer_descriptor(&h, index, BufferDescriptor::Uav(view));
 }
 #[repr(C)]
@@ -777,10 +806,11 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
             || d.format != 39 || d.dimension != 1 || d.mapping != 5768 || d.stride != 0 || d.flags != 1
         { trap("unsupported buffer SRV"); }
         let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid SRV range"); };
+        clear_texture_descriptor(handle);
         write_buffer_descriptor(&h, index, BufferDescriptor::Srv(view));
         return;
     }
-    let (Some(Data::Texture(t)), Some(Data::Heap(_, h))) = (data(res), data(handle as This)) else { trap("invalid SRV"); };
+    let (Some(Data::Texture(t)), Some((h,index))) = (data(res), texture_handle(handle)) else { trap("invalid SRV"); };
     if device(this).is_none() || !matches!(t.format, 28 | 29 | 71 | 72 | 77 | 78 | 87 | 91) { trap("unsupported SRV"); }
     let (first_mip, mip_count) = if desc.is_null() {
         (0, t.mips)
@@ -800,12 +830,13 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
         }
         (first, count)
     };
-    *h.lock().unwrap() = Some(Srv { texture: t, first_mip, mip_count });
+    clear_buffer_descriptor(handle);
+    h.lock().unwrap()[index] = Some(Srv { texture: t, first_mip, mip_count });
 }
 extern "system" fn create_sampler(this: This, desc: *const [u32; 13], handle: u64) {
-    let (Some(Data::Sampler(h)), Some(d)) = (data(handle as This), unsafe { desc.as_ref() }) else { trap("invalid sampler"); };
+    let (Some((h,index)), Some(d)) = (sampler_handle(handle), unsafe { desc.as_ref() }) else { trap("invalid sampler"); };
     if device(this).is_none() || !matches!(d[0], 0 | 0x15) || d[1..] != [3,3,3,0,1,8,0,0,0,0,0,0] { trap("unsupported sampler"); }
-    *h.lock().unwrap() = Some(d[0] == 0x15);
+    h.lock().unwrap()[index] = Some(d[0] == 0x15);
 }
 #[repr(C)]
 struct ComputeDesc {
@@ -1010,8 +1041,8 @@ extern "system" fn set_heaps(this: This, n: u32, heaps: *const This) {
             l.invalid = true; return;
         }
         l.graphics.heaps = hs.iter().map(|p| *p as usize).collect();
-        l.graphics.texture = None;
-        l.graphics.sampler = None;
+        l.graphics.textures.clear();
+        l.graphics.samplers.clear();
         return;
     }
     if l.kind != 2 || n != 1 || heaps.is_null() {
@@ -1047,18 +1078,26 @@ extern "system" fn set_table(this: This, slot: u32, handle: u64) {
 }
 extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
-    if !l.graphics.heaps.contains(&(handle as usize)) { l.invalid = true; return; }
-    match data(handle as This) {
-        Some(Data::Heap(_, h)) => {
-            let texture = h.lock().unwrap().clone();
-            if let Some(t) = texture { l.graphics.texture = Some((slot,h,t)); } else { l.invalid = true; }
+    if slot >= 64 { l.invalid = true; return; }
+    let binding = l.graphics.heaps.iter().find_map(|&base| {
+        let index = usize::try_from(handle.checked_sub(base as u64)?).ok()?;
+        match data(base as This) {
+            Some(Data::Heap(_, h)) => {
+                let value = h.lock().unwrap().get(index)?.clone()?;
+                Some((Some((h,index,value)),None))
+            }
+            Some(Data::Sampler(h)) => {
+                let value = *h.lock().unwrap().get(index)?;
+                Some((None,Some((h,index,value?))))
+            }
+            _ => None,
         }
-        Some(Data::Sampler(h)) => {
-            let sampler = *h.lock().unwrap();
-            if let Some(v) = sampler { l.graphics.sampler = Some((slot,h,v)); } else { l.invalid = true; }
-        }
-        _ => l.invalid = true,
-    }
+    });
+    let Some((texture,sampler)) = binding else { l.invalid = true; return; };
+    l.graphics.textures.retain(|t| t.0 != slot);
+    l.graphics.samplers.retain(|s| s.0 != slot);
+    if let Some((h,index,value)) = texture { l.graphics.textures.push((slot,h,index,value)); }
+    if let Some((h,index,value)) = sampler { l.graphics.samplers.push((slot,h,index,value)); }
 }
 extern "system" fn set_constants(this: This, slot: u32, n: u32, values: *const u32, offset: u32) {
     let l = list(this);
@@ -1541,7 +1580,7 @@ extern "system" fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, st
     let command = if desc.1.format == 20 { Command::ClearStencil { target: resource.id(), flags, depth, stencil } }
         else { Command::ClearDepth { target: resource.id(), depth } };
     l.graphics.jobs.push(GraphicsJob { command, resources: vec![resource], descriptor: Some(desc),
-        depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+        depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 extern "system" fn clear_rtv(this: This, handle: u64, color: *const f32, n: u32, rects: *const c_void) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1550,7 +1589,7 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const f32, n: u32,
     let c = unsafe { *(color as *const [f32;4]) };
     if !c.iter().all(|v| v.is_finite()) { l.invalid = true; return; }
     let resource = GraphicsResource::Texture(desc.1.clone());
-    l.graphics.jobs.push(GraphicsJob { command: Command::Clear { target: resource.id(), color: c }, resources: vec![resource], descriptor: Some(desc), depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+    l.graphics.jobs.push(GraphicsJob { command: Command::Clear { target: resource.id(), color: c }, resources: vec![resource], descriptor: Some(desc), depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 extern "system" fn targets(this: This, n: u32, handles: *const u64, single: i32, depth: *const u64) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1667,26 +1706,35 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         && views[0].slot==0 && views[0].stride==pipeline.stride;
     let first_view=views.first().unwrap().clone();
     if let Some((b,_)) = &index { resources.push(GraphicsResource::Buffer(b.clone())); }
-    if let Some((_,_,view)) = &g.texture { resources.push(GraphicsResource::Texture(view.texture.clone())); }
-    if g.texture.is_some() != g.sampler.is_some() { l.invalid = true; return; }
+    for (_,_,_,view) in &g.textures { resources.push(GraphicsResource::Texture(view.texture.clone())); }
+    if g.textures.is_empty() != g.samplers.is_empty() || g.textures.len()>16 || g.samplers.len()>16 {
+        l.invalid = true; return;
+    }
+    let single = g.textures.len()==1 && g.samplers.len()==1;
+    let texture = single.then(|| &g.textures[0]);
+    let sampler = single.then(|| &g.samplers[0]);
     if pipeline.depth.as_ref().is_some_and(|d| d.stencil.is_some()) {
         g.jobs.push(GraphicsJob { command: Command::SetStencilRef(g.stencil_ref), resources: vec![],
-            descriptor: None, depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+            descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
     }
     if pipeline.depth.is_some() != g.depth.is_some() { l.invalid = true; return; }
     if let Some((_,t,_)) = &g.depth { resources.push(GraphicsResource::Texture(t.clone())); }
     let command = Command::Draw(Draw { target: target.id, pipeline: pipeline.id,
         vertex_buffer: first_view.buffer, vertex_offset: first_view.offset, vertex_size: first_view.size, vertex_stride: first_view.stride,
         vertex_count: count, instance_count: instances, first_vertex: if index.is_some() { 0 } else { first }, first_instance: instance,
-        viewport, scissor, topology: 4, constants, texture: g.texture.as_ref().map(|v| v.2.texture.id),
-        first_mip: g.texture.as_ref().map_or(0, |v| v.2.first_mip),
-        mip_count: g.texture.as_ref().map_or(0, |v| v.2.mip_count),
-        index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: g.sampler.as_ref().is_some_and(|v| v.2),
-        constant_slot: g.constant_slot, texture_slot: g.texture.as_ref().map(|v| v.0),
-        sampler_slot: g.sampler.as_ref().map(|v| v.0), vertices: if legacy {Vec::new()} else {views} });
+        viewport, scissor, topology: 4, constants, texture: texture.map(|v| v.3.texture.id),
+        first_mip: texture.map_or(0, |v| v.3.first_mip),
+        mip_count: texture.map_or(0, |v| v.3.mip_count),
+        index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: sampler.is_some_and(|v| v.3),
+        constant_slot: g.constant_slot, texture_slot: texture.map(|v| v.0),
+        sampler_slot: sampler.map(|v| v.0), vertices: if legacy {Vec::new()} else {views},
+        textures: if single {Vec::new()} else {g.textures.iter().map(|v| wine_transport::SampledTextureBinding {
+            slot:v.0,resource:v.3.texture.id,first_mip:v.3.first_mip,mip_count:v.3.mip_count }).collect()},
+        samplers: if single {Vec::new()} else {g.samplers.iter().map(|v| wine_transport::SamplerBinding {
+            slot:v.0,linear_filter:v.3 }).collect()} });
     g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
-        texture: g.texture.as_ref().map(|v| (v.1.clone(),v.2.clone())),
-        sampler: g.sampler.as_ref().map(|v| (v.1.clone(),v.2)) });
+        textures: g.textures.iter().map(|v| (v.1.clone(),v.2,v.3.clone())).collect(),
+        samplers: g.samplers.iter().map(|v| (v.1.clone(),v.2,v.3)).collect() });
 }
 extern "system" fn copy_buffer(this: This, dst: This, dst_offset: u64, src: This, src_offset: u64, size: u64) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1695,7 +1743,7 @@ extern "system" fn copy_buffer(this: This, dst: This, dst_offset: u64, src: This
         || src_offset.checked_add(size).is_none_or(|v| v > s.len() as u64) { l.invalid = true; return; }
     let command = Command::CopyBuffer { src: s.id, dst: d.id, src_offset, dst_offset, size };
     l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(s),GraphicsResource::Buffer(d)],
-        descriptor: None, depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+        descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 #[repr(C)]
 struct Transition { kind: u32, flags: u32, resource: This, subresource: u32, before: u32, after: u32, padding: u32 }
@@ -1705,7 +1753,7 @@ extern "system" fn barrier(this: This, n: u32, p: *const Transition) -> u32 {
     for b in unsafe { std::slice::from_raw_parts(p, n as usize) } {
         let resource = match data(b.resource) { Some(Data::Texture(t)) => GraphicsResource::Texture(t), Some(Data::Buffer(b)) => GraphicsResource::Buffer(b), _ => { l.invalid = true; return 0; } };
         if b.kind != 0 || b.flags != 0 || b.subresource != u32::MAX { l.invalid = true; return 0; }
-        l.graphics.jobs.push(GraphicsJob { command: Command::Barrier { id: resource.id(), before: b.before, after: b.after }, resources: vec![resource], descriptor: None, depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+        l.graphics.jobs.push(GraphicsJob { command: Command::Barrier { id: resource.id(), before: b.before, after: b.after }, resources: vec![resource], descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
     }
     0
 }
@@ -1743,7 +1791,7 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
         let (src,dst) = if upload { (buffer.id,texture.id) } else { (texture.id,buffer.id) };
         let command = Command::CopyDepthStencil { src,dst,offset:footprint.offset,pitch:footprint.pitch,width,height,plane:mip,upload };
         l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer),GraphicsResource::Texture(texture)],
-            descriptor: None, depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+            descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
         return;
     }
     let Some((width, height, _, _)) = wine_transport::mip_layout(texture.format, texture.width, texture.height, texture.mips, mip) else { l.invalid = true; return; };
@@ -1759,7 +1807,7 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
     let (src_id, dst_id) = if upload { (buffer.id, texture.id) } else { (texture.id, buffer.id) };
     let command = Command::CopyTexture(CopyTexture { src: src_id, dst: dst_id, offset: footprint.offset,
         pitch: footprint.pitch, width, height, format: texture.format, mip, buffer_to_texture: upload });
-    l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer), GraphicsResource::Texture(texture)], descriptor: None, depth_descriptor: None, pipeline: None, texture: None, sampler: None });
+    l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer), GraphicsResource::Texture(texture)], descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let mut resources = HashMap::new();
@@ -1774,12 +1822,12 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
             let d = h.lock().unwrap();
             if d.1 != *revision || !d.0.as_ref().is_some_and(|v| Arc::ptr_eq(v,t)) { return Err("DSV descriptor changed".into()); }
         }
-        if let Some((h,t)) = &j.texture {
-            if !h.lock().unwrap().as_ref().is_some_and(|v| Arc::ptr_eq(&v.texture, &t.texture)
+        for (h,index,t) in &j.textures {
+            if !h.lock().unwrap().get(*index).and_then(Option::as_ref).is_some_and(|v| Arc::ptr_eq(&v.texture, &t.texture)
                 && v.first_mip == t.first_mip && v.mip_count == t.mip_count) { return Err("SRV descriptor changed".into()); }
         }
-        if let Some((h,v)) = &j.sampler {
-            if *h.lock().unwrap() != Some(*v) { return Err("sampler descriptor changed".into()); }
+        for (h,index,v) in &j.samplers {
+            if h.lock().unwrap().get(*index).copied().flatten() != Some(*v) { return Err("sampler descriptor changed".into()); }
         }
         if let Some(p) = &j.pipeline {
             let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,

@@ -184,14 +184,12 @@ bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, ui
 @property(nonatomic, strong) id<MTLBuffer> indices;
 @property(nonatomic, strong) id<MTLBuffer> fragmentConstants;
 @property(nonatomic, strong) id<MTLBuffer> fragmentArguments;
-@property(nonatomic, strong) id<MTLTexture> sampledTexture;
-@property(nonatomic, strong) id<MTLSamplerState> sampler;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLTexture>> *sampledTextures;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *samplers;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, MTLSamplerDescriptor *> *samplerDescriptors;
 @property(nonatomic, strong) id<MTLBuffer> textureHeap;
 @property(nonatomic, strong) id<MTLBuffer> samplerHeap;
 @property(nonatomic) BOOL textureEnabled;
-@property(nonatomic) BOOL linearFilter;
-@property(nonatomic) float minLod;
-@property(nonatomic) float maxLod;
 @property(nonatomic) size_t fragmentConstantBytes;
 @property(nonatomic) size_t vertexStride;
 @property(nonatomic) uint32_t width;
@@ -300,6 +298,9 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
             FAIL(@"unsupported blend state");
         VictoryMetalRenderer *r = [VictoryMetalRenderer new];
         r.vertexBuffers = [NSMutableDictionary dictionary];
+        r.sampledTextures = [NSMutableDictionary dictionary];
+        r.samplers = [NSMutableDictionary dictionary];
+        r.samplerDescriptors = [NSMutableDictionary dictionary];
         r.device = MTLCreateSystemDefaultDevice();
         if (!r.device) FAIL(@"no Metal device");
         NSError *e = nil;
@@ -422,9 +423,11 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         if (texture_enabled) {
             if (r.device.argumentBuffersSupport != MTLArgumentBuffersTier2)
                 FAIL(@"texture binding requires argument buffers tier 2");
-            r.textureHeap = [r.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
-            r.samplerHeap = [r.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
+            r.textureHeap = [r.device newBufferWithLength:16 * 24 options:MTLResourceStorageModeShared];
+            r.samplerHeap = [r.device newBufferWithLength:16 * 24 options:MTLResourceStorageModeShared];
             if (!r.textureHeap || !r.samplerHeap) FAIL(@"fragment descriptor heap allocation failed");
+            memset(r.textureHeap.contents, 0, 16 * 24);
+            memset(r.samplerHeap.contents, 0, 16 * 24);
             r.textureEnabled = YES;
         }
         r.width = width;
@@ -575,14 +578,15 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
     }
 }
 
-bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, uint32_t levels,
-                               const uint8_t *rgba, bool linear, uint32_t texture_format, float min_lod, float max_lod,
-                               char *error, size_t error_len) {
+bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, uint32_t height,
+                                  uint32_t levels, const uint8_t *rgba, uint32_t texture_format,
+                                  char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
-        if (!r.textureEnabled) return fail(error, error_len, @"texture binding is not enabled");
-        id<MTLTexture> texture = r.sampledTexture;
+        if (!r.textureEnabled || index >= 16) return fail(error, error_len, @"invalid texture binding");
+        NSNumber *key = @(index);
+        id<MTLTexture> texture = r.sampledTextures[key];
         MTLPixelFormat format;
         size_t blockBytes;
         switch (texture_format) {
@@ -609,20 +613,6 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, ui
             texture = [r.device newTextureWithDescriptor:desc];
             if (!texture) return fail(error, error_len, @"sampled texture allocation failed");
         }
-        id<MTLSamplerState> sampler = r.sampler;
-        if (!sampler || r.linearFilter != linear || r.minLod != min_lod || r.maxLod != max_lod) {
-            MTLSamplerDescriptor *desc = [MTLSamplerDescriptor new];
-            desc.minFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-            desc.magFilter = desc.minFilter;
-            desc.mipFilter = linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
-            desc.lodMinClamp = min_lod;
-            desc.lodMaxClamp = max_lod;
-            desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-            desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-            desc.supportArgumentBuffers = YES;
-            sampler = [r.device newSamplerStateWithDescriptor:desc];
-            if (!sampler) return fail(error, error_len, @"sampler allocation failed");
-        }
         uint32_t w = width, h = height;
         const uint8_t *levelPixels = rgba;
         for (uint32_t level = 0; level < levels; ++level) {
@@ -635,17 +625,41 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, ui
             w = w > 1 ? w / 2 : 1;
             h = h > 1 ? h / 2 : 1;
         }
-        // IRDescriptorTableEntry: texture uses textureViewID, sampler uses
-        // gpuVA; metadata is a zero min-LOD clamp or zero sampler LOD bias.
-        uint64_t *tex = r.textureHeap.contents;
+        // IRDescriptorTableEntry is 24 bytes: gpuVA, textureViewID, metadata.
+        uint64_t *tex = (uint64_t *)r.textureHeap.contents + (size_t)index * 3;
         tex[0] = 0; tex[1] = texture.gpuResourceID._impl; tex[2] = 0;
-        uint64_t *smp = r.samplerHeap.contents;
+        r.sampledTextures[key] = texture;
+        return true;
+    }
+}
+
+bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
+                                  float min_lod, float max_lod, char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+        if (!r.textureEnabled || index >= 16) return fail(error, error_len, @"invalid sampler binding");
+        NSNumber *key = @(index);
+        id<MTLSamplerState> sampler = r.samplers[key];
+        MTLSamplerDescriptor *old = r.samplerDescriptors[key];
+        MTLSamplerMinMagFilter filter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        if (!sampler || old.minFilter != filter || old.lodMinClamp != min_lod || old.lodMaxClamp != max_lod) {
+            MTLSamplerDescriptor *desc = [MTLSamplerDescriptor new];
+            desc.minFilter = filter;
+            desc.magFilter = filter;
+            desc.mipFilter = linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+            desc.lodMinClamp = min_lod;
+            desc.lodMaxClamp = max_lod;
+            desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            desc.supportArgumentBuffers = YES;
+            sampler = [r.device newSamplerStateWithDescriptor:desc];
+            if (!sampler) return fail(error, error_len, @"sampler allocation failed");
+            r.samplerDescriptors[key] = desc;
+            r.samplers[key] = sampler;
+        }
+        uint64_t *smp = (uint64_t *)r.samplerHeap.contents + (size_t)index * 3;
         smp[0] = sampler.gpuResourceID._impl; smp[1] = 0; smp[2] = 0;
-        r.sampledTexture = texture;
-        r.sampler = sampler;
-        r.linearFilter = linear;
-        r.minLod = min_lod;
-        r.maxLod = max_lod;
         return true;
     }
 }
@@ -733,10 +747,12 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
             [render useResource:r.fragmentConstants usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
         if (r.textureEnabled) {
-            if (!r.sampledTexture || !r.sampler) return fail(error, error_len, @"fragment texture has not been bound");
+            if (r.sampledTextures.count == 0 && r.samplers.count == 0)
+                return fail(error, error_len, @"fragment bindings have not been set");
             [render setFragmentBuffer:r.textureHeap offset:0 atIndex:0];
             [render setFragmentBuffer:r.samplerHeap offset:0 atIndex:1];
-            [render useResource:r.sampledTexture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+            for (id<MTLTexture> texture in r.sampledTextures.allValues)
+                [render useResource:texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
         if (rasterize && indices) {
             [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle

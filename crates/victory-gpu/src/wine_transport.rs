@@ -76,7 +76,14 @@ pub struct Draw {
     pub constant_slot:Option<u32>, pub texture_slot:Option<u32>, pub sampler_slot:Option<u32>,
     /// Explicit vertex views for the extended input-layout protocol; empty for legacy draws.
     pub vertices: Vec<VertexView>,
+    /// Multiple independently bound single-descriptor root tables.
+    pub textures: Vec<SampledTextureBinding>,
+    pub samplers: Vec<SamplerBinding>,
 }
+#[derive(Clone, Debug)]
+pub struct SampledTextureBinding { pub slot:u32, pub resource:u64, pub first_mip:u32, pub mip_count:u32 }
+#[derive(Clone, Debug)]
+pub struct SamplerBinding { pub slot:u32, pub linear_filter:bool }
 #[derive(Clone, Debug)]
 pub struct VertexView { pub slot:u32, pub buffer:u64, pub offset:u64, pub size:u32, pub stride:u32 }
 #[derive(Clone, Debug)]
@@ -197,16 +204,31 @@ fn validate_resource(r:&Resource)->Result<(),String> {
 fn validate_commands(resources:&[Resource],commands:&[Command])->Result<(),String> {
     for command in commands {
         match command {
-            Command::Draw(d)=>match d.texture {
-                None if d.first_mip!=0 || d.mip_count!=0 => return Err("texture view without texture".into()),
-                Some(id)=>{
+            Command::Draw(d)=>{
+                let mut slots=HashSet::new();
+                let extended=!d.textures.is_empty() || !d.samplers.is_empty();
+                if extended && (d.textures.is_empty() || d.samplers.is_empty()
+                    || d.textures.len()>16 || d.samplers.len()>16 || d.texture.is_some()
+                    || d.first_mip!=0 || d.mip_count!=0 || d.texture_slot.is_some()
+                    || d.sampler_slot.is_some() || d.linear_filter)
+                {return Err("invalid extended sampled bindings".into())}
+                if !extended && d.texture.is_none() && (d.first_mip!=0 || d.mip_count!=0) {
+                    return Err("texture view without texture".into());
+                }
+                for (slot,id,first,count) in d.textures.iter().map(|t|(Some(t.slot),t.resource,t.first_mip,t.mip_count))
+                    .chain(d.texture.map(|id|(None,id,d.first_mip,d.mip_count)))
+                {
+                    if slot.is_some_and(|slot| slot>=64 || !slots.insert(slot)) {return Err("invalid texture slot".into())}
                     let mips=match resources.iter().find(|r|r.id==id).map(|r|r.kind) {
                         Some(ResourceKind::Texture {mips,..})=>mips,
                         _=>return Err("unknown sampled texture".into()),
                     };
-                    if d.mip_count==0 || d.first_mip.checked_add(d.mip_count).is_none_or(|end|end>mips) {return Err("invalid texture view range".into())}
-                },
-                None=>{},
+                    if count==0 || first.checked_add(count).is_none_or(|end|end>mips) {return Err("invalid texture view range".into())}
+                }
+                for sampler in &d.samplers {
+                    if sampler.slot>=64 || !slots.insert(sampler.slot) {return Err("invalid sampler slot".into())}
+                }
+                if extended && d.constant_slot.is_some_and(|slot| slots.contains(&slot)) {return Err("overlapping sampled and constant slots".into())}
             },
             Command::CopyTexture(c)=>{
                 let id=if c.buffer_to_texture {c.dst} else {c.src};
@@ -263,12 +285,12 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
     count(w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
-        Command::Draw(d) => {w.u32(if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
+        Command::Draw(d) => {let extended=!d.textures.is_empty() || !d.samplers.is_empty();w.u32(if extended {10} else if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
             if d.texture==Some(0) || d.depth==Some(0) || [d.constant_slot,d.texture_slot,d.sampler_slot].contains(&Some(u32::MAX)) {return Err("invalid optional identifier or slot".into())}
             if let Some(i)=&d.index {w.u32(1);w.u64(i.buffer);w.u64(i.offset);for v in [i.size,i.format,i.first,i.base_vertex as u32] {w.u32(v);}} else {w.u32(0);}
             w.u64(d.depth.unwrap_or(0));w.u32(d.linear_filter as u32);
             w.u32(d.vertex_stride);for slot in [d.constant_slot,d.texture_slot,d.sampler_slot] {w.u32(slot.unwrap_or(u32::MAX));}
-            if !d.vertices.is_empty() {
+            if !d.vertices.is_empty() || extended {
                 if d.vertices.len()>16 {return Err("too many vertex views".into())}
                 w.u32(d.vertices.len() as u32);
                 let mut slots=0u32;
@@ -276,6 +298,12 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
                     if v.slot>=16 || v.buffer==0 || v.size==0 || v.stride==0 || slots & (1<<v.slot)!=0 {return Err("invalid vertex view".into())}
                     slots|=1<<v.slot;w.u32(v.slot);w.u64(v.buffer);w.u64(v.offset);w.u32(v.size);w.u32(v.stride);
                 }
+            }
+            if extended {
+                w.u32(d.textures.len() as u32);
+                for t in &d.textures {w.u32(t.slot);w.u64(t.resource);w.u32(t.first_mip);w.u32(t.mip_count);}
+                w.u32(d.samplers.len() as u32);
+                for s in &d.samplers {w.u32(s.slot);w.u32(s.linear_filter as u32);}
             }
         },
         Command::Barrier {id,before,after} => {w.u32(2);w.u64(*id);w.u32(*before);w.u32(*after);},
@@ -327,12 +355,12 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
-        kind @ (1|9)=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
+        kind @ (1|9|10)=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
             let index=if r.boolean()? {Some(Index {buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,format:r.u32()?,first:r.u32()?,base_vertex:r.u32()? as i32})} else {None};
             let depth=match r.u64()? {0=>None,id=>Some(id)};let linear_filter=r.boolean()?;let vertex_stride=r.u32()?;let mut slot=|| -> Result<Option<u32>,String> {Ok(match r.u32()? {u32::MAX=>None,v=>Some(v)})};let constant_slot=slot()?;let texture_slot=slot()?;let sampler_slot=slot()?;
             let mut vertices=Vec::new();
-            if kind==9 {
-                let n=r.count()?;if n==0 || n>16 {return Err("invalid vertex view count".into())}
+            if kind==9 || kind==10 {
+                let n=r.count()?;if (kind==9 && n==0) || n>16 {return Err("invalid vertex view count".into())}
                 let mut slots=0u32;
                 for _ in 0..n {
                     let v=VertexView {slot:r.u32()?,buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,stride:r.u32()?};
@@ -340,7 +368,14 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
                     slots|=1<<v.slot;vertices.push(v);
                 }
             }
-            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,first_mip,mip_count,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot,vertices})},
+            let mut textures=Vec::new();let mut samplers=Vec::new();
+            if kind==10 {
+                let n=r.count()?;if n==0 || n>16 {return Err("invalid texture binding count".into())}
+                for _ in 0..n {textures.push(SampledTextureBinding {slot:r.u32()?,resource:r.u64()?,first_mip:r.u32()?,mip_count:r.u32()?});}
+                let n=r.count()?;if n==0 || n>16 {return Err("invalid sampler binding count".into())}
+                for _ in 0..n {samplers.push(SamplerBinding {slot:r.u32()?,linear_filter:r.boolean()?});}
+            }
+            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,first_mip,mip_count,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot,vertices,textures,samplers})},
         2=>Command::Barrier {id:r.u64()?,before:r.u32()?,after:r.u32()?},
         3=> {let src=r.u64()?;let dst=r.u64()?;let offset=r.u64()?;let pitch=r.u32()?;let width=r.u32()?;let height=r.u32()?;let format=r.u32()?;let mip=r.u32()?;let buffer_to_texture=match r.u32()? {0=>false,1=>true,_=>return Err("invalid copy direction".into())};Command::CopyTexture(CopyTexture {src,dst,offset,pitch,width,height,format,mip,buffer_to_texture})},
         4=>Command::CopyBuffer {src:r.u64()?,dst:r.u64()?,src_offset:r.u64()?,dst_offset:r.u64()?,size:r.u64()?},
@@ -651,10 +686,28 @@ mod tests {
         b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
-            depth:Some(3),linear_filter:true,constant_slot:Some(3),texture_slot:Some(2),sampler_slot:Some(1),vertices:vec![]}));
+            depth:Some(3),linear_filter:true,constant_slot:Some(3),texture_slot:Some(2),sampler_slot:Some(1),vertices:vec![],textures:vec![],samplers:vec![]}));
         let encoded=encode_batch(&b).unwrap();
         assert_eq!(encode_batch(&decode_batch(&encoded).unwrap()).unwrap(),encoded);
         b.pipelines.push(b.pipelines[0].clone());
+        assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
+    fn multiple_sampled_bindings_round_trip_and_reject_invalid() {
+        let mut b=batch();
+        b.resources.push(Resource {id:3,state:0,kind:ResourceKind::Texture {width:1,height:1,format:28,mips:1},bytes:vec![1,2,3,4]});
+        b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
+            vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
+            topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
+            constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
+            textures:vec![SampledTextureBinding {slot:1,resource:2,first_mip:0,mip_count:1},SampledTextureBinding {slot:2,resource:3,first_mip:0,mip_count:1}],
+            samplers:vec![SamplerBinding {slot:3,linear_filter:false},SamplerBinding {slot:4,linear_filter:true}]}));
+        let bytes=encode_batch(&b).unwrap();
+        for end in 0..bytes.len() {assert!(decode_batch(&bytes[..end]).is_err());}
+        assert_eq!(encode_batch(&decode_batch(&bytes).unwrap()).unwrap(),bytes);
+        let Some(Command::Draw(d))=b.commands.last_mut() else {unreachable!()};
+        d.samplers[1].slot=2;
         assert!(encode_batch(&b).is_err());
     }
 
@@ -670,7 +723,7 @@ mod tests {
             vertex_count:3,instance_count:3,first_vertex:0,first_instance:2,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
             constant_slot:None,texture_slot:None,sampler_slot:None,
-            vertices:vec![VertexView {slot:0,buffer:1,offset:0,size:4,stride:16},VertexView {slot:1,buffer:1,offset:0,size:4,stride:4}]}));
+            vertices:vec![VertexView {slot:0,buffer:1,offset:0,size:4,stride:16},VertexView {slot:1,buffer:1,offset:0,size:4,stride:4}],textures:vec![],samplers:vec![]}));
         let bytes=encode_batch(&b).unwrap();
         assert_eq!(encode_batch(&decode_batch(&bytes).unwrap()).unwrap(),bytes);
         b.pipelines[0].inputs[0].step_rate=0;
@@ -770,7 +823,7 @@ mod tests {
         b.commands=vec![Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:Some(2),first_mip:1,mip_count:2,index:None,depth:None,linear_filter:false,
-            constant_slot:None,texture_slot:Some(0),sampler_slot:Some(0),vertices:vec![]})];
+            constant_slot:None,texture_slot:Some(0),sampler_slot:Some(0),vertices:vec![],textures:vec![],samplers:vec![]})];
         let encoded=encode_batch(&b).unwrap();
         for end in 0..encoded.len() {assert!(decode_batch(&encoded[..end]).is_err());}
         let decoded=decode_batch(&encoded).unwrap();

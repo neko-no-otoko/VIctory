@@ -2,7 +2,7 @@
 //!
 //! `Renderer` retains its device, pipeline, render target and readback buffer
 //! across draws. It supports float4 position vertices, optionally followed by
-//! float2 texture coordinates, fragment b0 constants, and one 2D texture/sampler.
+//! float2 texture coordinates, fragment b0 constants, and sampled texture/sampler heaps.
 
 #![cfg(target_os = "macos")]
 
@@ -146,18 +146,13 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
-    fn victory_metal_set_texture(
-        renderer: *mut c_void,
-        width: u32,
-        height: u32,
-        levels: u32,
-        rgba: *const u8,
-        linear_filter: bool,
-        format: u32,
-        min_lod: f32,
-        max_lod: f32,
-        error: *mut c_char,
-        error_len: usize,
+    fn victory_metal_set_texture_at(
+        renderer: *mut c_void, index: u32, width: u32, height: u32, levels: u32,
+        pixels: *const u8, format: u32, error: *mut c_char, error_len: usize,
+    ) -> bool;
+    fn victory_metal_set_sampler_at(
+        renderer: *mut c_void, index: u32, linear_filter: bool, min_lod: f32,
+        max_lod: f32, error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_clear(
         width: u32,
@@ -347,8 +342,8 @@ struct NativeVertexBuffer {
 /// layout additionally supplies attribute 12 as a float2 at offset 16, with
 /// stride 24 rather than 16. Supported fragment bindings are `b0, space0`
 /// at offset 0 in the converter's automatic linear argument buffer, and
-/// texture and sampler heap index 0. The caller must verify those layouts via
-/// converter reflection and translated shader metadata.
+/// up to 16 independently indexed textures and samplers in direct heaps.
+/// The caller must verify the layouts via converter reflection and translated shader metadata.
 /// The output is tightly packed in the configured color format, top row first.
 pub struct Renderer {
     handle: NonNull<c_void>,
@@ -356,6 +351,7 @@ pub struct Renderer {
     fragment_constant_dwords: usize,
     fragment_texture: bool,
     texture_bound: bool,
+    sampler_bound: bool,
     depth_enabled: bool,
     stencil_enabled: bool,
     vertex_uv: bool,
@@ -572,6 +568,7 @@ impl Renderer {
             fragment_constant_dwords: fragment_constant_dwords as usize,
             fragment_texture,
             texture_bound: false,
+            sampler_bound: false,
             depth_enabled: depth.is_some(),
             stencil_enabled: stencil.is_some(),
             vertex_uv,
@@ -682,12 +679,22 @@ impl Renderer {
         min_lod: f32,
         max_lod: f32,
     ) -> Result<(), RenderError> {
-        if !self.fragment_texture || width == 0 || height == 0 || levels == 0
+        if !min_lod.is_finite() || !max_lod.is_finite() || min_lod < 0.0 || min_lod > max_lod {
+            return Err(RenderError("invalid sampler LOD range".into()));
+        }
+        self.set_fragment_texture_mips_at(0, width, height, levels, pixels, format)?;
+        self.set_fragment_sampler_at(0, filter, min_lod, max_lod)
+    }
+
+    /// Upload a tightly packed 2D-array mip chain to a direct resource heap index.
+    pub fn set_fragment_texture_mips_at(
+        &mut self, index: u32, width: u32, height: u32, levels: u32,
+        pixels: &[u8], format: TextureFormat,
+    ) -> Result<(), RenderError> {
+        if !self.fragment_texture || index >= 16 || width == 0 || height == 0 || levels == 0
             || levels > u32::BITS - width.max(height).leading_zeros()
-            || !min_lod.is_finite() || !max_lod.is_finite()
-            || min_lod < 0.0 || min_lod > max_lod
         {
-            return Err(RenderError("invalid texture dimensions, mip count, binding or LOD range".into()));
+            return Err(RenderError("invalid texture dimensions, mip count or binding".into()));
         }
         let (mut w, mut h, mut size) = (width, height, 0usize);
         for _ in 0..levels {
@@ -710,22 +717,38 @@ impl Renderer {
         // SAFETY: the renderer and validated input buffer live through the
         // synchronous upload, which retains its own Metal texture.
         let ok = unsafe {
-            victory_metal_set_texture(
-                self.handle.as_ptr(),
-                width,
-                height,
-                levels,
-                pixels.as_ptr(),
-                matches!(filter, TextureFilter::Linear),
-                format.native_value(),
-                min_lod,
-                max_lod,
-                error.as_mut_ptr(),
-                error.len(),
+            victory_metal_set_texture_at(
+                self.handle.as_ptr(), index, width, height, levels, pixels.as_ptr(),
+                format.native_value(), error.as_mut_ptr(), error.len(),
             )
         };
         if ok {
             self.texture_bound = true;
+            Ok(())
+        } else {
+            Err(native_error(&error))
+        }
+    }
+
+    /// Set a direct sampler heap index independently of texture bindings.
+    pub fn set_fragment_sampler_at(
+        &mut self, index: u32, filter: TextureFilter, min_lod: f32, max_lod: f32,
+    ) -> Result<(), RenderError> {
+        if !self.fragment_texture || index >= 16 || !min_lod.is_finite()
+            || !max_lod.is_finite() || min_lod < 0.0 || min_lod > max_lod
+        {
+            return Err(RenderError("invalid sampler binding or LOD range".into()));
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: the renderer remains alive throughout this synchronous call.
+        let ok = unsafe {
+            victory_metal_set_sampler_at(
+                self.handle.as_ptr(), index, matches!(filter, TextureFilter::Linear),
+                min_lod, max_lod, error.as_mut_ptr(), error.len(),
+            )
+        };
+        if ok {
+            self.sampler_bound = true;
             Ok(())
         } else {
             Err(native_error(&error))
@@ -787,8 +810,8 @@ impl Renderer {
         {
             return Err(RenderError("expected valid nonempty indexed triangles and exact-sized constants and output buffers".into()));
         }
-        if self.fragment_texture && !self.texture_bound {
-            return Err(RenderError("fragment texture has not been bound".into()));
+        if self.fragment_texture && !self.texture_bound && !self.sampler_bound {
+            return Err(RenderError("fragment bindings have not been set".into()));
         }
         let vertex_count = u32::try_from(vertices.len())
             .map_err(|_| RenderError("too many vertices".into()))?;
@@ -835,8 +858,8 @@ impl Renderer {
         {
             return Err(RenderError("expected nonempty vertices and exact-sized constants and output buffers".into()));
         }
-        if self.fragment_texture && !self.texture_bound {
-            return Err(RenderError("fragment texture has not been bound".into()));
+        if self.fragment_texture && !self.texture_bound && !self.sampler_bound {
+            return Err(RenderError("fragment bindings have not been set".into()));
         }
         let vertex_count = u32::try_from(vertices.len())
             .map_err(|_| RenderError("too many vertices".into()))?;
@@ -905,8 +928,8 @@ impl Renderer {
         if pixels.len() != self.pixel_len || constants.len() != self.fragment_constant_dwords {
             return Err(RenderError("expected exact-sized constants and output buffers".into()));
         }
-        if self.fragment_texture && !self.texture_bound {
-            return Err(RenderError("fragment texture has not been bound".into()));
+        if self.fragment_texture && !self.texture_bound && !self.sampler_bound {
+            return Err(RenderError("fragment bindings have not been set".into()));
         }
         if buffers.len() > 25 {
             return Err(RenderError("too many vertex buffers".into()));
@@ -1023,8 +1046,8 @@ impl Renderer {
                     .into(),
             ));
         }
-        if self.fragment_texture && !self.texture_bound {
-            return Err(RenderError("fragment texture has not been bound".into()));
+        if self.fragment_texture && !self.texture_bound && !self.sampler_bound {
+            return Err(RenderError("fragment bindings have not been set".into()));
         }
         let count =
             u32::try_from(vertices.len()).map_err(|_| RenderError("too many vertices".into()))?;

@@ -66,7 +66,9 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     if d.instance_count==0 || d.topology!=4 || d.vertex_count==0 || d.vertex_count%3!=0
         || (!generic && (d.instance_count!=1 || d.first_instance!=0 || !d.vertices.is_empty() || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride))
     {return Err("unsupported draw topology, instances or vertex layout".into())}
-    if d.target==d.vertex_buffer || d.texture==Some(d.target) || d.depth==Some(d.target) || d.depth==d.texture && d.depth.is_some() {return Err("draw resource alias is unsupported".into())}
+    if d.target==d.vertex_buffer || d.texture==Some(d.target) || d.depth==Some(d.target) || d.depth==d.texture && d.depth.is_some()
+        || d.textures.iter().any(|t| t.resource==d.target || Some(t.resource)==d.depth)
+    {return Err("draw resource alias is unsupported".into())}
     let target=rs.get(&d.target).ok_or("unknown target")?; let (width,height,color_format)=target_image(target)?;
     if format(p.format)?!=color_format || p.depth.is_some()!=d.depth.is_some() {return Err("pipeline attachment mismatch".into())}
     let vb=rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?; buffer(vb)?;
@@ -94,9 +96,34 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         prepared.insert(d.pipeline,value);
     }
     let (prepared,resolved)=prepared.get_mut(&d.pipeline).unwrap();
-    if d.texture_slot!=prepared.texture_slot.map(u32::from) || d.sampler_slot!=prepared.sampler_slot.map(u32::from) || d.texture.is_some()!=prepared.texture_slot.is_some() {return Err("shader texture or sampler slot mismatch".into())}
+    let extended=!d.textures.is_empty() || !d.samplers.is_empty();
+    if extended && (d.texture.is_some() || d.texture_slot.is_some() || d.sampler_slot.is_some()
+        || d.first_mip!=0 || d.mip_count!=0 || d.linear_filter)
+    {return Err("mixed legacy and extended texture bindings".into())}
+    let mut texture_bindings:Vec<_>=d.textures.iter().map(|t|(t.slot,t.resource,t.first_mip,t.mip_count)).collect();
+    let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s|(s.slot,s.linear_filter)).collect();
+    if !extended {
+        if d.texture_slot!=prepared.texture_slot.map(u32::from) || d.sampler_slot!=prepared.sampler_slot.map(u32::from)
+            || d.texture.is_some()!=prepared.texture_slot.is_some()
+            || prepared.texture_slots.len()>1 || prepared.sampler_slots.len()>1
+        {return Err("shader texture or sampler slot mismatch".into())}
+        if let (Some(slot),Some(resource))=(d.texture_slot,d.texture) {
+            texture_bindings.push((slot,resource,d.first_mip,d.mip_count));
+        } else if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())}
+        if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,d.linear_filter));}
+    }
+    texture_bindings.sort_unstable_by_key(|t|t.0);
+    sampler_bindings.sort_unstable_by_key(|s|s.0);
+    if texture_bindings.len()!=prepared.texture_slots.len() || sampler_bindings.len()!=prepared.sampler_slots.len()
+        || texture_bindings.iter().zip(&prepared.texture_slots).any(|(t,s)|t.0!=u32::from(*s))
+        || sampler_bindings.iter().zip(&prepared.sampler_slots).any(|(t,s)|t.0!=u32::from(*s))
+    {return Err("shader texture or sampler slot mismatch".into())}
     let mut constants=vec![0;prepared.dwords];let mut has_constants=false;
-    for u in &prepared.user_data {constants[u.index as usize]=match u.root {RootType::Constants=>{has_constants=true;if d.constant_slot!=Some(u.slot as u32) {return Err("constant root slot mismatch".into())} *d.constants.get(u.dword as usize).ok_or("missing root constant")?},RootType::Table=>0,_=>return Err("unsupported root argument".into())};}
+    for u in &prepared.user_data {constants[u.index as usize]=match u.root {RootType::Constants=>{has_constants=true;if d.constant_slot!=Some(u.slot as u32) {return Err("constant root slot mismatch".into())} *d.constants.get(u.dword as usize).ok_or("missing root constant")?},RootType::Table=>{
+        if let Some(index)=prepared.texture_slots.iter().position(|&s|s==u.slot) {(index as u32)*32}
+        else if let Some(index)=prepared.sampler_slots.iter().position(|&s|s==u.slot) {(index as u32)*16}
+        else {return Err("unknown descriptor table slot".into())}
+    },_=>return Err("unsupported root argument".into())};}
     if !has_constants && (d.constant_slot.is_some() || !d.constants.is_empty()) {return Err("unexpected root constants".into())}
     if d.viewport.iter().any(|v|!v.is_finite()) {return Err("invalid viewport".into())}
     let sc=d.scissor;if sc[2]<sc[0] || sc[3]<sc[1] {return Err("invalid scissor".into())}
@@ -106,20 +133,20 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     let mut stencil=None;
     let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} let combined=matches!(r.kind,ResourceKind::Texture {format:20,..});if combined != p.depth.as_ref().is_some_and(|z|z.stencil.is_some()) {return Err("pipeline depth format mismatch".into())} let size=(width as usize)*(height as usize)*4;if combined {stencil=Some(r.bytes[size..].to_vec());} Some(r.bytes[..size].chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
     let mut target=rs.remove(&d.target).ok_or("unknown target")?;
-    let sampled=if let Some(id)=d.texture {
+    let mut sampled=Vec::with_capacity(texture_bindings.len());
+    for &(_,id,first_mip,mip_count) in &texture_bindings {
         let r=rs.get(&id).ok_or("unknown sampled texture")?;let (w,h,mips,f)=image(r)?;
-        let end=d.first_mip.checked_add(d.mip_count).ok_or("texture view range overflow")?;
-        if d.mip_count==0 || end>mips {return Err("invalid texture view range".into())}
+        let end=first_mip.checked_add(mip_count).ok_or("texture view range overflow")?;
+        if mip_count==0 || end>mips {return Err("invalid texture view range".into())}
         let ResourceKind::Texture {format:fmt,..}=r.kind else {return Err("expected texture".into())};
-        let (view_width,view_height,start,_)=mip_layout(fmt,w,h,mips,d.first_mip).ok_or("invalid texture view range")?;
+        let (view_width,view_height,start,_)=mip_layout(fmt,w,h,mips,first_mip).ok_or("invalid texture view range")?;
         let (_,_,last,last_len)=mip_layout(fmt,w,h,mips,end-1).ok_or("invalid texture view range")?;
         let end_offset=last.checked_add(last_len).ok_or("texture view size overflow")?;
-        Some(Texture {width:view_width,height:view_height,levels:d.mip_count,pixels:&r.bytes[start..end_offset],filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:f,min_lod:0.,max_lod:0.})
-    } else {if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())} None};
+        sampled.push((Texture {width:view_width,height:view_height,levels:mip_count,pixels:&r.bytes[start..end_offset],filter:TextureFilter::Nearest,format:f,min_lod:0.,max_lod:0.},
+            Some(SampledTextureIdentity {resource:id,generation:generations.get(&id).copied().unwrap_or(0),first_mip})));
+    }
+    let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,linear)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},0.,0.)).collect();
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
-    prepared.set_sampled_texture_identity(d.texture.map(|resource| SampledTextureIdentity {
-        resource, generation:generations.get(&resource).copied().unwrap_or(0), first_mip:d.first_mip,
-    }));
     let result=if generic {
         let legacy_view=crate::wine_transport::VertexView {slot:0,buffer:d.vertex_buffer,offset:d.vertex_offset,size:d.vertex_size,stride:d.vertex_stride};
         let views=if d.vertices.is_empty() {std::slice::from_ref(&legacy_view)} else {d.vertices.as_slice()};
@@ -135,8 +162,8 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
             let v=views.iter().find(|v|v.slot==a.slot).ok_or("missing vertex buffer")?;
             attributes.push(victory_metal::VertexAttribute {index:u32::from(r.attribute_index),format:a.format,slot:a.slot,offset:a.offset,stride:v.stride,per_instance:a.per_instance,step_rate:a.step_rate});
         }
-        prepared.draw_inputs(width,height,&attributes,&buffers,index,d.first_vertex,d.vertex_count,d.instance_count,d.first_instance,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes,true)
-    } else if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)};
+        prepared.draw_inputs(width,height,&attributes,&buffers,index,d.first_vertex,d.vertex_count,d.instance_count,d.first_instance,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes,true)
+    } else if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes)};
     rs.insert(d.target,target);result?;
     if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;let size=depth.len()*4;for (bytes,value) in r.bytes[..size].chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}if let Some(stencil)=stencil {r.bytes[size..].copy_from_slice(&stencil);}}
     Ok(())
@@ -177,6 +204,7 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
             else {for v in &d.vertices {access(&mut rs,&mut touched,v.buffer,1)?;}}
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}
             if let Some(id)=d.texture {access(&mut rs,&mut touched,id,0x80)?;}
+            for binding in &d.textures {access(&mut rs,&mut touched,binding.resource,0x80)?;}
             if let Some(id)=d.depth {access(&mut rs,&mut touched,id,0x10)?;}
             draw(&mut rs,&pipelines,&mut prepared,&generations,d,stencil_reference)?;
         },
@@ -226,7 +254,7 @@ mod tests {
             viewport: [0.0; 6], scissor: [0; 4], topology: 4, constants: vec![],
             texture: Some(3), first_mip: 0, mip_count: 1, index: None, depth: Some(4),
             linear_filter: false, constant_slot: None, texture_slot: None, sampler_slot: None,
-            vertices: vec![],
+            vertices: vec![], textures: vec![], samplers: vec![],
         };
         mark_writes(&mut generations, &Command::Draw(draw), 1);
         assert_eq!(generations.get(&1), Some(&1));
