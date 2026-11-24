@@ -245,13 +245,34 @@ execution. This is a trusted-workload experiment, not a process sandbox.
 
 The restricted compute path supports one committed default raw UAV buffer, a
 one-entry shader-visible heap, root constants in slot 0, descriptor table in
-slot 1, and dispatch/readback. A pending queue wait can defer the work as
-described below. Limits are 4 MiB per shader, 16 MiB per buffer and 64
-constant dwords. Restricted graphics and opt-in
-presentation paths are described below. Root CBVs, general resource states
-and arbitrary D3D12.X methods remain unsupported; some unsupported void
-methods abort rather than pretend to succeed. The loopback bearer token is not
-a boundary against other processes with access to it.
+slot 1, an optional root CBV in one slot 2–63, and dispatch/readback.
+A pending queue wait can defer the work as described below. Limits are 4 MiB
+per shader, 16 MiB per buffer and 64 constant dwords. Restricted graphics and
+opt-in presentation paths are described below. Root SRV/UAV descriptors,
+general resource states and arbitrary D3D12.X methods remain unsupported;
+some unsupported void methods abort rather than pretend to succeed. The
+loopback bearer token is not a boundary against other processes with access
+to it.
+
+The compute CBV must address a live committed default-heap buffer in COMMON
+or VERTEX_AND_CONSTANT_BUFFER state, at a 16-byte-aligned offset; the view
+extends to the allocation end or 64 KiB, whichever is smaller. It cannot
+alias the dispatch UAV. The translated shader's CBV slot must match the bound
+slot, and only the native path's validated unbounded console descriptor and
+static-offset scalar loads are supported. A recorded dispatch retains the
+buffer and offset and snapshots current bytes at execution, including after
+a deferred queue wait; no guest pointer crosses the transport. Missing,
+misaligned, undersized, aliased, state-invalid and mismatched bindings fail.
+Protocol opcode 6 carries the CBV; opcode 1 remains the no-CBV path.
+
+On an M3 Max with Wine 11 under Rosetta and the Apple converter, a normally
+launched TLS guest used offset CBVs in two translated Metal dispatches,
+released the bound resource before submission and checked changed output
+after late writes. Invalid slots, ranges, resource states and root SRV/UAV
+methods were rejected. With the launcher environment below, run `cargo test
+--locked -p victory --target x86_64-apple-darwin --test wine_cbv -- --ignored
+--nocapture`. This is a restricted compute binding path, not general D3D12.X
+or game compatibility.
 
 The fixture below uses compiler-generated static TLS, two Windows threads and
 TLS callbacks before dispatching the existing synthetic D3D12.X shader and

@@ -167,7 +167,15 @@ struct Job {
     heap: Arc<Mutex<Option<Arc<Buffer>>>>,
     buffer: Arc<Buffer>,
     constants: Vec<u32>,
+    cbv: Option<RootCbv>,
     groups: [u32; 3],
+}
+
+#[derive(Clone)]
+struct RootCbv {
+    slot: u32,
+    buffer: Arc<Buffer>,
+    offset: usize,
 }
 #[derive(Default)]
 struct ListState {
@@ -177,6 +185,7 @@ struct ListState {
     heap: Option<(usize, Arc<Mutex<Option<Arc<Buffer>>>>)>,
     table: bool,
     constants: Vec<Option<u32>>,
+    cbv: Option<RootCbv>,
     jobs: Vec<Job>,
     kind: u32,
     graphics: GraphicsState,
@@ -404,6 +413,7 @@ static LIST_TABLE: Table<160> = {
     t[35] = set_table as *const ();
     t[36] = graphics_table as *const ();
     t[39] = set_constants as *const ();
+    t[41] = set_cbv as *const ();
     Table(t)
 };
 static QUEUE_TABLE: Table<160> = {
@@ -610,7 +620,7 @@ extern "system" fn create_resource(
         return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), state: Mutex::new(state), bytes: Mutex::new(bytes), tiled })), &BUFFER_TABLE, iid, RESOURCE, out);
     }
     if r.dimension != 1 || r.mips != 1 || r.width > MAX_BUFFER as u64 || r.height != 1 || r.format != 0
-        || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 0x400 | 0x800) {
+        || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 1 | 0x400 | 0x800) {
         return E_INVALIDARG;
     }
     let bytes = (0..r.width).map(|_| UnsafeCell::new(0)).collect::<Vec<_>>().into_boxed_slice();
@@ -976,6 +986,35 @@ extern "system" fn set_constants(this: This, slot: u32, n: u32, values: *const u
         *dst = Some(*value);
     }
 }
+extern "system" fn set_cbv(this: This, slot: u32, address: u64) {
+    let l = list(this);
+    let mut l = l.lock().unwrap();
+    if l.closed {
+        trap("closed list");
+    }
+    if l.kind != 2 || !(2..=63).contains(&slot) || address % 16 != 0
+        || l.cbv.as_ref().is_some_and(|cbv| cbv.slot != slot)
+    {
+        l.invalid = true;
+        return;
+    }
+    let map = objects().lock().unwrap();
+    let found = map.values().find_map(|entry| {
+        let Data::Buffer(buffer) = &entry.data else { return None; };
+        let offset = address.checked_sub(buffer.ptr() as u64)?;
+        if offset < buffer.len() as u64 {
+            Some(RootCbv { slot, buffer: buffer.clone(), offset: offset as usize })
+        } else {
+            None
+        }
+    });
+    drop(map);
+    if let Some(cbv) = found {
+        l.cbv = Some(cbv);
+    } else {
+        l.invalid = true;
+    }
+}
 // Retain both objects and reject descriptor changes before submission.
 extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
     let l = list(this);
@@ -988,6 +1027,7 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
     let constants: Option<Vec<u32>> = l.constants.iter().copied().collect();
     if l.kind != 2 || x == 0 || y == 0 || z == 0 || !l.table || l.pipeline.is_none()
         || buffer.is_none() || constants.is_none()
+        || l.cbv.as_ref().zip(buffer.as_ref()).is_some_and(|(cbv, uav)| Arc::ptr_eq(&cbv.buffer, uav))
     {
         l.invalid = true;
         return;
@@ -997,28 +1037,50 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         heap: heap.unwrap(),
         buffer: buffer.unwrap(),
         constants: constants.unwrap(),
+        cbv: l.cbv.clone(),
         groups: [x, y, z],
     };
     l.jobs.push(job);
 }
 fn run(c: &Config, j: &Job) -> Result<(), String> {
+    // Snapshot at execution, after earlier queued jobs have updated resources.
+    if let Some(binding) = &j.cbv {
+        if !matches!(*binding.buffer.state.lock().unwrap(), 0 | 1) {
+            return Err("root CBV requires COMMON or VERTEX_AND_CONSTANT_BUFFER state".into());
+        }
+    }
+    let cbv = j.cbv.as_ref().map(|binding| {
+        let len = (binding.buffer.len() - binding.offset).min(65536);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(binding.buffer.ptr().add(binding.offset), len)
+        }.to_vec();
+        (binding.slot, bytes)
+    });
     let mut s = TcpStream::connect_timeout(&c.addr, Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     for v in [
-        MAGIC, 1, j.shader.len() as u32, j.buffer.len() as u32, j.constants.len() as u32,
+        MAGIC, if cbv.is_some() { 6 } else { 1 }, j.shader.len() as u32, j.buffer.len() as u32, j.constants.len() as u32,
         j.groups[0], j.groups[1], j.groups[2],
     ] {
         s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
     }
     let input = unsafe { std::slice::from_raw_parts(j.buffer.ptr(), j.buffer.len()) };
-    s.write_all(&c.token)
-        .and_then(|_| s.write_all(&j.shader))
+    s.write_all(&c.token).map_err(|e| e.to_string())?;
+    if let Some((slot, bytes)) = &cbv {
+        s.write_all(&slot.to_le_bytes())
+            .and_then(|_| s.write_all(&(bytes.len() as u32).to_le_bytes()))
+            .map_err(|e| e.to_string())?;
+    }
+    s.write_all(&j.shader)
         .and_then(|_| s.write_all(input))
         .map_err(|e| e.to_string())?;
     for v in &j.constants {
         s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+    if let Some((_, bytes)) = &cbv {
+        s.write_all(bytes).map_err(|e| e.to_string())?;
     }
     let mut header = [0u8; 16];
     s.read_exact(&mut header).map_err(|e| e.to_string())?;

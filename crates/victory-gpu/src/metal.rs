@@ -150,14 +150,17 @@ pub struct WineMetalCompute {
 
 #[cfg(target_arch = "x86_64")]
 impl WineMetalCompute {
-    /// Prepare a shader with root constants at slot 0 and a UAV table at slot 1.
+    /// Prepare a shader with root constants at slot 0, a UAV table at slot 1,
+    /// and an optional root CBV at a slot from 2 through 63.
     pub fn new(shader: &[u8]) -> Result<Self, String> {
         if shader.is_empty() || shader.len() > 4 * 1024 * 1024 {
             return Err("invalid compute request dimensions or lengths".into());
         }
         let prepared = Prepared::new(shader)?;
-        if prepared.table_slot != 1 || prepared.root_cbv.is_some() {
-            return Err("expected UAV table at root slot 1 without a root CBV".into());
+        if prepared.table_slot != 1
+            || prepared.root_cbv.is_some_and(|(slot, _, _)| !(2..64).contains(&slot))
+        {
+            return Err("expected UAV table at root slot 1 and optional root CBV at slot 2..63".into());
         }
         if prepared.user_data.iter().any(|u| !matches!(
             (u.root, u.slot), (RootType::Constants, 0) | (RootType::Table, 1)
@@ -169,12 +172,44 @@ impl WineMetalCompute {
 
     /// Dispatch synchronously and replace the UAV contents with the result.
     pub fn dispatch(&mut self, buffer: &mut [u8], root_constants: &[u32], groups: [u32; 3]) -> Result<(), String> {
+        self.dispatch_inner(buffer, root_constants, groups, None)
+    }
+
+    /// Dispatch synchronously with the bytes of a root CBV.
+    pub fn dispatch_with_root_cbv(
+        &mut self,
+        buffer: &mut [u8],
+        root_constants: &[u32],
+        groups: [u32; 3],
+        slot: u32,
+        cbv: &[u8],
+    ) -> Result<(), String> {
+        self.dispatch_inner(buffer, root_constants, groups, Some((slot, cbv)))
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        buffer: &mut [u8],
+        root_constants: &[u32],
+        groups: [u32; 3],
+        cbv: Option<(u32, &[u8])>,
+    ) -> Result<(), String> {
         if buffer.is_empty() || buffer.len() > 16 * 1024 * 1024
             || root_constants.len() > 64 || groups.contains(&0)
         {
             return Err("invalid compute request dimensions or lengths".into());
         }
         let p = &mut self.prepared;
+        let cbv = match (p.root_cbv, cbv) {
+            (None, None) => None,
+            (Some((expected, required, offset)), Some((slot, bytes)))
+                if slot == u32::from(expected) && !bytes.is_empty()
+                    && bytes.len() <= 65536 && bytes.len() as u64 >= required =>
+            {
+                Some((bytes, offset))
+            }
+            _ => return Err("missing, unexpected, or invalid root CBV".into()),
+        };
         let mut constants = vec![0; p.dwords];
         for u in &p.user_data {
             constants[u.index as usize] = match (u.root, u.slot) {
@@ -184,7 +219,11 @@ impl WineMetalCompute {
                 _ => return Err("unsupported root argument".into()),
             };
         }
-        p.compute.dispatch(buffer, &constants, groups, p.threads)
+        match cbv {
+            Some((bytes, offset)) => p.compute.dispatch_with_root_cbv(
+                buffer, &constants, groups, p.threads, bytes, offset),
+            None => p.compute.dispatch(buffer, &constants, groups, p.threads),
+        }
     }
 }
 

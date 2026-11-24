@@ -43,12 +43,26 @@ mod host {
         let buffer_len = fields[3] as usize;
         let count = fields[4] as usize;
         let groups = [fields[5], fields[6], fields[7]];
+        let cbv_info = if fields[1] == 6 {
+            let mut bytes = [0; 8];
+            stream.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            let slot = word(&bytes[..4]);
+            let len = word(&bytes[4..]) as usize;
+            if !(2..64).contains(&slot) || len == 0 || len > 65536 {
+                return Err("invalid root CBV slot or length".into());
+            }
+            Some((slot, len))
+        } else {
+            None
+        };
         let mut shader = vec![0; shader_len];
         let mut buffer = vec![0; buffer_len];
         let mut constant_bytes = vec![0; count * 4];
         stream.read_exact(&mut shader).map_err(|e| e.to_string())?;
         stream.read_exact(&mut buffer).map_err(|e| e.to_string())?;
         stream.read_exact(&mut constant_bytes).map_err(|e| e.to_string())?;
+        let mut cbv = vec![0; cbv_info.map_or(0, |(_, len)| len)];
+        stream.read_exact(&mut cbv).map_err(|e| e.to_string())?;
         let constants: Vec<u32> = constant_bytes.chunks_exact(4).map(word).collect();
         if cache.as_ref().is_none_or(|(cached, _)| *cached != shader) {
             // Drop the old pipeline before constructing a replacement.
@@ -56,7 +70,12 @@ mod host {
             let pipeline = victory_gpu::WineMetalCompute::new(&shader)?;
             *cache = Some((shader, pipeline));
         }
-        cache.as_mut().expect("pipeline was prepared").1.dispatch(&mut buffer, &constants, groups)?;
+        let pipeline = &mut cache.as_mut().expect("pipeline was prepared").1;
+        if let Some((slot, _)) = cbv_info {
+            pipeline.dispatch_with_root_cbv(&mut buffer, &constants, groups, slot, &cbv)?;
+        } else {
+            pipeline.dispatch(&mut buffer, &constants, groups)?;
+        }
         Ok(buffer)
     }
 
@@ -147,10 +166,10 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6) {
             return Err("invalid protocol header".into());
         }
-        if fields[1] == 1 {
+        if matches!(fields[1], 1 | 6) {
             let shader_len = fields[2] as usize;
             let buffer_len = fields[3] as usize;
             if shader_len == 0 || shader_len > MAX_SHADER || buffer_len == 0
@@ -170,7 +189,7 @@ mod host {
             return Err("authentication failed".into());
         }
         match fields[1] {
-            1 => compute_request(stream, fields, cache),
+            1 | 6 => compute_request(stream, fields, cache),
             2 => graphics_request(stream, fields),
             5 => {
                 let mut payload = vec![0; fields[2] as usize];
