@@ -7,6 +7,11 @@
 #include "windows_d3d12x_ordered_shaders.h"
 __declspec(dllimport) HRESULT __stdcall D3D12XboxCreateDevice(const void *, const unsigned *, const IID *, void **);
 #define SLOT(o,n,T) ((T)((*(void ***)(o))[(n)/8]))
+#ifdef NATIVE_PRESENT_SRGB
+#define TARGET_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+#else
+#define TARGET_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
+#endif
 typedef unsigned long long U64;
 typedef HRESULT (__stdcall *CreateResource)(void *, const void *, unsigned, const void *, unsigned, const void *, const IID *, void **);
 typedef HRESULT (__stdcall *CreateObject)(void *, const void *, const IID *, void **);
@@ -62,7 +67,7 @@ static void transition(void *list,void *resource,unsigned before,unsigned after)
 static void copy_texture(void *list,void *buffer,void *texture,unsigned width,unsigned height,int upload) {
     D3D12_TEXTURE_COPY_LOCATION buf={0},tex={0};
     buf.pResource=buffer; buf.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    buf.PlacedFootprint.Footprint.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    buf.PlacedFootprint.Footprint.Format=upload?DXGI_FORMAT_R8G8B8A8_UNORM:TARGET_FORMAT;
     buf.PlacedFootprint.Footprint.Width=width; buf.PlacedFootprint.Footprint.Height=height;
     buf.PlacedFootprint.Footprint.Depth=1; buf.PlacedFootprint.Footprint.RowPitch=256;
     tex.pResource=texture; tex.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -95,11 +100,11 @@ unsigned mainCRTStartup(void *unused) {
     rd.Width=24576;
     for(unsigned i=0;i<2;i++) if(make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&upload[i])!=S_OK) return 3;
     for(unsigned i=0;i<3;i++) if(make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&readback[i])!=S_OK) return 3;
-    rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width=64; rd.Height=64; rd.Format=DXGI_FORMAT_R8G8B8A8_UNORM; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width=64; rd.Height=64; rd.Format=TARGET_FORMAT; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if(make(dev,&hp,0,&rd,4,0,&IID_ID3D12Resource,&target[0])!=S_OK) return 4;
     rd.Height=96;
     if(make(dev,&hp,0,&rd,4,0,&IID_ID3D12Resource,&target[1])!=S_OK) return 4;
-    rd.Width=2; rd.Height=1; rd.Flags=0;
+    rd.Width=2; rd.Height=1; rd.Format=DXGI_FORMAT_R8G8B8A8_UNORM; rd.Flags=0;
 #ifdef NATIVE_PRESENT
     for(unsigned i=0;i<2;i++) if(make(dev,&hp,0,&rd,0x80,0,&IID_ID3D12Resource,&tex[i])!=S_OK) return 5;
 #else
@@ -132,7 +137,7 @@ unsigned mainCRTStartup(void *unused) {
     *(unsigned *)(stream.b+24)=2; *(const void **)(stream.b+32)=ps; *(U64 *)(stream.b+40)=sizeof(ps);
     *(unsigned *)(stream.b+48)=10; *(unsigned *)(stream.b+52)=3; *(unsigned *)(stream.b+56)=1; *(unsigned *)(stream.b+76)=1;
     *(unsigned *)(stream.b+96)=11; *(unsigned *)(stream.b+152)=12; *(void **)(stream.b+160)=&element; *(unsigned *)(stream.b+168)=1;
-    *(unsigned *)(stream.b+176)=14; *(unsigned *)(stream.b+180)=3; *(unsigned *)(stream.b+184)=15; *(unsigned *)(stream.b+188)=28; *(unsigned *)(stream.b+220)=1;
+    *(unsigned *)(stream.b+176)=14; *(unsigned *)(stream.b+180)=3; *(unsigned *)(stream.b+184)=15; *(unsigned *)(stream.b+188)=TARGET_FORMAT; *(unsigned *)(stream.b+220)=1;
     StreamDesc sd={sizeof(stream.b),stream.b}; if(SLOT(dev,0x2b0,CreateObject)(dev,&sd,&IID_ID3D12PipelineState,&pipeline)!=S_OK) return 8;
     ID3D12CommandAllocator *allocator=0; ID3D12GraphicsCommandList *list[2]={0}; ID3D12CommandQueue *queue=0;
     if(ID3D12Device_CreateCommandAllocator((ID3D12Device *)dev,0,&IID_ID3D12CommandAllocator,(void **)&allocator)!=S_OK) return 9;
@@ -182,7 +187,12 @@ unsigned mainCRTStartup(void *unused) {
     volatile unsigned char *a=mapped[0],*b=mapped[1]; unsigned left=32*256+10*4,mid=48*256+32*4,right=48*256+56*4;
     if(a[left]!=255 || a[left+1]!=0 || a[left+2]!=0 || a[left+3]!=255) return 14;
     if(b[mid]!=0 || b[mid+1]!=255 || b[mid+2]!=0 || b[mid+3]!=255) return 17;
+#ifdef NATIVE_PRESENT_SRGB
+    /* RGB is encoded by the sRGB render target; alpha remains linear. */
+    if(b[right]!=137 || b[right+1]!=188 || b[right+2]!=255 || b[right+3]!=0) return 18;
+#else
     if(b[right]!=64 || b[right+1]!=128 || b[right+2]!=255 || b[right+3]!=0) return 18;
+#endif
     for(unsigned i=0;i<2;i++) { SLOT(list[i],0x10,Release)(list[i]); SLOT(vb[i],0x10,Release)(vb[i]); SLOT(upload[i],0x10,Release)(upload[i]); SLOT(readback[i],0x10,Release)(readback[i]); SLOT(tex[i],0x10,Release)(tex[i]); SLOT(target[i],0x10,Release)(target[i]); }
     SLOT(readback[2],0x10,Release)(readback[2]);
     for(unsigned i=0;i<5;i++) SLOT(heap[i],0x10,Release)(heap[i]);

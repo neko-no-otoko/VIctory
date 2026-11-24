@@ -20,12 +20,19 @@ fn real_pe_presents_on_native_fixture_main_thread() {
     std::fs::write(root.join("windows_d3d12x_ordered_shaders.h"), include_str!("../../../tests/fixtures/windows_d3d12x_ordered_shaders.h")).unwrap();
     std::fs::write(root.join("d3d.def"), "LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n").unwrap();
     tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "d3d.def", "-l", "d3d.lib"]);
-    tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-DNATIVE_PRESENT", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "present.c", "-o", "present.obj"]);
-    tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:present.exe", "present.obj", "d3d.lib"]);
-    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
-        .arg("native-fixture").arg(root.join("present.exe")).arg("--execute")
-        .output().unwrap();
-    let logs = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    assert!(output.status.success(), "status: {}\n{logs}", output.status);
-    assert!(logs.contains("fixture entry returned 42"), "{logs}");
+    for (variant, srgb) in [("unorm", false), ("srgb", true)] {
+        let mut args = vec!["-O2", "-DNATIVE_PRESENT", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"];
+        if srgb {
+            args.push("-DNATIVE_PRESENT_SRGB");
+        }
+        args.extend(["-c", "present.c", "-o", "present.obj"]);
+        tool(root, "x86_64-w64-mingw32-clang", &args);
+        tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:present.exe", "present.obj", "d3d.lib"]);
+        let output = Command::new(env!("CARGO_BIN_EXE_victory"))
+            .arg("native-fixture").arg(root.join("present.exe")).arg("--execute")
+            .output().unwrap();
+        let logs = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{variant} status: {}\n{logs}", output.status);
+        assert!(logs.contains("fixture entry returned 42"), "{variant}: {logs}");
+    }
 }

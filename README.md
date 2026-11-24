@@ -127,8 +127,8 @@ The caller must not access mapped resources concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
 
-An opt-in native macOS `PresentX` path sends a single RGBA8/BGRA8 color
-resource to a separate authenticated helper with a real AppKit window and
+An opt-in native macOS `PresentX` path sends a single RGBA8/BGRA8 UNORM or
+UNORM_SRGB resource to a separate authenticated helper with an AppKit window and
 `CAMetalLayer`. It waits for Metal completion and preserves the source
 resource. The Wine proxy supports RGBA8 presentation; both paths reject
 unsupported planes and parameters. This is an experimental synthetic-fixture

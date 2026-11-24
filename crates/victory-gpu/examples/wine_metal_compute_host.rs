@@ -111,7 +111,7 @@ mod host {
             .and_then(|rows| rows.checked_mul(pitch as usize))
             .and_then(|bytes| bytes.checked_add(row_bytes))
             .ok_or("image size overflow")?;
-        if width == 0 || !matches!(format, 28 | 87) || flags > 1
+        if width == 0 || !matches!(format, 28 | 29 | 87 | 91) || flags > 1
             || (pitch as usize) < row_bytes || required != bytes_len as usize
             || required > MAX_BUFFER
         {
@@ -206,25 +206,40 @@ mod host {
     pub fn run() -> Result<(), String> {
         let mut args = std::env::args();
         let program = args.next().unwrap_or_default();
-        let address: SocketAddr = args.next().ok_or_else(|| format!("usage: {program} LOOPBACK_ADDR:PORT"))?
+        let address: SocketAddr = args.next().ok_or_else(|| format!("usage: {program} LOOPBACK_ADDR:PORT [--announce]"))?
             .parse().map_err(|e| format!("invalid listen address: {e}"))?;
+        let announce = match args.next().as_deref() {
+            None => false,
+            Some("--announce") => true,
+            _ => return Err("expected optional --announce after the loopback address".into()),
+        };
         if args.next().is_some() || !address.ip().is_loopback() {
-            return Err("expected exactly one loopback listen address".into());
+            return Err("expected one loopback listen address and optional --announce".into());
         }
         let token = token()?;
         let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
         let presentation_enabled = std::env::var_os("VICTORY_WINE_METAL_PRESENT")
             .is_some_and(|value| value == "1");
         if presentation_enabled {
-            victory_metal::present::run_app(move || serve(listener, token, true))
-                .map_err(|e| e.to_string())
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            victory_metal::present::run_app(move || {
+                let _ = send.send(serve(listener, token, true, announce));
+            }).map_err(|e| e.to_string())?;
+            receive.recv().map_err(|e| e.to_string())?
         } else {
-            serve(listener, token, false);
-            Ok(())
+            serve(listener, token, false, announce)
         }
     }
 
-    fn serve(listener: TcpListener, token: [u8; 16], presentation_enabled: bool) {
+    fn announce_listener(listener: &TcpListener, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "VICTORY_WINE_METAL_READY={}", listener.local_addr()?)?;
+        out.flush()
+    }
+
+    fn serve(listener: TcpListener, token: [u8; 16], presentation_enabled: bool, announce: bool) -> Result<(), String> {
+        if announce {
+            announce_listener(&listener, &mut io::stdout().lock()).map_err(|e| e.to_string())?;
+        }
         let mut cache = None;
         for connection in listener.incoming() {
             match connection {
@@ -245,6 +260,26 @@ mod host {
                 }
                 Err(error) => eprintln!("accept failed: {error}"),
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn announces_bound_ephemeral_loopback_port() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut announcement = Vec::new();
+            announce_listener(&listener, &mut announcement).unwrap();
+            let line = std::str::from_utf8(&announcement).unwrap();
+            assert_eq!(line, format!("VICTORY_WINE_METAL_READY={}\n", listener.local_addr().unwrap()));
+            let endpoint: SocketAddr = line.trim_end().strip_prefix("VICTORY_WINE_METAL_READY=").unwrap().parse().unwrap();
+            assert_ne!(endpoint.port(), 0);
+            let client = TcpStream::connect(endpoint).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            drop((client, server));
         }
     }
 }

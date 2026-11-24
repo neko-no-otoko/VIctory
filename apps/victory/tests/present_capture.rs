@@ -41,18 +41,18 @@ fn drawable_capture_checks_channels_alpha_orientation_and_changed_source_size() 
     let mut wrong = token; wrong[0] ^= 1;
     let (status, _, _) = request(addr, &wrong, [64, 64, 28, 256, 16384, 1], &[]);
     assert_ne!(status, 0, "wrong token must be rejected");
-    for fields in [[0, 64, 28, 256, 16384, 1], [64, 64, 29, 256, 16384, 1], [64, 64, 28, 255, 16384, 1], [64, 64, 28, 256, 16384, 2]] {
+    for fields in [[0, 64, 28, 256, 16384, 1], [64, 64, 30, 256, 16384, 1], [64, 64, 28, 255, 16384, 1], [64, 64, 28, 256, 16384, 2]] {
         let (status, _, _) = request(addr, &token, fields, &[]);
         assert_ne!(status, 0, "bad fields must be rejected: {fields:?}");
     }
     // BGRA expectations at top-left, top-right, bottom-left and bottom-right.
     let colors = [[19, 37, 223, 255], [201, 42, 13, 192], [31, 209, 53, 128], [177, 91, 7, 64]];
-    for (width, height, format) in [(64usize, 64usize, 28u32), (96, 80, 87)] {
+    for (width, height, format) in [(64usize, 64usize, 28u32), (64, 64, 29), (96, 80, 87), (96, 80, 91)] {
         let pitch = width * 4 + 16;
         let mut pixels = vec![0x5a; (height - 1) * pitch + width * 4];
         for y in 0..height { for x in 0..width {
             let bgra = colors[(y >= height/2) as usize * 2 + (x >= width/2) as usize];
-            let pixel = if format == 28 { [bgra[2], bgra[1], bgra[0], bgra[3]] } else { bgra };
+            let pixel = if format == 28 || format == 29 { [bgra[2], bgra[1], bgra[0], bgra[3]] } else { bgra };
             let at = y * pitch + x * 4;
             pixels[at..at+4].copy_from_slice(&pixel);
         }}
@@ -66,7 +66,7 @@ fn drawable_capture_checks_channels_alpha_orientation_and_changed_source_size() 
         assert_eq!(payload.len(), 12 + len);
         for (i, (x, y)) in [(dw/4, dh/4), (3*dw/4, dh/4), (dw/4, 3*dh/4), (3*dw/4, 3*dh/4)].into_iter().enumerate() {
             let at = 12 + (y * dw + x) * 4;
-            assert_eq!(&payload[at..at+4], &colors[i], "drawable {dw}x{dh}, quadrant {i}, source {width}x{height}");
+            assert_eq!(&payload[at..at+4], &colors[i], "drawable {dw}x{dh}, quadrant {i}, source {width}x{height}, format {format}");
         }
     }
 }

@@ -215,22 +215,25 @@ The view's current backing size determines the drawable size; the source is
 stretched with nearest filtering. Closing the window makes later presents
 fail rather than creating a replacement.
 
-The supported console ABI is one plane with one live linear RGBA8_UNORM or
-BGRA8_UNORM color resource, a null present-parameters pointer, and the older
-queue slot `0xf0` or newer slot `0x100`. As in the upstream path, the frame
-token is not used for pacing. Other planes, formats and parameters fail. The
-queue serializes presentation with submitted work, preserves resource state
-and contents, and does not permit concurrent guest writes to mapped resources.
+The supported console ABI is one plane with one live linear RGBA8 or BGRA8
+UNORM/UNORM_SRGB color resource, a null present-parameters pointer, and the
+older queue slot `0xf0` or newer slot `0x100`. As in the upstream path, the
+frame token is not used for pacing. sRGB backbuffers are copied as encoded
+storage bytes into the UNORM drawable, not decoded a second time; alpha remains
+unchanged. Other planes, formats and parameters fail. The queue serializes
+presentation with submitted work, preserves resource state and contents, and
+does not permit concurrent guest writes to mapped resources.
 This is not a general DXGI swap chain, vsync implementation, HDR output, or
 game support.
 
-On an M3 Max, the real native-fixture PE and Wine PE both presented translated
-shader output. An independent drawable readback verified RGBA/BGRA channels,
-alpha, orientation and source-size changes; a separate AppKit probe verified
-drawable resizing and failure after closing the window. CoreGraphics reported
-the helper window on-screen, but screen-capture permission was unavailable and
-window capture failed, so the pixels were **not visually verified on the
-display**. These checks do not establish game compatibility.
+On an M3 Max, real native-fixture UNORM and sRGB PEs and a Wine PE presented
+translated shader output. Independent drawable readback verified RGBA/BGRA
+UNORM and sRGB bytes, alpha, orientation and source-size changes; an AppKit
+probe verified drawable resizing and failure after closing the window.
+CoreGraphics reported the helper window on-screen, but screen-capture
+permission was unavailable and window capture failed, so the pixels were
+**not visually verified on the display**. These checks do not establish game
+compatibility.
 
 With an Aqua session and the helper running as described in
 [the Wine proxy notes](wine-loader-tests.md), run:

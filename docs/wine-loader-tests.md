@@ -289,6 +289,13 @@ CARGO_TARGET_DIR=/tmp/victory-metal-host-target cargo build -p victory-gpu \
 /tmp/victory-metal-host-target/x86_64-apple-darwin/debug/examples/wine_metal_compute_host "$VICTORY_WINE_METAL_ADDR"
 ```
 
+For a launcher that needs a race-free ephemeral port, pass
+`127.0.0.1:0 --announce` instead of the fixed address. After binding and,
+when enabled, initializing AppKit, the helper prints and flushes exactly one
+`VICTORY_WINE_METAL_READY=127.0.0.1:<port>` line to stdout before serving.
+The launcher must monitor the helper process after that line; the line alone
+does not guarantee it remains alive.
+
 In another terminal with the same address and token, run the Windows target
 under Wine with its isolated prefix and the existing Windows runner setup:
 

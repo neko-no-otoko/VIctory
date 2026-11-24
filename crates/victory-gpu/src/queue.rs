@@ -317,7 +317,7 @@ extern "system" fn present(
         let resource = unsafe { *plane.resources };
         let result = crate::resource::with_live_metal_resource(resource, |resource| -> Result<(), String> {
             let format = crate::resource::metal_color_format(resource).ok_or("unsupported color format")?;
-            if !matches!(format, 28 | 87) { return Err("unsupported color format".into()); }
+            if !matches!(format, 28 | 29 | 87 | 91) { return Err("unsupported color format".into()); }
             let (ptr, width, height, pitch) = crate::resource::metal_texture(resource).ok_or("unsupported color resource")?;
             let len = (height as usize - 1).checked_mul(pitch)
                 .and_then(|n| n.checked_add(width as usize * 4)).ok_or("image size overflow")?;

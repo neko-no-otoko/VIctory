@@ -88,7 +88,7 @@ static int draw_frame(uint32_t width, uint32_t height, uint32_t format, uint32_t
                       uint32_t *out_height, uint8_t **out_pixels, size_t *out_len,
                       char *error, size_t error_len) {
     if (!running || !delegate || delegate.closed) { set_error(error, error_len, @"presentation window is closed or application is not running"); return -1; }
-    if (!width || !height || !pixels || (format != 28 && format != 87) || (uint64_t)pitch < (uint64_t)width * 4 ||
+    if (!width || !height || !pixels || (format != 28 && format != 29 && format != 87 && format != 91) || (uint64_t)pitch < (uint64_t)width * 4 ||
         (uint64_t)(height - 1) * pitch + (uint64_t)width * 4 > MAX_CAPTURE) {
         set_error(error, error_len, @"invalid presentation image"); return -1;
     }
@@ -110,7 +110,9 @@ static int draw_frame(uint32_t width, uint32_t height, uint32_t format, uint32_t
     if (!dw || !dh || dw > UINT32_MAX || dh > UINT32_MAX || (capture && (uint64_t)dw * dh * 4 > MAX_CAPTURE)) {
         set_error(error, error_len, @"invalid drawable dimensions"); return -1;
     }
-    MTLPixelFormat source_format = format == 28 ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatBGRA8Unorm;
+    // sRGB DXGI backbuffers already contain encoded bytes; sampling an sRGB
+    // texture would decode them before writing to the UNORM drawable.
+    MTLPixelFormat source_format = (format == 28 || format == 29) ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatBGRA8Unorm;
     if (!source_texture || source_texture.width != width || source_texture.height != height ||
         source_texture.pixelFormat != source_format) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source_format width:width height:height mipmapped:NO];

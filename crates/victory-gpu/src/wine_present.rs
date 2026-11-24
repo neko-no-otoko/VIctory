@@ -25,9 +25,10 @@ pub fn config() -> Result<(SocketAddr, [u8; 16]), String> {
     Ok((addr, token))
 }
 
-/// Present one RGBA8 or BGRA8 image. Returns only after GPU presentation completes.
+/// Present one RGBA8 or BGRA8 image, preserving UNORM or sRGB encoded bytes.
+/// Returns only after GPU presentation completes.
 pub fn send(addr: SocketAddr, token: [u8; 16], width: u32, height: u32, format: u32, pitch: u32, bytes: &[u8], capture: bool) -> Result<Capture, String> {
-    if !addr.ip().is_loopback() || addr.port() == 0 || width == 0 || height == 0 || !matches!(format, 28 | 87) {
+    if !addr.ip().is_loopback() || addr.port() == 0 || width == 0 || height == 0 || !matches!(format, 28 | 29 | 87 | 91) {
         return Err("invalid presentation endpoint or image".into());
     }
     let row = (width as usize).checked_mul(4).ok_or("image row overflow")?;
@@ -58,4 +59,49 @@ pub fn send(addr: SocketAddr, token: [u8; 16], width: u32, height: u32, format: 
         return Err("invalid drawable capture".into());
     }
     Ok(Capture { width, height, bytes: payload.split_off(12) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn sends_supported_formats_and_padded_bytes_unchanged() {
+        for format in [28, 29, 87, 91] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let token = [0x5a; 16];
+            // Two one-pixel rows with padding only after the first row.
+            let bytes = [1, 2, 3, 4, 0xaa, 0xbb, 5, 6, 7, 8];
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 58];
+                stream.read_exact(&mut request).unwrap();
+                let word = |n| u32::from_le_bytes(request[n..n + 4].try_into().unwrap());
+                assert_eq!((word(0), word(4), word(8), word(12)), (MAGIC, 4, 1, 2));
+                assert_eq!((word(16), word(20), word(24), word(28)), (format, 6, 10, 0));
+                assert_eq!(&request[32..48], &token);
+                assert_eq!(&request[48..], &bytes);
+                for v in [MAGIC, 0, 12, 0, 1, 2, 0u32] {
+                    stream.write_all(&v.to_le_bytes()).unwrap();
+                }
+            });
+            let result = send(addr, token, 1, 2, format, 6, &bytes, false).unwrap();
+            assert_eq!((result.width, result.height), (1, 2));
+            assert!(result.bytes.is_empty());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_formats_and_invalid_pitch_or_length() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let token = [0; 16];
+        assert_eq!(send(addr, token, 1, 1, 30, 4, &[0; 4], false).err().unwrap(), "invalid presentation endpoint or image");
+        for format in [28, 29, 87, 91] {
+            assert_eq!(send(addr, token, 1, 1, format, 3, &[0; 4], false).err().unwrap(), "invalid presentation image length or pitch");
+            assert_eq!(send(addr, token, 1, 2, format, 6, &[0; 12], false).err().unwrap(), "invalid presentation image length or pitch");
+        }
+    }
 }

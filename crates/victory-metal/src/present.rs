@@ -82,8 +82,11 @@ pub fn run_app<F: FnOnce() + Send + 'static>(worker: F) -> Result<(), RenderErro
     Ok(())
 }
 
-/// Present a top-row-first DXGI RGBA8 UNORM (28) or BGRA8 UNORM (87) image.
-/// Completion, including optional GPU drawable readback, precedes return.
+/// Present a top-row-first DXGI RGBA8 UNORM (28), RGBA8 UNORM_SRGB (29),
+/// BGRA8 UNORM (87), or BGRA8 UNORM_SRGB (91) image. The sRGB formats'
+/// encoded color bytes and alpha are preserved without sRGB decoding.
+/// `pitch` is the source row stride in bytes. Completion, including optional GPU
+/// drawable readback, precedes return.
 pub fn present(width: u32, height: u32, dxgi_format: u32, pitch: u32,
                pixels: &[u8], capture: bool) -> Result<PresentResult, RenderError> {
     if !RUNNING.load(Ordering::Acquire) {
@@ -94,7 +97,7 @@ pub fn present(width: u32, height: u32, dxgi_format: u32, pitch: u32,
         if width == 0 || height == 0 || (pitch as usize) < row { return None; }
         (height as usize - 1).checked_mul(pitch as usize)?.checked_add(row)
     });
-    if !matches!(dxgi_format, 28 | 87) || !matches!(required, Some(n) if n <= MAX_IMAGE && pixels.len() >= n) {
+    if !matches!(dxgi_format, 28 | 29 | 87 | 91) || !matches!(required, Some(n) if n <= MAX_IMAGE && pixels.len() >= n) {
         return Err(RenderError("invalid presentation image".into()));
     }
     let (mut out_width, mut out_height, mut out_len) = (0, 0, 0);
