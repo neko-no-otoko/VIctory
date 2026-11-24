@@ -1,4 +1,5 @@
 //! Shared XG texture-mode selection and limited native guest resolver.
+pub mod computer;
 use victory_formats::texture::Swizzle;
 
 /// Console texture description, with the layout field carrying the swizzle.
@@ -50,10 +51,19 @@ unsafe extern "win64" fn xg_suggest(desc: *const ResourceDesc, _: u32, out: *mut
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+unsafe extern "win64" fn xg_create(desc: *const ResourceDesc, out: *mut *mut computer::Computer) -> i32 {
+    computer::XGCreateTextureComputer(desc, out)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 impl victory_loader::ImportResolver for NativeResolver {
     fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
-        if dll.eq_ignore_ascii_case("xg_xs.dll") && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "XGSuggestSwizzleMode") {
-            victory_loader::Resolution::Found { address: xg_suggest as *const () as usize, provenance: victory_loader::Provenance::Hle }
-        } else { victory_loader::Resolution::Missing }
+        if !dll.eq_ignore_ascii_case("xg_xs.dll") { return victory_loader::Resolution::Missing; }
+        let address = match symbol {
+            victory_pe::ImportSymbol::Name { name, .. } if name == "XGSuggestSwizzleMode" => xg_suggest as *const () as usize,
+            victory_pe::ImportSymbol::Name { name, .. } if name == "XGCreateTextureComputer" => xg_create as *const () as usize,
+            _ => return victory_loader::Resolution::Missing,
+        };
+        victory_loader::Resolution::Found { address, provenance: victory_loader::Provenance::Hle }
     }
 }

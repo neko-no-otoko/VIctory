@@ -790,6 +790,7 @@ name = "victory-xg"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "tracing",
  "victory-formats",
  "victory-loader",
  "victory-pe",
