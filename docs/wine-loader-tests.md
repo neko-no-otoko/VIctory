@@ -106,10 +106,14 @@ In that same prefix, the synthetic loader integration tests passed 2/2. A
 separate GPU compute experiment compiled self-authored HLSL with Microsoft
 DXC v1.9.2609 and used an adapted MetalVulkan compute probe: after dispatch,
 UAV readback was `42, 7, 7, 7` from a buffer initialized to 7. The adapted
-probe is not included in this repository. VIctory-generated synthetic DXIL
-was also tried but failed pipeline creation with `0x80070057` and a
-`dxil-spirv` conversion error; the HLSL result does not validate that DXIL.
-Neither experiment establishes game compatibility or a native Metal backend.
+probe is not included in this repository. A VIctory-emitted synthetic
+compute DXIL shader also produced `42, 7, 7, 7` after its root signature was
+corrected to use eight `b0` constants and direct resource-heap indexing.
+Both shaders passed Microsoft's `dxv`. An earlier attempt at the VIctory
+shader failed pipeline creation with `0x80070057` using a root signature
+with only five constants and no direct-heap flag; it did not establish an
+emitter defect. These experiments do not establish game compatibility or a
+native Metal backend.
 The adapted source and HLSL remain on the test workstation at
 `/tmp/victory-metalvulkan/compute_matrix.c` and `compute.hlsl`; its original
 source is [MetalVulkan's compute probe](https://github.com/metalsharp/MetalVulkan/blob/v7.0/scripts/probes/core10/compute_matrix.c).
