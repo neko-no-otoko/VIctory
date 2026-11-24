@@ -120,21 +120,20 @@ bounds and non-overlapping, and source and destination must be distinct.
 Commands retain their resources until the list is reset or released. Placed or
 aliased resources, other heap types and state combinations, individual
 subresources, split or aliasing barriers, other shader bindings, descriptor
-changes after recording, root-signature commands, waits and presentation are
-not implemented. Unsupported list commands reject the list; submission
+changes after recording, root-signature commands and waits are not implemented.
+Unsupported list commands reject the list; submission
 failures latch the queue and prevent later fence signals.
 The caller must not access mapped resources concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
 
-Native macOS presentation is not implemented: the queue's `PresentX` returns
-`E_NOTIMPL`, and the runtime has no AppKit window or `CAMetalLayer` event-loop
-integration. A presentation implementation needs a real window and drawable
-lifecycle, serialized access to the rendered resource and its console state,
-and validation of the supported plane and present-parameter ABI rather than
-silently ignoring fields. It also needs an unlocked graphical session to verify
-that a submitted frame actually reaches a visible surface; offscreen readback
-alone does not establish that.
+An opt-in native macOS `PresentX` path sends a single RGBA8/BGRA8 color
+resource to a separate authenticated helper with a real AppKit window and
+`CAMetalLayer`. It waits for Metal completion and preserves the source
+resource. The Wine proxy supports RGBA8 presentation; both paths reject
+unsupported planes and parameters. This is an experimental synthetic-fixture
+path, not a general swap chain or game compatibility. See
+[the native loader notes](docs/native-macos-loader.md) for setup and limits.
 
 To run the synthetic device/list/queue test on a Metal GPU (no title assets):
 

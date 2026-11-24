@@ -12,8 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, and [`console`] which console model the title sees. The queue also
+//! handles the supported subset of console presentation.
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -62,6 +62,7 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 pub mod wine_transport;
+pub mod wine_present;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod wine_graphics;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

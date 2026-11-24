@@ -60,9 +60,9 @@ The synthetic executable integration test imports and calls both providers,
 checks that an unimplemented import fails to load, and runs without game data:
 `cargo test -p victory-native --target x86_64-apple-darwin --test native_executable`.
 
-The D3D12.X bridge uses typed Windows-x64 entry points for limited compute and
-offscreen graphics device, descriptor heap, resource, pipeline, allocator,
-list, queue and fence paths backed by the existing Metal implementation.
+The D3D12.X bridge uses typed Windows-x64 entry points for limited compute,
+graphics and opt-in presentation through device, descriptor heap, resource,
+pipeline, allocator, list, queue and fence paths backed by Metal.
 Unsupported vtable slots abort the process rather than silently succeed or call
 host-ABI pointers.
 Guest DLL allocation hooks and the Windows runtime page mapper are not
@@ -204,6 +204,42 @@ cargo test -p victory --target x86_64-apple-darwin --test native_srgb -- --ignor
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the
 Apple Metal Shader Converter and LLVM-MinGW. These synthetic shaders are not
 game shaders, and this result does not establish game compatibility.
+
+The opt-in `PresentX` path uses the same authenticated loopback helper as the
+Wine bridge. Set `VICTORY_WINE_METAL_PRESENT=1` in the helper process, and
+provide its loopback address and token to the native CLI. The helper runs
+AppKit on its main thread and its server on a worker; it creates a real
+resizable window with a `CAMetalLayer`. The source is uploaded to Metal,
+drawn into a drawable, presented, and completed before `PresentX` returns.
+The view's current backing size determines the drawable size; the source is
+stretched with nearest filtering. Closing the window makes later presents
+fail rather than creating a replacement.
+
+The supported console ABI is one plane with one live linear RGBA8_UNORM or
+BGRA8_UNORM color resource, a null present-parameters pointer, and the older
+queue slot `0xf0` or newer slot `0x100`. As in the upstream path, the frame
+token is not used for pacing. Other planes, formats and parameters fail. The
+queue serializes presentation with submitted work, preserves resource state
+and contents, and does not permit concurrent guest writes to mapped resources.
+This is not a general DXGI swap chain, vsync implementation, HDR output, or
+game support.
+
+On an M3 Max, the real native-fixture PE and Wine PE both presented translated
+shader output. An independent drawable readback verified RGBA/BGRA channels,
+alpha, orientation and source-size changes; a separate AppKit probe verified
+drawable resizing and failure after closing the window. CoreGraphics reported
+the helper window on-screen, but screen-capture permission was unavailable and
+window capture failed, so the pixels were **not visually verified on the
+display**. These checks do not establish game compatibility.
+
+With an Aqua session and the helper running as described in
+[the Wine proxy notes](wine-loader-tests.md), run:
+
+```sh
+cargo test -p victory --target x86_64-apple-darwin \
+  --test native_present --test present_capture -- --ignored --nocapture
+cargo run -p victory-metal --target x86_64-apple-darwin --example present_probe
+```
 
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls

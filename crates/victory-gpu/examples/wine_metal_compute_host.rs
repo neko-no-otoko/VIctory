@@ -97,15 +97,57 @@ mod host {
         pipeline.draw(width, height, clear, &vertices, &constants)
     }
 
+    fn present_request(
+        stream: &mut TcpStream,
+        fields: [u32; 8],
+        enabled: bool,
+    ) -> Result<Vec<u8>, String> {
+        if !enabled {
+            return Err("presentation is not enabled".into());
+        }
+        let [_, _, width, height, format, pitch, bytes_len, flags] = fields;
+        let row_bytes = (width as usize).checked_mul(4).ok_or("image size overflow")?;
+        let required = (height as usize).checked_sub(1)
+            .and_then(|rows| rows.checked_mul(pitch as usize))
+            .and_then(|bytes| bytes.checked_add(row_bytes))
+            .ok_or("image size overflow")?;
+        if width == 0 || !matches!(format, 28 | 87) || flags > 1
+            || (pitch as usize) < row_bytes || required != bytes_len as usize
+            || required > MAX_BUFFER
+        {
+            return Err("invalid present request dimensions, format, or length".into());
+        }
+        let mut pixels = vec![0; required];
+        stream.read_exact(&mut pixels).map_err(|e| e.to_string())?;
+        let result = victory_metal::present::present(width, height, format, pitch, &pixels, flags == 1)
+            .map_err(|e| e.to_string())?;
+        let capture_len = result.capture.len();
+        let expected_capture = (result.width as usize).checked_mul(result.height as usize)
+            .and_then(|n| n.checked_mul(4)).ok_or("drawable size overflow")?;
+        if result.width == 0 || result.height == 0
+            || (flags == 1 && (capture_len != expected_capture || capture_len > MAX_BUFFER))
+            || (flags == 0 && capture_len != 0)
+        {
+            return Err("invalid drawable capture returned by presenter".into());
+        }
+        let mut response = Vec::with_capacity(12 + capture_len);
+        response.extend_from_slice(&result.width.to_le_bytes());
+        response.extend_from_slice(&result.height.to_le_bytes());
+        response.extend_from_slice(&(capture_len as u32).to_le_bytes());
+        response.extend_from_slice(&result.capture);
+        Ok(response)
+    }
+
     fn request(
         stream: &mut TcpStream,
         expected_token: &[u8; 16],
         cache: &mut Option<(Vec<u8>, victory_gpu::WineMetalCompute)>,
+        presentation_enabled: bool,
     ) -> Result<Vec<u8>, String> {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 3) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 3 | 4) {
             return Err("invalid protocol header".into());
         }
         if fields[1] == 1 {
@@ -137,6 +179,7 @@ mod host {
                 let results = victory_gpu::execute_wine_batch(batch)?;
                 victory_gpu::wine_transport::encode_results(&results)
             }
+            4 => present_request(stream, fields, presentation_enabled),
             _ => unreachable!(),
         }
     }
@@ -170,6 +213,18 @@ mod host {
         }
         let token = token()?;
         let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
+        let presentation_enabled = std::env::var_os("VICTORY_WINE_METAL_PRESENT")
+            .is_some_and(|value| value == "1");
+        if presentation_enabled {
+            victory_metal::present::run_app(move || serve(listener, token, true))
+                .map_err(|e| e.to_string())
+        } else {
+            serve(listener, token, false);
+            Ok(())
+        }
+    }
+
+    fn serve(listener: TcpListener, token: [u8; 16], presentation_enabled: bool) {
         let mut cache = None;
         for connection in listener.incoming() {
             match connection {
@@ -177,14 +232,13 @@ mod host {
                     if !stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false) {
                         continue;
                     }
-                    let deadline = Some(Duration::from_secs(30));
-                    if let Err(error) = stream.set_read_timeout(deadline)
-                        .and_then(|()| stream.set_write_timeout(deadline))
+                    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(30)))
+                        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(60))))
                     {
                         eprintln!("setting connection timeouts failed: {error}");
                         continue;
                     }
-                    let result = request(&mut stream, &token, &mut cache);
+                    let result = request(&mut stream, &token, &mut cache, presentation_enabled);
                     if let Err(error) = respond(&mut stream, result) {
                         eprintln!("response failed: {error}");
                     }
@@ -192,7 +246,6 @@ mod host {
                 Err(error) => eprintln!("accept failed: {error}"),
             }
         }
-        Ok(())
     }
 }
 

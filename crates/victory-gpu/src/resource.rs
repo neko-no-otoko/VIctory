@@ -1145,6 +1145,19 @@ pub(crate) fn metal_texture_state<T>(
 static METAL_BUFFERS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+// Serialize presentation's checked access with final resource release.
+#[cfg(target_os = "macos")]
+static METAL_RESOURCES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Access a live resource while its final release is excluded.
+#[cfg(target_os = "macos")]
+pub(crate) fn with_live_metal_resource<T>(this: This, f: impl FnOnce(This) -> T) -> Option<T> {
+    let live = METAL_RESOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    if !live.contains(&(this as usize)) { return None; }
+    Some(f(this))
+}
+
 /// Return an owned reference to the committed buffer containing a GPU address range.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_buffer_at(address: u64, len: u64) -> Option<(This, u64)> {
@@ -1232,6 +1245,11 @@ fn hand_out_resource(
         )
     });
     let result = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    #[cfg(target_os = "macos")]
+    if result == S_OK {
+        METAL_RESOURCES.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(unsafe { *out } as usize);
+    }
     #[cfg(target_os = "macos")]
     if result == S_OK
         && let Some((address, object, size)) = registration
@@ -1621,10 +1639,12 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
 pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     #[cfg(target_os = "macos")]
     {
+        let mut live = METAL_RESOURCES.lock().unwrap_or_else(|e| e.into_inner());
         let mut buffers = METAL_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let r = resource(this);
         let address = r.data() as usize;
         let count = object::release_boxed::<Resource>(this);
+        if count == 0 { live.remove(&(this as usize)); }
         if count == 0
             && buffers
                 .get(&address)

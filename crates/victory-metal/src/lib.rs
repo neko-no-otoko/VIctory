@@ -8,6 +8,7 @@
 
 pub mod compute;
 pub mod converter;
+pub mod present;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;

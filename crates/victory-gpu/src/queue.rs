@@ -172,9 +172,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
-    token: u64,
-    count: u32,
-    resources: *const This,
+    pub(crate) token: u64,
+    pub(crate) count: u32,
+    pub(crate) resources: *const This,
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -299,15 +299,39 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
-    _parameters: *const u8,
+    parameters: *const u8,
 ) -> HRESULT {
     #[cfg(target_os = "macos")]
     {
-        let _ = (planes, plane_parameters);
-        return object::E_NOTIMPL;
+        if this.is_null() || planes != 1 || plane_parameters.is_null() || !parameters.is_null() {
+            return object::E_INVALIDARG;
+        }
+        let plane = unsafe { &*plane_parameters };
+        if plane.count != 1 || plane.resources.is_null() { return object::E_INVALIDARG; }
+        let _guard = METAL_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+        let q = queue(this);
+        if q.kind != 0 || q.failed.load(Ordering::Acquire) { return object::E_INVALIDARG; }
+        let resource = unsafe { *plane.resources };
+        let result = crate::resource::with_live_metal_resource(resource, |resource| -> Result<(), String> {
+            let format = crate::resource::metal_color_format(resource).ok_or("unsupported color format")?;
+            if !matches!(format, 28 | 87) { return Err("unsupported color format".into()); }
+            let (ptr, width, height, pitch) = crate::resource::metal_texture(resource).ok_or("unsupported color resource")?;
+            let len = (height as usize - 1).checked_mul(pitch)
+                .and_then(|n| n.checked_add(width as usize * 4)).ok_or("image size overflow")?;
+            if len > 16 * 1024 * 1024 { return Err("image too large".into()); }
+            let pitch = u32::try_from(pitch).map_err(|_| "pitch overflow")?;
+            let (addr, token) = crate::wine_present::config()?;
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            crate::wine_present::send(addr, token, width, height, format, pitch, bytes, false).map(|_| ())
+        });
+        return match result {
+            Some(Ok(())) => { FRAMES.fetch_add(1, Ordering::Relaxed); S_OK },
+            Some(Err(e)) => { tracing::error!(%e, "Metal presentation failed"); 0x80004005u32 as i32 },
+            None => object::E_INVALIDARG,
+        };
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
@@ -550,6 +574,9 @@ mod native {
     extern "win64" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         super::signal(this, fence, value)
     }
+    extern "win64" fn present(this: This, planes: u32, plane: *const Plane, parameters: *const u8) -> HRESULT {
+        super::present(this, planes, plane, parameters)
+    }
 
     const fn table(newer: bool) -> Table<36> {
         let mut f = object::native_table::<36>();
@@ -558,6 +585,7 @@ mod native {
         f[2] = release as *const ();
         f[10] = execute as *const ();
         f[if newer { 16 } else { 14 }] = signal as *const ();
+        f[if newer { 32 } else { 30 }] = present as *const ();
         Table(f)
     }
     pub(super) static FUNCTIONS: Table<36> = table(false);

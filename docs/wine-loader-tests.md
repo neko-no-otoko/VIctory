@@ -246,9 +246,9 @@ execution. This is a trusted-workload experiment, not a process sandbox.
 The restricted compute path supports one committed default raw UAV buffer, a
 one-entry shader-visible heap, root constants in slot 0, descriptor table in
 slot 1, and synchronous dispatch/readback. Limits are 4 MiB per shader,
-16 MiB per buffer and 64 constant dwords. A separate restricted offscreen
-graphics path is described below. Presentation, root CBVs, general resource
-states and arbitrary D3D12.X methods remain unsupported; some unsupported void
+16 MiB per buffer and 64 constant dwords. Restricted graphics and opt-in
+presentation paths are described below. Root CBVs, general resource states
+and arbitrary D3D12.X methods remain unsupported; some unsupported void
 methods abort rather than pretend to succeed. The loopback bearer token is not
 a boundary against other processes with access to it.
 
@@ -323,7 +323,7 @@ single sampled texture and point or linear clamp sampler. Shader constants
 must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
-This remains restricted: no presentation, asynchronous fences, partial clears,
+This remains restricted: no asynchronous fences or partial clears,
 multi-mip or tiled textures, BGRA/sRGB/BC formats through this proxy, stencil,
 arbitrary sampler/address modes, or general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
@@ -434,6 +434,46 @@ export VICTORY_TEST_D3D12X_UV_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tl
 CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
   --test wine_uv_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
 ```
+
+### Opt-in window presentation
+
+To enable presentation, set `VICTORY_WINE_METAL_PRESENT=1` in the helper's
+environment before starting it. Without that opt-in, presentation requests
+fail and the helper remains headless. The Wine queue accepts one plane with
+one live RGBA8_UNORM resource and null present parameters. The plane token is
+accepted but does not pace presentation, matching the upstream shortcut.
+Submission and presentation are synchronous and serialized; source pixels
+and resource state are preserved. The caller must not modify mapped resources
+concurrently. Other formats, multiple planes, placement, non-null present
+parameters, HDR and general swap-chain behavior are unsupported.
+
+The helper owns a visible AppKit window and `CAMetalLayer` on the macOS main
+thread. It stretches each source to the current view backing size, presents
+the drawable, and waits for Metal completion. Resizing changes the drawable;
+after the window is closed, subsequent presents fail. The helper requires an
+Aqua session and a Metal device. Native macOS PE fixtures can use the same
+helper; see [the native loader notes](native-macos-loader.md).
+
+With the import libraries from above and the presentation-enabled helper
+running, build and run the TLS-bearing Wine fixture:
+
+```sh
+x86_64-w64-mingw32-clang -O2 -fno-emulated-tls \
+  -c tests/fixtures/windows_d3d12x_present_graphics.c \
+  -o /tmp/victory-wine-hle-tls/present.obj
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /include:_tls_used \
+  /out:/tmp/victory-wine-hle-tls/present.exe /tmp/victory-wine-hle-tls/present.obj \
+  /tmp/victory-wine-hle-tls/kernel32.lib /tmp/victory-wine-hle-tls/d3d12_xs.lib \
+  "$LLVM_MINGW/x86_64-w64-mingw32/lib/libmingw32.a"
+export VICTORY_TEST_D3D12X_PRESENT_PE="$(winepath -w /tmp/victory-wine-hle-tls/present.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test wine_present_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
+```
+
+On an M3 Max, the Wine and native fixtures passed, as did GPU drawable
+readback, window-resize and close-rejection probes. CoreGraphics reported the
+window on-screen. Screen-capture permission was unavailable and a window-only
+capture failed, so these results do not visually verify display pixels.
 
 ## Normal Wine process with D3D12.X HLE DLL
 

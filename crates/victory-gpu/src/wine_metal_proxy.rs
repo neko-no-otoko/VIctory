@@ -302,6 +302,7 @@ static LIST_TABLE: Table<160> = {
 static QUEUE_TABLE: Table<160> = {
     let mut t = base();
     t[10] = execute as *const ();
+    t[30] = present as *const ();
     Table(t)
 };
 
@@ -748,6 +749,21 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     if kind == 0 && !graphics_jobs.is_empty() {
         if let Err(e) = run_graphics(&c, &graphics_jobs) { trap(&e); }
+    }
+}
+
+extern "system" fn present(this: This, planes: u32, plane: *const crate::queue::Plane, parameters: *const u8) -> HRESULT {
+    let Some(Data::Queue(c, 0)) = data(this) else { return E_INVALIDARG; };
+    if planes != 1 || plane.is_null() || !parameters.is_null() { return E_INVALIDARG; }
+    let plane = unsafe { &*plane };
+    if plane.count != 1 || plane.resources.is_null() { return E_INVALIDARG; }
+    let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Data::Texture(texture)) = data(unsafe { *plane.resources }) else { return E_INVALIDARG; };
+    if texture.format != 28 { return E_INVALIDARG; }
+    let bytes = texture.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    match crate::wine_present::send(c.addr, c.token, texture.width, texture.height, texture.format, texture.width * 4, &bytes, false) {
+        Ok(_) => S_OK,
+        Err(e) => { tracing::error!(%e, "Wine presentation failed"); FAIL }
     }
 }
 
