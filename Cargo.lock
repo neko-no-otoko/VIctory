@@ -831,6 +831,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-xg-dll"
+version = "0.1.0"
+dependencies = [
+ "victory-xg",
+]
+
+[[package]]
+name = "victory-xgameruntime-dll"
+version = "0.1.0"
+dependencies = [
+ "victory-hle",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

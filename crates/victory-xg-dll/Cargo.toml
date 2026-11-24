@@ -1,0 +1,18 @@
+[package]
+name = "victory-xg-dll"
+description = "Wine-loadable XG texture layout import DLL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "xg_xs"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+victory-xg = { path = "../victory-xg" }
+
+[lints]
+workspace = true

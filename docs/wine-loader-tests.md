@@ -530,3 +530,60 @@ D3D12.X compute workload through native Metal and checks GPU readback `42`.
 These tests passed with Wine 11 under Rosetta on an M3 Max. Wine's macOS
 transition internals are Wine implementation details; this is not ARM-native
 PE execution, a full console runtime, or evidence of game compatibility.
+
+## Normal Wine process with XG and XGameRuntime HLE DLLs
+
+The Windows-target crates `victory-xg-dll` and
+`victory-xgameruntime-dll` provide normal Wine-loadable `xg_xs.dll` and
+`xgameruntime.dll` files. They call the existing shared VIctory
+implementations; they do not map the executable or rewrite TLS. XG exports
+`XGCreateTextureComputer` and `XGSuggestSwizzleMode`. XGameRuntime exports
+`XGameRuntimeInitialize`, `XGameRuntimeUninitialize`, `InitializeApiImpl`,
+`InitializeApiImplEx`, `InitializeApiImplEx2`, `UninitializeApiImpl`,
+`QueryApiImpl`, and `XErrorReport`.
+
+XSystem and XUser are provider interfaces obtained from `QueryApiImpl`, not
+separate DLLs or direct `XUser*` exports. The shared HLE implements a fixed
+offline local identity and existing offline/error behavior; this does not
+connect to Xbox services. `QueryApiImpl` also exposes the other interfaces
+already registered by that HLE, with their existing limitations; this test
+does not validate all of them. Missing names are not exported, unknown
+provider/interface pairs return the upstream unsupported error, and
+linker-assigned PE ordinals are not Xbox ordinal mappings. Do not rely on
+ordinal imports. Unimplemented upstream vtable slots retain their existing
+behavior and are not a guarantee of ABI coverage.
+
+Using the Wine and LLVM-MinGW setup above, build all three independently
+loadable DLLs into the same explicit directory:
+
+```sh
+CARGO_TARGET_DIR=/tmp/victory-providers-target cargo build \
+  -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
+  --target x86_64-pc-windows-gnullvm
+export VICTORY_TEST_HLE_DLL_DIR=/tmp/victory-providers-target/x86_64-pc-windows-gnullvm/debug
+export WINEPATH="$(winepath -w "$VICTORY_TEST_HLE_DLL_DIR");$(winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
+export WINEDLLOVERRIDES='xg_xs,xgameruntime,d3d12_xs=n'
+wine /path/to/trusted-guest.exe
+```
+
+Wine's usual DLL search precedence still applies: an earlier same-named DLL
+can shadow the selected directory. These DLLs and paths are not a sandbox;
+trust the executable, DLLs and Wine prefix. The separate Windows DLLs each
+link their own HLE state and do not promise shared mutable configuration across
+modules. Other Xbox DLLs, ordinals, runtime interfaces and game compatibility
+remain outside the verified scope.
+
+With `VICTORY_TEST_HLE_DLL_DIR` and `LLVM_MINGW` set, run:
+
+```sh
+CARGO_TARGET_DIR=/tmp/victory-providers-target cargo test -p victory \
+  --target x86_64-apple-darwin --test wine_providers -- --ignored --nocapture
+```
+
+On the M3 Max with Wine 11 under Rosetta, the synthetic normally launched PE
+passed static TLS and two-thread callback checks, exact DLL-path and missing
+name/DLL checks, XG texture-computer layout and reference lifetime, and
+XSystem/XUser identity, handle, gamertag and error checks. The existing
+normally launched D3D12.X-to-Metal compute regression also passed with real
+GPU readback. No game files were used; these results do not establish game
+compatibility or ARM-native PE execution.
