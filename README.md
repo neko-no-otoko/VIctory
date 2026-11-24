@@ -102,14 +102,22 @@ The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle
 lists from a float4 vertex buffer into RGBA8 and reads the pixels back;
 device, pipeline, target and buffers are reused across synchronous draws.
-Its fixed input layout supports one per-vertex float4 and an optional fragment
-`b0, space0` constant buffer. Specify its size in dwords when creating the
-renderer (zero or a multiple of four) and supply that exact number per draw.
-The caller must verify using converter reflection that the fragment uses the
-automatic linear layout with b0 at byte offset zero, and that the supplied
-buffer is large enough. Other shader resources, console GPU semantics and
-presentation are not implemented. To exercise synthetic translated GFX10
-vertex and fragment shaders, including changing fragment constants:
+Its fixed input layout supports one per-vertex float4, optional fragment
+`b0, space0` constants, and one fragment texture and sampler at heap index 0.
+Specify the constant buffer size in dwords (zero or a multiple of four) and
+supply that exact number per draw. If texture binding is enabled, upload a
+tightly packed RGBA8 image with `set_fragment_texture` before drawing; nearest
+or linear filtering uses clamp-to-edge with one mip level.
+
+The caller must verify from converter reflection that b0 uses the automatic
+linear layout at offset zero and that the constant buffer is large enough, and
+from translated shader metadata that texture and sampler accesses use heap
+index zero. The fragment metallib must expect a 2D-array texture view (the
+converter's older default or array compatibility mode). Other layouts and
+resource types are not supported; the renderer does not infer or validate
+them from metallibs. Console GPU semantics and presentation are not
+implemented. To exercise synthetic translated GFX10 vertex and fragment
+shaders, including changing constants and sampled texels:
 
 ```sh
 cargo build -p victory

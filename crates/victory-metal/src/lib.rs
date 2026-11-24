@@ -1,8 +1,8 @@
 //! Native offscreen Metal triangle rendering, not a console GPU backend.
 //!
 //! `Renderer` retains its device, pipeline, render target and readback buffer
-//! across draws. It supports one float4 vertex attribute and a fragment b0
-//! constant buffer using the converter's linear argument-buffer layout.
+//! across draws. It supports one float4 vertex attribute, fragment b0
+//! constants, and one 2D texture/sampler in the converter's resource heaps.
 
 #![cfg(target_os = "macos")]
 
@@ -32,6 +32,7 @@ unsafe extern "C" {
         width: u32,
         height: u32,
         fragment_constant_dwords: u32,
+        fragment_texture: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -41,6 +42,15 @@ unsafe extern "C" {
         vertex_count: u32,
         fragment_constants: *const u32,
         pixels: *mut u8,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> bool;
+    fn victory_metal_set_texture(
+        renderer: *mut c_void,
+        width: u32,
+        height: u32,
+        rgba: *const u8,
+        linear_filter: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -60,14 +70,24 @@ fn native_error(error: &[c_char]) -> RenderError {
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
 ///
 /// Both metallibs must be produced by Apple Metal Shader Converter. Vertex
-/// attribute 0 is a per-vertex float4 at buffer slot 6. The only supported
-/// shader resource is fragment `b0, space0` at offset 0 in the converter's
-/// automatic linear argument buffer; the caller must verify that layout via
-/// converter reflection. The output is tightly packed RGBA8, top row first.
+/// attribute 0 is a per-vertex float4 at buffer slot 6. Supported fragment
+/// bindings are `b0, space0` at offset 0 in the converter's automatic linear
+/// argument buffer, and texture and sampler heap index 0. The caller must
+/// verify those layouts via converter reflection and translated shader metadata.
+/// The output is tightly packed RGBA8, top row first.
 pub struct Renderer {
     handle: NonNull<c_void>,
     pixel_len: usize,
     fragment_constant_dwords: usize,
+    fragment_texture: bool,
+    texture_bound: bool,
+}
+
+/// Texture filtering; address mode is clamp-to-edge and LOD is fixed to zero.
+#[derive(Clone, Copy)]
+pub enum TextureFilter {
+    Nearest,
+    Linear,
 }
 
 impl Renderer {
@@ -79,6 +99,7 @@ impl Renderer {
         width: u32,
         height: u32,
         fragment_constant_dwords: u32,
+        fragment_texture: bool,
     ) -> Result<Self, RenderError> {
         if width == 0 || height == 0 || vertex_metallib.is_empty() || fragment_metallib.is_empty() {
             return Err(RenderError(
@@ -112,6 +133,7 @@ impl Renderer {
                 width,
                 height,
                 fragment_constant_dwords,
+                fragment_texture,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -121,7 +143,47 @@ impl Renderer {
             handle,
             pixel_len,
             fragment_constant_dwords: fragment_constant_dwords as usize,
+            fragment_texture,
+            texture_bound: false,
         })
+    }
+
+    /// Upload RGBA8 texels and bind the sole fragment texture and sampler.
+    /// The converted fragment shader must expect a 2D-array texture view.
+    pub fn set_fragment_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        filter: TextureFilter,
+    ) -> Result<(), RenderError> {
+        let size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
+        if !self.fragment_texture || width == 0 || height == 0 || rgba.len() != size {
+            return Err(RenderError("expected enabled texture binding, nonzero dimensions and tightly packed RGBA8 texels".into()));
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: the renderer and validated input buffer live through the
+        // synchronous upload, which retains its own Metal texture.
+        let ok = unsafe {
+            victory_metal_set_texture(
+                self.handle.as_ptr(),
+                width,
+                height,
+                rgba.as_ptr(),
+                matches!(filter, TextureFilter::Linear),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok {
+            self.texture_bound = true;
+            Ok(())
+        } else {
+            Err(native_error(&error))
+        }
     }
 
     /// Draw a triangle list with the configured fragment b0 constants.
@@ -141,6 +203,9 @@ impl Renderer {
                 "expected a nonempty triangle list and exact-sized constants and output buffers"
                     .into(),
             ));
+        }
+        if self.fragment_texture && !self.texture_bound {
+            return Err(RenderError("fragment texture has not been bound".into()));
         }
         let count =
             u32::try_from(vertices.len()).map_err(|_| RenderError("too many vertices".into()))?;

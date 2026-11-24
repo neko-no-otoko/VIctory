@@ -1,46 +1,90 @@
 #![cfg(target_os = "macos")]
 
 use std::process::Command;
-use victory_metal::Renderer;
+use victory_metal::{Renderer, TextureFilter};
 use victory_shader::native::{StageIo, Usage, VsInput};
 use victory_shader::{
-    Container, HwStage, NativeProgram, RootParam, RootType, emit, io, ir, resource, structure,
+    Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, emit, io,
+    ir, resource, structure,
 };
 
-// Synthetic GFX10 pixel shader exporting (red, 0, 0, 1). Red is either a
-// literal or the first dword of the caller's b0 user-data buffer.
-fn fragment_dxil(use_constants: bool) -> Vec<u8> {
-    let mut words: Vec<u32> = if use_constants {
-        vec![0x7e00_0200] // v_mov_b32 v0, s0
+// GFX10 fragments: constant color, b0-driven color, or a texture sample.
+fn fragment_dxil(use_constants: bool, sampled: bool) -> Vec<u8> {
+    let words: Vec<u32> = if sampled {
+        vec![
+            0x7e04_0200, // v_mov_b32 v2, s0 (u coordinate)
+            0x7e06_02f0, // v_mov_b32 v3, 0.5 (v coordinate)
+            0xbe82_0309, // s_mov_b32 s2, s9 (texture heap)
+            0xbe89_0380, // s_mov_b32 s9, 0
+            0xbe83_0380, // s_mov_b32 s3, 0
+            0xf408_0204,
+            0xfa00_0000, // s_load_dwordx4 sampler descriptor
+            0xf40c_0001,
+            0xfa00_0000, // s_load_dwordx8 texture descriptor
+            0xf080_0f08,
+            0x0040_0002, // image_sample v[0:3], v[2:3]
+            0xf800_180f,
+            0x0302_0100,
+            0xbf81_0000,
+        ]
     } else {
-        vec![0x7e00_02ff, 0x3f80_0000] // v_mov_b32 v0, 1.0f
+        let mut words = if use_constants {
+            vec![0x7e00_0200] // v_mov_b32 v0, s0
+        } else {
+            vec![0x7e00_02ff, 0x3f80_0000]
+        };
+        words.extend_from_slice(&[
+            0x7e02_0280,
+            0x7e04_0280,
+            0x7e06_02ff,
+            0x3f80_0000,
+            0xf800_180f,
+            0x0302_0100,
+            0xbf81_0000,
+        ]);
+        words
     };
-    words.extend_from_slice(&[
-        0x7e02_0280, // v_mov_b32 v1, 0
-        0x7e04_0280, // v_mov_b32 v2, 0
-        0x7e06_02ff,
-        0x3f80_0000, // v_mov_b32 v3, 1.0f
-        0xf800_180f,
-        0x0302_0100, // exp mrt0, v0, v1, v2, v3 done vm
-        0xbf81_0000,
-    ]);
+    let root = |kind, user_data, slot| RootParam {
+        root: kind,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, user_data, slot, dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data,
+        slot,
+    };
     let native = NativeProgram {
         stage: HwStage::Ps,
         wave64: false,
-        vgprs: 4,
-        layout: if use_constants {
-            vec![RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }]
+        vgprs: 8,
+        layout: if sampled {
+            vec![
+                root(RootType::Constants, 0, 0),
+                root(RootType::Table, 8, 1),
+                root(RootType::Table, 9, 2),
+            ]
+        } else if use_constants {
+            vec![root(RootType::Constants, 0, 0)]
         } else {
             vec![]
         },
-        used: vec![],
+        used: if sampled {
+            vec![
+                used(ResourceType::Sampler, 8, 1, 4),
+                used(ResourceType::Srv, 9, 2, 8),
+            ]
+        } else {
+            vec![]
+        },
         io: StageIo::Ps {
             inputs: vec![],
             input_addr: 0,
@@ -232,10 +276,10 @@ fn assert_fragment_b0_layout(library: &std::ffi::OsStr, dxil: &[u8]) {
 
 #[test]
 fn rejects_invalid_arguments_before_gpu_work() {
-    assert!(Renderer::new(&[], "main", &[1], "main", 1, 1, 0).is_err());
-    assert!(Renderer::new(&[1], "main", &[1], "main", 0, 1, 0).is_err());
-    assert!(Renderer::new(&[1], "bad\0name", &[1], "main", 1, 1, 0).is_err());
-    assert!(Renderer::new(&[1], "main", &[1], "main", 1, 1, 1).is_err());
+    assert!(Renderer::new(&[], "main", &[1], "main", 1, 1, 0, false).is_err());
+    assert!(Renderer::new(&[1], "main", &[1], "main", 0, 1, 0, false).is_err());
+    assert!(Renderer::new(&[1], "bad\0name", &[1], "main", 1, 1, 0, false).is_err());
+    assert!(Renderer::new(&[1], "main", &[1], "main", 1, 1, 1, false).is_err());
 }
 
 #[test]
@@ -244,14 +288,17 @@ fn translated_stages_render_vertex_buffer() {
     let cli = std::env::var_os("VICTORY_TEST_CLI").expect("set VICTORY_TEST_CLI");
     let converter =
         std::env::var_os("VICTORY_TEST_METAL_CONVERTER").expect("set VICTORY_TEST_METAL_CONVERTER");
-    let uniform_dxil = fragment_dxil(true);
+    let uniform_dxil = fragment_dxil(true, false);
+    let sample_dxil = fragment_dxil(true, true);
     assert_fragment_b0_layout(&converter, &uniform_dxil);
+    assert_fragment_b0_layout(&converter, &sample_dxil);
     let tmp = tempfile::tempdir().unwrap();
     let mut libs = Vec::new();
     for (stage, data) in [
         ("vertex", vertex_dxil()),
-        ("fragment", fragment_dxil(false)),
+        ("fragment", fragment_dxil(false, false)),
         ("fragment", uniform_dxil),
+        ("fragment", sample_dxil),
     ] {
         let dxil = tmp.path().join(format!("{stage}.dxil"));
         let metallib = tmp.path().join(format!("{stage}.metallib"));
@@ -275,7 +322,7 @@ fn translated_stages_render_vertex_buffer() {
         libs.push(std::fs::read(metallib).unwrap());
     }
     // Odd width verifies padded GPU readback is copied into tight rows.
-    let mut renderer = Renderer::new(&libs[0], "main", &libs[1], "main", 5, 3, 0).unwrap();
+    let mut renderer = Renderer::new(&libs[0], "main", &libs[1], "main", 5, 3, 0, false).unwrap();
     let fullscreen = [[-1., -1., 0., 1.], [3., -1., 0., 1.], [-1., 3., 0., 1.]];
     let outside = [[2., 2., 0., 1.], [3., 2., 0., 1.], [2., 3., 0., 1.]];
     let mut pixels = vec![0; 5 * 3 * 4];
@@ -306,9 +353,15 @@ fn translated_stages_render_vertex_buffer() {
     );
     assert!(renderer.draw(&[], &[], &mut pixels).is_err());
     assert!(renderer.draw(&fullscreen, &[], &mut pixels[..4]).is_err());
-    assert!(Renderer::new(&libs[0], "missing", &libs[1], "main", 1, 1, 0).is_err());
+    assert!(Renderer::new(&libs[0], "missing", &libs[1], "main", 1, 1, 0, false).is_err());
+    assert!(
+        renderer
+            .set_fragment_texture(1, 1, &[0; 4], TextureFilter::Nearest)
+            .is_err()
+    );
 
-    let mut uniform_renderer = Renderer::new(&libs[0], "main", &libs[2], "main", 5, 3, 4).unwrap();
+    let mut uniform_renderer =
+        Renderer::new(&libs[0], "main", &libs[2], "main", 5, 3, 4, false).unwrap();
     let red = [1.0f32.to_bits(), 0, 0, 0];
     let black = [0.0f32.to_bits(), 0, 0, 0];
     uniform_renderer
@@ -336,5 +389,51 @@ fn translated_stages_render_vertex_buffer() {
         uniform_renderer
             .draw(&fullscreen, &red[..3], &mut pixels)
             .is_err()
+    );
+
+    let mut textured = Renderer::new(&libs[0], "main", &libs[3], "main", 5, 3, 12, true).unwrap();
+    let mut constants = [0u32; 12];
+    constants[0] = 0.25f32.to_bits();
+    assert!(textured.draw(&fullscreen, &constants, &mut pixels).is_err());
+    assert!(
+        textured
+            .set_fragment_texture(2, 1, &[1, 2], TextureFilter::Nearest)
+            .is_err()
+    );
+    let texels = [255, 0, 0, 255, 0, 255, 0, 255];
+    textured
+        .set_fragment_texture(2, 1, &texels, TextureFilter::Nearest)
+        .unwrap();
+    textured.draw(&fullscreen, &constants, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]),
+        "{pixels:?}"
+    );
+    constants[0] = 0.75f32.to_bits();
+    textured.draw(&fullscreen, &constants, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [0, 255, 0, 255]),
+        "{pixels:?}"
+    );
+    textured
+        .set_fragment_texture(2, 1, &texels, TextureFilter::Linear)
+        .unwrap();
+    constants[0] = 0.5f32.to_bits();
+    textured.draw(&fullscreen, &constants, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| (127..=128).contains(&p[0])
+            && (127..=128).contains(&p[1])
+            && p[2..] == [0, 255]),
+        "{pixels:?}"
+    );
+    let swapped = [0, 0, 255, 255, 255, 0, 0, 255];
+    textured
+        .set_fragment_texture(2, 1, &swapped, TextureFilter::Nearest)
+        .unwrap();
+    constants[0] = 0.25f32.to_bits();
+    textured.draw(&fullscreen, &constants, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+        "{pixels:?}"
     );
 }
