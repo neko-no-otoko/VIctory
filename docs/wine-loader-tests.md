@@ -434,3 +434,59 @@ export VICTORY_TEST_D3D12X_UV_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tl
 CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
   --test wine_uv_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
 ```
+
+## Normal Wine process with D3D12.X HLE DLL
+
+The `victory-d3d12x-dll` Windows-target crate builds a real `d3d12_xs.dll`.
+Its named exports delegate to the existing VIctory D3D12.X HLE registry,
+including the normal device allocator setup; the IID export contains the
+actual GUID data. Wine loads the original executable and DLLs normally, so
+Wine owns their static TLS, thread callbacks and process lifecycle. This route
+does not use VIctory's EXE-as-DLL loader or its instruction-byte rewrite.
+Other Xbox HLE DLLs and VIctory's manual-loader import overrides are **not**
+automatically provided by this DLL. Unsupported names are not exported; Wine
+handles unresolved imports according to its own loader behavior.
+Linker-assigned export ordinals are not a supported console ordinal mapping;
+use named imports only. Wine may resolve an ordinal by coincidence, so ordinal
+imports must not be relied upon.
+
+For an explicitly supplied, trusted PE and isolated Wine prefix, build and
+select the DLL as follows. LLVM-MinGW, Rust's Windows GNU-LLVM target, Wine,
+and the runner setup at the start of this document are required:
+
+```sh
+CARGO_TARGET_DIR=/tmp/victory-wine-exe-target cargo build \
+  -p victory-d3d12x-dll --target x86_64-pc-windows-gnullvm
+export VICTORY_TEST_D3D12X_DLL=/tmp/victory-wine-exe-target/x86_64-pc-windows-gnullvm/debug/d3d12_xs.dll
+export WINEPATH="$(winepath -w "$(dirname "$VICTORY_TEST_D3D12X_DLL")");$(winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
+export WINEDLLOVERRIDES='d3d12_xs=n'
+wine /path/to/trusted-guest.exe
+```
+
+This deliberately uses Wine's normal DLL search order, not a private loader
+or injection. `WINEPATH` does **not** override a same-named DLL in a directory
+Wine searches earlier, including the executable's directory. Inspect the
+actual loaded module path and trust the executable, its directories, prefix,
+and DLLs; these settings do not sandbox code or guarantee DLL identity in
+untrusted directories. The synthetic tests check the loaded module's exact
+path and exercise missing-DLL and incorrect-path failures.
+
+With the native Metal compute proxy running as described above and the same
+address and token exported, the two isolated Wine integration tests build
+distinct self-authored PE executables and a separate TLS-bearing DLL:
+
+```sh
+CARGO_TARGET_DIR=/tmp/victory-wine-exe-target cargo test -p victory \
+  --target x86_64-apple-darwin --test wine_process -- --ignored --nocapture
+```
+
+Both verify compiler-generated static TLS and callbacks across two PE images,
+two worker threads and a Wine-to-guest locale callback. They also observe the
+TLS-bearing DLL's process-detach callback with its state intact. An attempted
+EXE process-detach callback marker was not observed under this Wine build and
+is not claimed by this test. The second creates a
+device through the imported HLE DLL, dispatches the restricted synthetic
+D3D12.X compute workload through native Metal and checks GPU readback `42`.
+These tests passed with Wine 11 under Rosetta on an M3 Max. Wine's macOS
+transition internals are Wine implementation details; this is not ARM-native
+PE execution, a full console runtime, or evidence of game compatibility.

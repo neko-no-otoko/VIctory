@@ -687,6 +687,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-d3d12x-dll"
+version = "0.1.0"
+dependencies = [
+ "victory-gpu",
+ "victory-hle",
+ "victory-loader",
+ "victory-pe",
+]
+
+[[package]]
 name = "victory-formats"
 version = "0.1.0"
 

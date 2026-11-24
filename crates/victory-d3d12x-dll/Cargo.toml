@@ -1,0 +1,21 @@
+[package]
+name = "victory-d3d12x-dll"
+description = "Wine-loadable D3D12.X HLE import DLL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "d3d12_xs"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+victory-gpu.workspace = true
+victory-hle.workspace = true
+victory-loader.workspace = true
+victory-pe.workspace = true
+
+[lints]
+workspace = true
