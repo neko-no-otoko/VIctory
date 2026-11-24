@@ -1069,3 +1069,56 @@ unsigned entry(void) {
     use std::os::unix::process::ExitStatusExt;
     assert!(matches!(output.status.signal(), Some(10 | 11)), "fault status {:?}", output.status);
 }
+
+#[test]
+fn native_fixture_uses_monotonic_timing_services() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nQueryPerformanceCounter\nQueryPerformanceFrequency\nGetTickCount64\nSleep\nGetLastError\nSetLastError\n").unwrap();
+    std::fs::write(dir.path().join("timing.c"), r#"
+typedef unsigned long DWORD;
+typedef unsigned long long ULONGLONG;
+typedef long long LONGLONG;
+typedef int BOOL;
+__declspec(dllimport) BOOL QueryPerformanceCounter(LONGLONG *);
+__declspec(dllimport) BOOL QueryPerformanceFrequency(LONGLONG *);
+__declspec(dllimport) ULONGLONG GetTickCount64(void);
+__declspec(dllimport) void Sleep(DWORD);
+__declspec(dllimport) DWORD GetLastError(void);
+__declspec(dllimport) void SetLastError(DWORD);
+int timing_marker = 7;
+int *volatile timing_relocation = &timing_marker;
+unsigned entry(void) {
+    LONGLONG frequency, frequency2, start, end, after_zero;
+    ULONGLONG tick_start, tick_end, tick_zero, elapsed_ms, tick_elapsed;
+    if (*timing_relocation != 7) return 1;
+    SetLastError(1234);
+    if (!QueryPerformanceFrequency(&frequency) || frequency <= 0 || GetLastError() != 1234) return 2;
+    if (!QueryPerformanceFrequency(&frequency2) || frequency2 != frequency) return 3;
+    if (!QueryPerformanceCounter(&start) || GetLastError() != 1234) return 4;
+    tick_start = GetTickCount64();
+    if (GetLastError() != 1234) return 5;
+    Sleep(30);
+    if (GetLastError() != 1234) return 6;
+    tick_end = GetTickCount64();
+    if (!QueryPerformanceCounter(&end) || end < start || tick_end < tick_start) return 7;
+    elapsed_ms = (ULONGLONG)(end - start) * 1000 / (ULONGLONG)frequency;
+    tick_elapsed = tick_end - tick_start;
+    if (elapsed_ms < 25 || elapsed_ms > 10000 || tick_elapsed < 25 || tick_elapsed > 10000) return 8;
+    if (elapsed_ms > tick_elapsed + 100 || tick_elapsed > elapsed_ms + 100) return 9;
+    Sleep(0);
+    tick_zero = GetTickCount64();
+    if (!QueryPerformanceCounter(&after_zero) || after_zero < end || tick_zero < tick_end || GetLastError() != 1234) return 10;
+    if (QueryPerformanceCounter(0) || GetLastError() != 87) return 11;
+    SetLastError(1234);
+    if (QueryPerformanceFrequency(0) || GetLastError() != 87) return 12;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "timing.c", "-o", "timing.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:timing.exe", "timing.obj", "kernel32.lib"]);
+    let exe = dir.path().join("timing.exe");
+    let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+}

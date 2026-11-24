@@ -299,6 +299,13 @@ free; a full 48-byte Windows x64 result buffer is required.
 error state and are available without a file root. This is not Windows process
 initialization or executable guest memory support.
 
+The native `kernel32.dll` resolver also provides `QueryPerformanceCounter`,
+`QueryPerformanceFrequency`, `GetTickCount64`, and `Sleep`. The counters use
+the same Mach continuous monotonic clock, converted to nanoseconds for a
+fixed 1 GHz performance-counter frequency and milliseconds for tick count.
+`Sleep(0)` yields, finite sleeps wait on the host, and `Sleep(INFINITE)` does
+not return. Other timing APIs remain unresolved.
+
 With `--execute`, executable and DLL code runs **unsandboxed in the CLI
 process** and can crash, hang or corrupt it. Only pass trusted images with
 a normally returning `extern "win64" fn() -> u32` executable entry, and

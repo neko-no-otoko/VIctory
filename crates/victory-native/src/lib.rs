@@ -6,6 +6,8 @@ mod files;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod memory;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod timing;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub use files::FileScope;
 
 
@@ -24,6 +26,9 @@ mod macos {
                 return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
             }
             if let Some(address) = crate::memory::resolve(dll, symbol) {
+                return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
+            }
+            if let Some(address) = crate::timing::resolve(dll, symbol) {
                 return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
             }
             if dll.eq_ignore_ascii_case("d3d12_xs.dll")
