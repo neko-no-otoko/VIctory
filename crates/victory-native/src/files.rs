@@ -1,16 +1,18 @@
-//! Opt-in, synchronous, read-only Win32 file services for native guests.
+//! Opt-in, synchronous Win32 file services for native guests.
 //!
 //! The scope and its handles belong to the calling thread. Guest-created
-//! threads are not supported. This is not a process sandbox.
+//! threads are not supported. This is not a process sandbox. The host must
+//! not mutate the root trees concurrently: advisory locks coordinate only
+//! cooperating file scopes, not arbitrary host processes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
@@ -27,12 +29,21 @@ const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_DUP_NAME: u32 = 52;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_NAME: u32 = 123;
+const ERROR_FILE_EXISTS: u32 = 80;
+const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
 const INVALID_HANDLE: usize = usize::MAX;
 
 struct Context {
     root: File,
-    handles: HashMap<usize, File>,
+    save: Option<File>,
+    handles: HashMap<usize, GuestFile>,
+}
+
+struct GuestFile {
+    file: File,
+    readable: bool,
+    writable: bool,
 }
 
 thread_local! {
@@ -54,16 +65,37 @@ pub struct FileScope {
 
 impl FileScope {
     pub fn enter(root: &Path) -> io::Result<Self> {
+        Self::enter_with_save(root, None)
+    }
+
+    /// Opens distinct game and optional save roots for this thread.
+    pub fn enter_with_save(root: &Path, save: Option<&Path>) -> io::Result<Self> {
         CONTEXT.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_some() {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file scope is already active"));
             }
-            let root = OpenOptions::new()
+            let open_root = |path: &Path| OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(root)?;
-            *slot = Some(Context { root, handles: HashMap::new() });
+                .open(path);
+            let root_file = open_root(root)?;
+            let save_file = if let Some(save) = save {
+                let root_path = std::fs::canonicalize(root)?;
+                let save_path = std::fs::canonicalize(save)?;
+                let save_file = open_root(save)?;
+                let root_metadata = root_file.metadata()?;
+                let save_metadata = save_file.metadata()?;
+                if root_path.starts_with(&save_path) || save_path.starts_with(&root_path)
+                    || (root_metadata.dev() == save_metadata.dev() && root_metadata.ino() == save_metadata.ino())
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "game and save roots must be distinct and non-overlapping"));
+                }
+                Some(save_file)
+            } else {
+                None
+            };
+            *slot = Some(Context { root: root_file, save: save_file, handles: HashMap::new() });
             Ok(Self { _thread_bound: PhantomData })
         })
     }
@@ -84,6 +116,8 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
     Some(match name.as_str() {
         "CreateFileW" => create_file_w as *const () as usize,
         "ReadFile" => read_file as *const () as usize,
+        "WriteFile" => write_file as *const () as usize,
+        "FlushFileBuffers" => flush_file_buffers as *const () as usize,
         "SetFilePointerEx" => set_file_pointer_ex as *const () as usize,
         "GetFileSizeEx" => get_file_size_ex as *const () as usize,
         "CloseHandle" => close_handle as *const () as usize,
@@ -101,6 +135,7 @@ fn error_code(error: &io::Error, intermediate: bool) -> u32 {
     match error.raw_os_error() {
         Some(libc::ENOENT) => if intermediate { ERROR_PATH_NOT_FOUND } else { ERROR_FILE_NOT_FOUND },
         Some(libc::ENOTDIR) => ERROR_PATH_NOT_FOUND,
+        Some(libc::EEXIST) => ERROR_FILE_EXISTS,
         Some(libc::EACCES | libc::EPERM | libc::ELOOP) => ERROR_ACCESS_DENIED,
         Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE) => ERROR_NOT_ENOUGH_MEMORY,
         Some(libc::ENAMETOOLONG) => ERROR_INVALID_NAME,
@@ -168,17 +203,8 @@ fn consider_component(selected: &mut Option<CString>, wanted: &[u8], name: &CStr
     Ok(())
 }
 
-fn open_relative(root: &File, path: &str) -> Result<File, u32> {
+fn open_relative(root: &File, path: &str, readable: bool, writable: bool, disposition: u32) -> Result<(File, bool), u32> {
     if path.is_empty() { return Err(ERROR_INVALID_NAME); }
-    // Every absolute DOS drive is an alias of the explicitly supplied root.
-    // Drive-relative, rooted, UNC and device namespace paths are not mapped.
-    let bytes = path.as_bytes();
-    let path = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        if bytes.get(2).is_none_or(|b| *b != b'/' && *b != b'\\') {
-            return Err(ERROR_ACCESS_DENIED);
-        }
-        &path[3..]
-    } else { path };
     if path.starts_with(['/', '\\']) || path.contains(':') {
         return Err(ERROR_ACCESS_DENIED);
     }
@@ -190,11 +216,22 @@ fn open_relative(root: &File, path: &str) -> Result<File, u32> {
         }
         let intermediate = parts.peek().is_some();
         let parent = directory.as_ref().unwrap_or(root);
-        let name = find_component(parent, part, intermediate)?;
-        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-            | if intermediate { libc::O_DIRECTORY } else { libc::O_NONBLOCK };
+        let (name, created) = match find_component(parent, part, intermediate) {
+            Ok(name) => {
+                if !intermediate && disposition == 1 { return Err(ERROR_FILE_EXISTS); }
+                (name, false)
+            }
+            Err(ERROR_FILE_NOT_FOUND) if !intermediate && matches!(disposition, 1 | 4) => {
+                (CString::new(part).map_err(|_| ERROR_INVALID_NAME)?, true)
+            }
+            Err(code) => return Err(code),
+        };
+        let flags = (if intermediate || !writable { libc::O_RDONLY } else if readable { libc::O_RDWR } else { libc::O_WRONLY })
+            | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            | if intermediate { libc::O_DIRECTORY } else { libc::O_NONBLOCK }
+            | if created { libc::O_CREAT | libc::O_EXCL } else { 0 };
         // SAFETY: parent is an open directory and name is a NUL-terminated component.
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o666) };
         if fd < 0 {
             let error = io::Error::last_os_error();
             if intermediate && error.raw_os_error() == Some(libc::ENOTDIR) {
@@ -213,8 +250,8 @@ fn open_relative(root: &File, path: &str) -> Result<File, u32> {
             directory = Some(file);
         } else {
             let metadata = file.metadata().map_err(|e| error_code(&e, false))?;
-            if !metadata.is_file() { return Err(ERROR_ACCESS_DENIED); }
-            return Ok(file);
+            if !metadata.is_file() || (writable && metadata.nlink() != 1) { return Err(ERROR_ACCESS_DENIED); }
+            return Ok((file, created));
         }
     }
     Err(ERROR_INVALID_NAME)
@@ -229,13 +266,14 @@ unsafe extern "win64" fn create_file_w(
     flags: u32,
     template: *mut c_void,
 ) -> usize {
-    // Only read access, OPEN_EXISTING and ordinary file attributes are supported.
     const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
     const READ_RIGHTS: u32 = 0x0012_0089;
-    // Every supported handle allows other reads. Exclusive sharing would
-    // require enforcing Windows share modes across aliases and host processes.
-    if access & !(GENERIC_READ | READ_RIGHTS) != 0 || access & (GENERIC_READ | 1) == 0
-        || share & !7 != 0 || share & 1 == 0 || !security.is_null() || disposition != 3
+    let readable = access & (GENERIC_READ | 1) != 0;
+    let writable = access & GENERIC_WRITE != 0;
+    if access & !(GENERIC_READ | GENERIC_WRITE | READ_RIGHTS) != 0 || !(readable || writable)
+        || share & !7 != 0 || share & 1 == 0 || !security.is_null()
+        || !matches!(disposition, 1 | 3 | 4) || (disposition != 3 && !writable)
         || flags & !0x80 != 0 || !template.is_null()
     {
         fail(ERROR_NOT_SUPPORTED);
@@ -249,14 +287,42 @@ unsafe extern "win64" fn create_file_w(
     let result = CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let context = slot.as_mut().ok_or(ERROR_INVALID_HANDLE)?;
-        let file = open_relative(&context.root, &path)?;
+        let bytes = path.as_bytes();
+        let (drive, relative) = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            if bytes.get(2).is_none_or(|b| *b != b'/' && *b != b'\\') {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            (Some(bytes[0].to_ascii_uppercase()), &path[3..])
+        } else { (None, path.as_str()) };
+        let save = drive == Some(b'T') && context.save.is_some();
+        if writable && !save { return Err(ERROR_NOT_SUPPORTED); }
+        if save && share & 3 != 3 { return Err(ERROR_NOT_SUPPORTED); }
+        let root = if save { context.save.as_ref().unwrap() } else { &context.root };
+        // The advisory lock covers all case-folded lookups and creation.
+        struct Lock<'a>(&'a File);
+        impl Drop for Lock<'_> {
+            fn drop(&mut self) { unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); } }
+        }
+        let _lock = if save {
+            if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(error_code(&io::Error::last_os_error(), false));
+            }
+            Some(Lock(root))
+        } else { None };
+        let (file, created) = open_relative(root, relative, readable, writable, disposition)?;
         let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             (value != INVALID_HANDLE).then(|| value + 1)
         }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
-        context.handles.insert(handle, file);
-        Ok(handle)
+        context.handles.insert(handle, GuestFile { file, readable, writable });
+        Ok((handle, created))
     });
-    match result { Ok(handle) => handle, Err(code) => { fail(code); INVALID_HANDLE } }
+    match result {
+        Ok((handle, created)) => {
+            if disposition == 4 { fail(if created { 0 } else { ERROR_ALREADY_EXISTS }); }
+            handle
+        }
+        Err(code) => { fail(code); INVALID_HANDLE }
+    }
 }
 
 unsafe extern "win64" fn read_file(
@@ -271,9 +337,10 @@ unsafe extern "win64" fn read_file(
     let result = CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let file = slot.as_mut().and_then(|c| c.handles.get_mut(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
+        if !file.readable { return Err(ERROR_ACCESS_DENIED); }
         // SAFETY: guest supplies a writable buffer of count bytes.
         let buffer = unsafe { std::slice::from_raw_parts_mut(buffer, count as usize) };
-        file.read(buffer).map_err(|e| error_code(&e, false))
+        file.file.read(buffer).map_err(|e| error_code(&e, false))
     });
     match result {
         Ok(n) => {
@@ -283,6 +350,44 @@ unsafe extern "win64" fn read_file(
         }
         Err(code) => { fail(code); 0 }
     }
+}
+
+unsafe extern "win64" fn write_file(
+    handle: usize, buffer: *const u8, count: u32, bytes_written: *mut u32, overlapped: *mut c_void,
+) -> i32 {
+    if !bytes_written.is_null() {
+        // SAFETY: a non-null output pointer must be writable by the guest.
+        unsafe { *bytes_written = 0; }
+    }
+    if !overlapped.is_null() { fail(ERROR_NOT_SUPPORTED); return 0; }
+    if buffer.is_null() || bytes_written.is_null() { fail(ERROR_INVALID_PARAMETER); return 0; }
+    let result = CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let file = slot.as_mut().and_then(|c| c.handles.get_mut(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
+        if !file.writable { return Err(ERROR_ACCESS_DENIED); }
+        let metadata = file.file.metadata().map_err(|e| error_code(&e, false))?;
+        if !metadata.is_file() || metadata.nlink() != 1 { return Err(ERROR_ACCESS_DENIED); }
+        // SAFETY: the guest supplies a readable buffer of count bytes.
+        let buffer = unsafe { std::slice::from_raw_parts(buffer, count as usize) };
+        file.file.write(buffer).map_err(|e| error_code(&e, false))
+    });
+    match result {
+        Ok(n) => {
+            unsafe { *bytes_written = n as u32; }
+            1
+        }
+        Err(code) => { fail(code); 0 }
+    }
+}
+
+extern "win64" fn flush_file_buffers(handle: usize) -> i32 {
+    let result = CONTEXT.with(|slot| {
+        let slot = slot.borrow();
+        let file = slot.as_ref().and_then(|c| c.handles.get(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
+        if !file.writable { return Err(ERROR_ACCESS_DENIED); }
+        file.file.sync_all().map_err(|e| error_code(&e, false))
+    });
+    match result { Ok(()) => 1, Err(code) => { fail(code); 0 } }
 }
 
 unsafe extern "win64" fn set_file_pointer_ex(handle: usize, distance: i64, new_position: *mut i64, method: u32) -> i32 {
@@ -296,7 +401,7 @@ unsafe extern "win64" fn set_file_pointer_ex(handle: usize, distance: i64, new_p
     let result = CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let file = slot.as_mut().and_then(|c| c.handles.get_mut(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
-        file.seek(seek).map_err(|e| {
+        file.file.seek(seek).map_err(|e| {
             if e.raw_os_error() == Some(libc::EINVAL) { ERROR_NEGATIVE_SEEK } else { error_code(&e, false) }
         })
     });
@@ -317,7 +422,7 @@ unsafe extern "win64" fn get_file_size_ex(handle: usize, size: *mut i64) -> i32 
     let result = CONTEXT.with(|slot| {
         let slot = slot.borrow();
         let file = slot.as_ref().and_then(|c| c.handles.get(&handle)).ok_or(ERROR_INVALID_HANDLE)?;
-        file.metadata().map(|m| m.len()).map_err(|e| error_code(&e, false))
+        file.file.metadata().map(|m| m.len()).map_err(|e| error_code(&e, false))
     });
     match result {
         Ok(length) => {
@@ -415,6 +520,122 @@ mod tests {
             assert_eq!(read, 0);
             assert_eq!(read_file(handle, null_mut(), 1, &mut read, null_mut()), 0);
             assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    unsafe fn save_open(path: &str, disposition: u32) -> usize {
+        unsafe { create_file_w(wide(path).as_ptr(), 0xc000_0000, 3, null(), disposition, 0x80, null_mut()) }
+    }
+
+    #[test]
+    fn save_roots_must_be_distinct_and_disjoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let nested = game.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        symlink(&game, dir.path().join("alias")).unwrap();
+        assert!(FileScope::enter_with_save(&game, Some(&game)).is_err());
+        assert!(FileScope::enter_with_save(&game, Some(&nested)).is_err());
+        assert!(FileScope::enter_with_save(&nested, Some(&game)).is_err());
+        assert!(FileScope::enter_with_save(&game, Some(&dir.path().join("alias/nested"))).is_err());
+    }
+
+    #[test]
+    fn save_io_permissions_and_lifetimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(game.join("data"), b"game").unwrap();
+        let scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            for path in ["data", "C:\\data", "T:\\..\\data"] {
+                assert_eq!(save_open(path, 4), INVALID_HANDLE);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            }
+            let h = save_open("t:\\Save.DAT", 4);
+            assert_ne!(h, INVALID_HANDLE);
+            assert_eq!(get_last_error(), 0);
+            let mut n = 0;
+            assert_eq!(write_file(h, b"saved".as_ptr(), 5, &mut n, null_mut()), 1);
+            assert_eq!(n, 5);
+            assert_eq!(flush_file_buffers(h), 1);
+            assert_eq!(save_open("T:\\save.dat", 1), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_FILE_EXISTS);
+            let h2 = save_open("T:\\save.dat", 4);
+            assert_ne!(h2, INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_ALREADY_EXISTS);
+            assert_eq!(close_handle(h2), 1);
+            std::fs::hard_link(save.join("Save.DAT"), game.join("linked")).unwrap();
+            assert_eq!(write_file(h, b"x".as_ptr(), 1, &mut n, null_mut()), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(save_open("T:\\Save.DAT", 3), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            drop(scope);
+            assert_eq!(flush_file_buffers(h), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+        }
+        assert_eq!(std::fs::read(save.join("Save.DAT")).unwrap(), b"saved");
+        assert_eq!(std::fs::read(game.join("data")).unwrap(), b"game");
+        let _scope = FileScope::enter(&game).unwrap();
+        unsafe {
+            assert_ne!(open("T:\\data"), INVALID_HANDLE);
+            assert_eq!(save_open("T:\\data", 3), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn save_create_serializes_case_insensitive_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = ["T:\\File", "T:\\file"].into_iter().map(|path| {
+            let game = game.clone();
+            let save = save.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let _scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+                barrier.wait();
+                let h = unsafe { save_open(path, 1) };
+                if h == INVALID_HANDLE { assert_eq!(get_last_error(), ERROR_FILE_EXISTS); false } else { true }
+            })
+        }).collect();
+        assert_eq!(threads.into_iter().map(|t| t.join().unwrap()).filter(|success| *success).count(), 1);
+        assert_eq!(std::fs::read_dir(save).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_rejects_symlinks_and_unsupported_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(game.join("data"), b"game").unwrap();
+        symlink(game.join("data"), save.join("link")).unwrap();
+        symlink(&game, save.join("dirlink")).unwrap();
+        let _scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            for path in ["T:\\link", "T:\\dirlink\\data"] {
+                assert_eq!(save_open(path, 3), INVALID_HANDLE);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            }
+            for (share, disposition, flags) in [(1, 3, 0), (3, 2, 0), (3, 5, 0), (3, 3, 0x4000_0000)] {
+                assert_eq!(create_file_w(wide("T:\\link").as_ptr(), 0x4000_0000, share, null(), disposition, flags, null_mut()), INVALID_HANDLE);
+                assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            }
+            let h = open("data");
+            let mut n = 1;
+            assert_eq!(write_file(h, b"x".as_ptr(), 1, &mut n, null_mut()), 0);
+            assert_eq!(n, 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(flush_file_buffers(h), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
         }
     }
 

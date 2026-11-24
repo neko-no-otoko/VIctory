@@ -192,22 +192,32 @@ directories. The loader attaches DLLs in dependency order and detaches in
 reverse order; cycles, forwarded exports, unsupported images and missing
 imports are rejected. DLLs are not searched for or loaded dynamically.
 
-Passing `--file-root /path/to/directory` enables a restricted synchronous
-read-only `kernel32.dll` file API for the executing thread. Relative paths
-and absolute DOS drive paths such as `G:\data\file` resolve under that one
-root; all ASCII drive letters are aliases, not separate mounts. Drive-relative,
-rooted, UNC and device-namespace paths, traversal and symlink components are
-rejected. Each component uses ASCII case-insensitive matching; non-ASCII bytes
-are not case folded. If multiple directory entries match, lookup fails with
-`ERROR_DUP_NAME`, even for an exact spelling. Lookup uses directory-relative
-`openat` with no-follow; concurrent directory mutations can race the ambiguity
-check, but cannot make it follow a symlink. File handles are closed when the
-execution scope ends.
-The API provides `CreateFileW`, `ReadFile`, `SetFilePointerEx`, `GetFileSizeEx`,
-`CloseHandle`, `GetLastError`, and `SetLastError`. Only regular files opened
-for reading with `OPEN_EXISTING` and `FILE_SHARE_READ` are supported; other
-access modes, creation modes, flags, and overlapped I/O are rejected. Windows
-sharing restrictions against external host processes are not enforced.
+Passing `--file-root /path/to/directory` enables restricted synchronous
+`kernel32.dll` file APIs for the executing thread. Relative paths and absolute
+DOS drive paths such as `G:\data\file` resolve under that read-only root.
+Optionally, `--save-root /path/to/saves` maps `T:\...` to a separate writable
+root; without it, `T:` remains a read-only alias like the other drive letters.
+The two roots must not overlap. Drive-relative, rooted, UNC and
+device-namespace paths, traversal and symlink components are rejected.
+
+Components match ASCII case-insensitively; non-ASCII bytes are not case
+folded. Multiple matching directory entries fail with `ERROR_DUP_NAME`, even
+for an exact spelling. Directory-relative `openat` uses no-follow. Save opens
+and creation use an advisory root lock to coordinate cooperating processes;
+the host must not mutate either root concurrently. The path and hard-link
+checks cannot prevent a hostile, uncooperative host process from changing
+the trees during an operation. File handles are thread-scoped and are closed
+when the execution scope ends.
+
+The API provides `CreateFileW`, `ReadFile`, `WriteFile`, `SetFilePointerEx`,
+`GetFileSizeEx`, `FlushFileBuffers`, `CloseHandle`, `GetLastError`, and
+`SetLastError`. Game files support only regular read-only `OPEN_EXISTING`
+with `FILE_SHARE_READ`. Save files support regular synchronous reads/writes,
+`OPEN_EXISTING`, `CREATE_NEW`, and `OPEN_ALWAYS`, with both `FILE_SHARE_READ`
+and `FILE_SHARE_WRITE`; writable hard-linked files are rejected. Truncation,
+deletion, other access/creation modes and flags, and overlapped I/O are not
+supported. Windows sharing restrictions against external host processes are
+not enforced.
 Without `--file-root`, these imports remain unresolved. This path binding is
 not a process sandbox: guest machine code and host callbacks execute
 unsandboxed and must be trusted.

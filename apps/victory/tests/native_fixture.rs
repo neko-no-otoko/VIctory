@@ -355,3 +355,135 @@ unsigned entry(void) {
     assert!(executed.status.success(), "{}", String::from_utf8_lossy(&executed.stderr));
     assert!(String::from_utf8_lossy(&executed.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&executed.stdout));
 }
+
+#[test]
+fn native_fixture_writes_only_to_separate_save_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    let save = dir.path().join("save");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::create_dir(&save).unwrap();
+    std::fs::write(game.join("game.bin"), b"game").unwrap();
+    std::fs::write(dir.path().join("outside.bin"), b"outside").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside.bin"), save.join("link")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), save.join("dirlink")).unwrap();
+    std::fs::hard_link(game.join("game.bin"), save.join("hardlink")).unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateFileW\nWriteFile\nReadFile\nSetFilePointerEx\nFlushFileBuffers\nCloseHandle\nGetLastError\n").unwrap();
+    std::fs::write(dir.path().join("save.c"), r#"
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef int BOOL;
+typedef unsigned short WCHAR;
+__declspec(dllimport) HANDLE CreateFileW(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE);
+__declspec(dllimport) BOOL WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
+__declspec(dllimport) BOOL ReadFile(HANDLE, void *, DWORD, DWORD *, void *);
+__declspec(dllimport) BOOL SetFilePointerEx(HANDLE, long long, long long *, DWORD);
+__declspec(dllimport) BOOL FlushFileBuffers(HANDLE);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) DWORD GetLastError(void);
+#define INVALID ((HANDLE)-1)
+#define READ 0x80000000UL
+#define WRITE 0x40000000UL
+#define SHARE 3
+#define NORMAL 0x80
+#define CREATE_NEW 1
+#define OPEN_EXISTING 3
+#define OPEN_ALWAYS 4
+static const WCHAR saved[] = {'T',':','\\','S','a','v','e','.','d','a','t',0};
+static const WCHAR folded[] = {'t',':','\\','s','A','V','E','.','D','A','T',0};
+static const WCHAR game[] = {'C',':','\\','g','a','m','e','.','b','i','n',0};
+static const WCHAR relative[] = {'g','a','m','e','.','b','i','n',0};
+static const WCHAR traversal[] = {'T',':','\\','.','.','\\','o','u','t','s','i','d','e','.','b','i','n',0};
+static const WCHAR link[] = {'T',':','\\','l','i','n','k',0};
+static const WCHAR dirlink[] = {'T',':','\\','d','i','r','l','i','n','k','\\','o','u','t','s','i','d','e','.','b','i','n',0};
+static const WCHAR hardlink[] = {'T',':','\\','h','a','r','d','l','i','n','k',0};
+int marker = 7; int *volatile relocated_marker = &marker;
+unsigned entry(void) {
+    HANDLE h;
+    DWORD n;
+    long long pos;
+    char buf[8];
+    unsigned long long overlapped[4] = {0};
+    if (*relocated_marker != 7) return 1;
+#ifdef CREATE
+    h = CreateFileW(saved, READ | WRITE, SHARE, 0, CREATE_NEW, NORMAL, 0);
+    if (h == INVALID || !h) return 2;
+    n = 99;
+    if (!WriteFile(h, "hello", 5, &n, 0) || n != 5) return 3;
+    if (!FlushFileBuffers(h)) return 4;
+    if (!SetFilePointerEx(h, 0, &pos, 0) || pos != 0) return 5;
+    if (!ReadFile(h, buf, 5, &n, 0) || n != 5 || buf[0] != 'h' || buf[4] != 'o') return 6;
+    if (WriteFile(h, "x", 1, &n, overlapped) || GetLastError() != 50) return 7;
+    if (!CloseHandle(h)) return 8;
+    if (WriteFile(h, "x", 1, &n, 0) || GetLastError() != 6) return 9;
+    if (FlushFileBuffers(h) || GetLastError() != 6) return 10;
+    if (CloseHandle(h) || GetLastError() != 6) return 11;
+#else
+    h = CreateFileW(folded, READ | WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0);
+    if (h == INVALID || !h) return 12;
+    if (!ReadFile(h, buf, 5, &n, 0) || n != 5 || buf[0] != 'h' || buf[4] != 'o') return 13;
+    if (!CloseHandle(h)) return 14;
+    h = CreateFileW(folded, WRITE, SHARE, 0, CREATE_NEW, NORMAL, 0);
+    if (h != INVALID || GetLastError() != 80) return 15;
+    h = CreateFileW(folded, READ | WRITE, SHARE, 0, OPEN_ALWAYS, NORMAL, 0);
+    if (h == INVALID || !h) return 16;
+    if (!CloseHandle(h)) return 17;
+    if (CreateFileW(game, WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 18;
+    if (CreateFileW(relative, WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 19;
+    if (CreateFileW(traversal, WRITE, SHARE, 0, CREATE_NEW, NORMAL, 0) != INVALID) return 20;
+    if (CreateFileW(link, WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 21;
+    if (CreateFileW(dirlink, WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 22;
+    if (CreateFileW(hardlink, WRITE, SHARE, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 23;
+    if (CreateFileW(saved, WRITE, 1, 0, OPEN_EXISTING, NORMAL, 0) != INVALID) return 24;
+    if (CreateFileW(saved, WRITE, SHARE, 0, OPEN_EXISTING, 0x40000000UL, 0) != INVALID) return 25;
+    if (CreateFileW(saved, WRITE, SHARE, 0, 2, NORMAL, 0) != INVALID) return 26;
+    if (CreateFileW(saved, WRITE, SHARE, 0, 5, NORMAL, 0) != INVALID) return 27;
+#endif
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    for (obj, exe, define) in [("create.obj", "create.exe", "-DCREATE"), ("verify.obj", "verify.exe", "")] {
+        let mut args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "save.c", "-o", obj];
+        if !define.is_empty() { args.push(define); }
+        tool(dir.path(), "x86_64-w64-mingw32-clang", &args);
+        tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", &format!("/out:{exe}"), obj, "kernel32.lib"]);
+    }
+    let create = dir.path().join("create.exe");
+    let verify = dir.path().join("verify.exe");
+    let run = |exe: &std::path::Path| cli(&["native-fixture".as_ref(), exe.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+    for exe in [&create, &verify] {
+        let output = run(exe);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+    }
+    assert_eq!(std::fs::read(save.join("Save.dat")).unwrap(), b"hello");
+    assert_eq!(std::fs::read(game.join("game.bin")).unwrap(), b"game");
+    assert_eq!(std::fs::read(dir.path().join("outside.bin")).unwrap(), b"outside");
+    let race_save = dir.path().join("race-save");
+    std::fs::create_dir(&race_save).unwrap();
+    let mut children = Vec::new();
+    for _ in 0..4 {
+        children.push(Command::new(env!("CARGO_BIN_EXE_victory"))
+            .args(["native-fixture".as_ref(), create.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), race_save.as_os_str(), "--execute".as_ref()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn());
+    }
+    let mut winners = 0;
+    for child in children {
+        let output = child.unwrap().wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("fixture entry returned 42") { winners += 1; }
+        else { assert!(stdout.contains("fixture entry returned 2"), "{stdout}"); }
+    }
+    assert_eq!(winners, 1);
+    assert_eq!(std::fs::read(race_save.join("Save.dat")).unwrap(), b"hello");
+    for (root, save_root) in [(&game, &game), (&game, &dir.path().to_path_buf()), (&dir.path().to_path_buf(), &save)] {
+        let output = cli(&["native-fixture".as_ref(), verify.as_os_str(), "--file-root".as_ref(), root.as_os_str(), "--save-root".as_ref(), save_root.as_os_str(), "--execute".as_ref()]);
+        assert!(!output.status.success(), "overlapping roots must be rejected");
+    }
+    let no_game = cli(&["native-fixture".as_ref(), verify.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+    assert!(!no_game.status.success(), "--save-root must require --file-root");
+}
