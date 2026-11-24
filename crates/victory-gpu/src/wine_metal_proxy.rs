@@ -79,7 +79,7 @@ struct Entry {
 #[derive(Clone)]
 enum Data {
     Device(Arc<Config>),
-    Heap(Arc<Mutex<Option<Arc<Buffer>>>>, TextureHeap),
+    Heap(Arc<Mutex<BufferHeap>>, TextureHeap),
     Sampler(Arc<Mutex<Option<bool>>>),
     Buffer(Arc<Buffer>),
     Pipeline(Arc<Vec<u8>>),
@@ -95,6 +95,7 @@ enum Data {
 struct Buffer {
     id: u64,
     state: Mutex<u32>,
+    allow_uav: bool,
     bytes: Box<[UnsafeCell<u8>]>,
 }
 impl Buffer {
@@ -104,6 +105,38 @@ impl Buffer {
     fn ptr(&self) -> *mut u8 {
         self.bytes.as_ptr().cast::<u8>() as *mut u8
     }
+}
+#[derive(Clone)]
+struct BufferView { buffer: Arc<Buffer>, offset: u32, length: u32 }
+#[derive(Clone)]
+enum BufferDescriptor { Srv(BufferView), Uav(BufferView) }
+struct BufferHeap { entries: Vec<Option<BufferDescriptor>>, generation: u64 }
+type ComputeHeap = Arc<Mutex<BufferHeap>>;
+
+fn buffer_handle(handle: u64) -> Option<(ComputeHeap, usize)> {
+    let map = objects().lock().unwrap();
+    map.iter().find_map(|(&base, entry)| {
+        let Data::Heap(heap, _) = &entry.data else { return None; };
+        let index = handle.checked_sub(base as u64)?;
+        if index < heap.lock().unwrap().entries.len() as u64 {
+            Some((heap.clone(), index as usize))
+        } else { None }
+    })
+}
+fn raw_view(buffer: Arc<Buffer>, first: u64, elements: u32) -> Option<BufferView> {
+    let offset = first.checked_mul(4)?;
+    let length = u64::from(elements).checked_mul(4)?;
+    if length == 0 || offset.checked_add(length)? > buffer.len() as u64 { return None; }
+    Some(BufferView { buffer, offset: u32::try_from(offset).ok()?, length: u32::try_from(length).ok()? })
+}
+extern "system" fn descriptor_increment(this: This, kind: u32) -> u32 {
+    if device(this).is_none() || kind > 3 { trap("invalid descriptor heap type"); }
+    1
+}
+fn write_buffer_descriptor(heap: &ComputeHeap, index: usize, descriptor: BufferDescriptor) {
+    let mut heap = heap.lock().unwrap();
+    heap.entries[index] = Some(descriptor);
+    heap.generation = heap.generation.checked_add(1).expect("descriptor generation overflow");
 }
 // Guest access to mapped memory and queue submission must be synchronized by
 // the guest, as with an ordinary persistently mapped D3D resource.
@@ -164,8 +197,11 @@ struct GraphicsState {
 #[derive(Clone)]
 struct Job {
     shader: Arc<Vec<u8>>,
-    heap: Arc<Mutex<Option<Arc<Buffer>>>>,
+    heap: ComputeHeap,
+    generation: u64,
     buffer: Arc<Buffer>,
+    srv: Option<BufferView>,
+    uav: BufferView,
     constants: Vec<u32>,
     cbv: Option<RootCbv>,
     groups: [u32; 3],
@@ -182,7 +218,7 @@ struct ListState {
     closed: bool,
     invalid: bool,
     pipeline: Option<Arc<Vec<u8>>>,
-    heap: Option<(usize, Arc<Mutex<Option<Arc<Buffer>>>>)>,
+    heap: Option<(usize, ComputeHeap)>,
     table: bool,
     constants: Vec<Option<u32>>,
     cbv: Option<RootCbv>,
@@ -353,6 +389,7 @@ static DEVICE_TABLE: Table<160> = {
     t[11] = create_pipeline as *const ();
     t[12] = create_list as *const ();
     t[14] = create_heap as *const ();
+    t[15] = descriptor_increment as *const ();
     t[20] = create_rtv as *const ();
     t[21] = create_dsv as *const ();
     t[18] = create_srv as *const ();
@@ -486,20 +523,20 @@ extern "system" fn create_heap(this: This, d: *const HeapDesc, iid: *const Iid, 
     let Some(d) = (unsafe { d.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if device(this).is_none() || d.count != 1 || d.nodes != 0 {
+    if device(this).is_none() || d.count == 0 || d.count > 2 || d.nodes != 0 {
         return E_INVALIDARG;
     }
-    if d.kind == 2 && d.flags == 0 {
+    if d.kind == 2 && d.flags == 0 && d.count == 1 {
         return new(Data::Rtv(Arc::new(Mutex::new((None, 0)))), &HEAP_TABLE, iid, HEAP, out);
     }
-    if d.kind == 3 && d.flags == 0 {
+    if d.kind == 3 && d.flags == 0 && d.count == 1 {
         return new(Data::Dsv(Arc::new(Mutex::new((None, 0)))), &HEAP_TABLE, iid, HEAP, out);
     }
-    if d.kind == 1 && d.flags == 1 {
+    if d.kind == 1 && d.flags == 1 && d.count == 1 {
         return new(Data::Sampler(Arc::new(Mutex::new(None))), &HEAP_TABLE, iid, HEAP, out);
     }
     if d.kind != 0 || d.flags != 1 { return E_INVALIDARG; }
-    new(Data::Heap(Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))), &HEAP_TABLE, iid, HEAP, out)
+    new(Data::Heap(Arc::new(Mutex::new(BufferHeap { entries: vec![None; d.count as usize], generation: 0 })), Arc::new(Mutex::new(None))), &HEAP_TABLE, iid, HEAP, out)
 }
 extern "system" fn heap_handle(this: This) -> u64 {
     if !matches!(data(this), Some(Data::Heap(..)) | Some(Data::Sampler(_)) | Some(Data::Rtv(_)) | Some(Data::Dsv(_))) {
@@ -614,17 +651,17 @@ extern "system" fn create_resource(
             let Ok(len) = usize::try_from(layout.size) else { return E_INVALIDARG; };
             if len == 0 || len > MAX_BUFFER || layout.planes.len() != 1 { return E_INVALIDARG; }
             let bytes = (0..len).map(|_| UnsafeCell::new(0)).collect::<Vec<_>>().into_boxed_slice();
-            Some((Buffer { id: 0, state: Mutex::new(state), bytes }, layout))
+            Some((Buffer { id: 0, state: Mutex::new(state), allow_uav: false, bytes }, layout))
         } else { None };
         let bytes = if tiled.is_some() { Vec::new() } else { vec![0; size] };
         return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), state: Mutex::new(state), bytes: Mutex::new(bytes), tiled })), &BUFFER_TABLE, iid, RESOURCE, out);
     }
     if r.dimension != 1 || r.mips != 1 || r.width > MAX_BUFFER as u64 || r.height != 1 || r.format != 0
-        || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 1 | 0x400 | 0x800) {
+        || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 1 | 8 | 0x40 | 0x400 | 0x800) {
         return E_INVALIDARG;
     }
     let bytes = (0..r.width).map(|_| UnsafeCell::new(0)).collect::<Vec<_>>().into_boxed_slice();
-    new(Data::Buffer(Arc::new(Buffer { id: resource_id(), state: Mutex::new(state), bytes })), &BUFFER_TABLE, iid, RESOURCE, out)
+    new(Data::Buffer(Arc::new(Buffer { id: resource_id(), state: Mutex::new(state), allow_uav: r.flags & 4 != 0, bytes })), &BUFFER_TABLE, iid, RESOURCE, out)
 }
 #[repr(C)]
 struct Range {
@@ -677,20 +714,35 @@ extern "system" fn create_uav(
     desc: *const UavDesc,
     handle: u64,
 ) {
-    let (Some(Data::Buffer(b)), Some(Data::Heap(h, _)), Some(d)) =
-        (data(res), data(handle as This), unsafe { desc.as_ref() })
-    else {
-        trap("invalid UAV arguments");
-    };
-    if device(this).is_none() || !counter.is_null() || d.format != 39 || d.dimension != 1
-        || d.first != 0 || d.elements as usize * 4 != b.len() || d.stride != 0
-        || d.counter != 0 || d.flags != 1
-    {
-        trap("unsupported UAV view");
+    let (Some(Data::Buffer(b)), Some((h, index)), Some(d)) =
+        (data(res), buffer_handle(handle), unsafe { desc.as_ref() })
+    else { trap("invalid UAV arguments"); };
+    if device(this).is_none() || !b.allow_uav || !counter.is_null() || d.format != 39 || d.dimension != 1
+        || d.stride != 0 || d.counter != 0 || d.flags != 1
+        || index != h.lock().unwrap().entries.len() - 1
+    { trap("unsupported UAV view"); }
+    let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid UAV range"); };
+    if h.lock().unwrap().entries.len() == 1 && (view.offset != 0 || view.length as usize != view.buffer.len()) {
+        trap("legacy UAV must cover the buffer");
     }
-    *h.lock().unwrap() = Some(b);
+    write_buffer_descriptor(&h, index, BufferDescriptor::Uav(view));
+}
+#[repr(C)]
+struct BufferSrvDesc {
+    format: u32, dimension: u32, mapping: u32, padding: std::mem::MaybeUninit<u32>,
+    first: u64, elements: u32, stride: u32, flags: u32,
 }
 extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle: u64) {
+    if let Some(Data::Buffer(b)) = data(res) {
+        let (Some((h, index)), Some(d)) = (buffer_handle(handle), unsafe { desc.cast::<BufferSrvDesc>().as_ref() })
+            else { trap("invalid buffer SRV"); };
+        if device(this).is_none() || h.lock().unwrap().entries.len() != 2 || index != 0
+            || d.format != 39 || d.dimension != 1 || d.mapping != 5768 || d.stride != 0 || d.flags != 1
+        { trap("unsupported buffer SRV"); }
+        let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid SRV range"); };
+        write_buffer_descriptor(&h, index, BufferDescriptor::Srv(view));
+        return;
+    }
     let (Some(Data::Texture(t)), Some(Data::Heap(_, h))) = (data(res), data(handle as This)) else { trap("invalid SRV"); };
     if device(this).is_none() || !matches!(t.format, 28 | 71 | 72 | 77 | 78) { trap("unsupported SRV"); }
     let (first_mip, mip_count) = if desc.is_null() {
@@ -1022,20 +1074,29 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
     if l.closed {
         trap("closed list");
     }
-    let heap = l.heap.as_ref().map(|h| h.1.clone());
-    let buffer = heap.as_ref().and_then(|h| h.lock().unwrap().clone());
+    let Some(heap) = l.heap.as_ref().map(|h| h.1.clone()) else { l.invalid = true; return; };
+    let (generation, srv, uav) = {
+        let h = heap.lock().unwrap();
+        match h.entries.as_slice() {
+            [Some(BufferDescriptor::Uav(uav))] => (h.generation, None, uav.clone()),
+            [Some(BufferDescriptor::Srv(srv)), Some(BufferDescriptor::Uav(uav))] =>
+                (h.generation, Some(srv.clone()), uav.clone()),
+            _ => { l.invalid = true; return; }
+        }
+    };
     let constants: Option<Vec<u32>> = l.constants.iter().copied().collect();
     if l.kind != 2 || x == 0 || y == 0 || z == 0 || !l.table || l.pipeline.is_none()
-        || buffer.is_none() || constants.is_none()
-        || l.cbv.as_ref().zip(buffer.as_ref()).is_some_and(|(cbv, uav)| Arc::ptr_eq(&cbv.buffer, uav))
-    {
-        l.invalid = true;
-        return;
-    }
+        || constants.is_none() || (srv.is_some() && l.cbv.is_some())
+        || srv.as_ref().is_some_and(|v| Arc::ptr_eq(&v.buffer, &uav.buffer))
+        || l.cbv.as_ref().is_some_and(|cbv| Arc::ptr_eq(&cbv.buffer, &uav.buffer))
+    { l.invalid = true; return; }
     let job = Job {
         shader: l.pipeline.as_ref().unwrap().clone(),
-        heap: heap.unwrap(),
-        buffer: buffer.unwrap(),
+        heap,
+        generation,
+        buffer: uav.buffer.clone(),
+        srv,
+        uav,
         constants: constants.unwrap(),
         cbv: l.cbv.clone(),
         groups: [x, y, z],
@@ -1044,6 +1105,12 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
 }
 fn run(c: &Config, j: &Job) -> Result<(), String> {
     // Snapshot at execution, after earlier queued jobs have updated resources.
+    if !matches!(*j.buffer.state.lock().unwrap(), 0 | 8) {
+        return Err("UAV requires COMMON or UNORDERED_ACCESS state".into());
+    }
+    if j.srv.as_ref().is_some_and(|v| !matches!(*v.buffer.state.lock().unwrap(), 0 | 0x40)) {
+        return Err("SRV requires COMMON or NON_PIXEL_SHADER_RESOURCE state".into());
+    }
     if let Some(binding) = &j.cbv {
         if !matches!(*binding.buffer.state.lock().unwrap(), 0 | 1) {
             return Err("root CBV requires COMMON or VERTEX_AND_CONSTANT_BUFFER state".into());
@@ -1061,13 +1128,18 @@ fn run(c: &Config, j: &Job) -> Result<(), String> {
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     for v in [
-        MAGIC, if cbv.is_some() { 6 } else { 1 }, j.shader.len() as u32, j.buffer.len() as u32, j.constants.len() as u32,
+        MAGIC, if j.srv.is_some() { 7 } else if cbv.is_some() { 6 } else { 1 }, j.shader.len() as u32, j.buffer.len() as u32, j.constants.len() as u32,
         j.groups[0], j.groups[1], j.groups[2],
     ] {
         s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
     }
     let input = unsafe { std::slice::from_raw_parts(j.buffer.ptr(), j.buffer.len()) };
     s.write_all(&c.token).map_err(|e| e.to_string())?;
+    if let Some(srv) = &j.srv {
+        for value in [srv.buffer.len() as u32, srv.offset, srv.length, j.uav.offset, j.uav.length] {
+            s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
     if let Some((slot, bytes)) = &cbv {
         s.write_all(&slot.to_le_bytes())
             .and_then(|_| s.write_all(&(bytes.len() as u32).to_le_bytes()))
@@ -1080,6 +1152,10 @@ fn run(c: &Config, j: &Job) -> Result<(), String> {
         s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
     }
     if let Some((_, bytes)) = &cbv {
+        s.write_all(bytes).map_err(|e| e.to_string())?;
+    }
+    if let Some(srv) = &j.srv {
+        let bytes = unsafe { std::slice::from_raw_parts(srv.buffer.ptr(), srv.buffer.len()) };
         s.write_all(bytes).map_err(|e| e.to_string())?;
     }
     let mut header = [0u8; 16];
@@ -1111,8 +1187,8 @@ fn perform_queue_op(queue: &ProxyQueue, op: QueueOp) -> Result<(), String> {
             let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
             for job in &jobs {
                 let descriptor = job.heap.lock().unwrap_or_else(|e| e.into_inner());
-                if !descriptor.as_ref().is_some_and(|buffer| Arc::ptr_eq(buffer, &job.buffer)) {
-                    return Err("UAV descriptor changed after dispatch".into());
+                if descriptor.generation != job.generation {
+                    return Err("buffer descriptor changed after dispatch".into());
                 }
                 run(&queue.config, job)?;
             }

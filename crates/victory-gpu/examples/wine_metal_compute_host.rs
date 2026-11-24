@@ -37,7 +37,7 @@ mod host {
     fn compute_request(
         stream: &mut TcpStream,
         fields: [u32; 8],
-        cache: &mut Option<(Vec<u8>, victory_gpu::WineMetalCompute)>,
+        cache: &mut Option<(Vec<u8>, bool, victory_gpu::WineMetalCompute)>,
     ) -> Result<Vec<u8>, String> {
         let shader_len = fields[2] as usize;
         let buffer_len = fields[3] as usize;
@@ -55,6 +55,21 @@ mod host {
         } else {
             None
         };
+        let raw_info = if fields[1] == 7 {
+            let mut bytes = [0; 20];
+            stream.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            let words: [usize; 5] = std::array::from_fn(|i| word(&bytes[i * 4..i * 4 + 4]) as usize);
+            let [input_len, srv_offset, srv_len, uav_offset, uav_len] = words;
+            if input_len == 0 || input_len > MAX_BUFFER
+                || srv_len == 0 || srv_offset.checked_add(srv_len).is_none_or(|end| end > input_len)
+                || uav_len == 0 || uav_offset.checked_add(uav_len).is_none_or(|end| end > buffer_len)
+            {
+                return Err("invalid raw buffer view".into());
+            }
+            Some((input_len, (srv_offset, srv_len), (uav_offset, uav_len)))
+        } else {
+            None
+        };
         let mut shader = vec![0; shader_len];
         let mut buffer = vec![0; buffer_len];
         let mut constant_bytes = vec![0; count * 4];
@@ -63,15 +78,24 @@ mod host {
         stream.read_exact(&mut constant_bytes).map_err(|e| e.to_string())?;
         let mut cbv = vec![0; cbv_info.map_or(0, |(_, len)| len)];
         stream.read_exact(&mut cbv).map_err(|e| e.to_string())?;
+        let mut input = vec![0; raw_info.map_or(0, |(len, _, _)| len)];
+        stream.read_exact(&mut input).map_err(|e| e.to_string())?;
         let constants: Vec<u32> = constant_bytes.chunks_exact(4).map(word).collect();
-        if cache.as_ref().is_none_or(|(cached, _)| *cached != shader) {
+        let raw = raw_info.is_some();
+        if cache.as_ref().is_none_or(|(cached, cached_raw, _)| *cached != shader || *cached_raw != raw) {
             // Drop the old pipeline before constructing a replacement.
             *cache = None;
-            let pipeline = victory_gpu::WineMetalCompute::new(&shader)?;
-            *cache = Some((shader, pipeline));
+            let pipeline = if raw {
+                victory_gpu::WineMetalCompute::new_raw_views(&shader)?
+            } else {
+                victory_gpu::WineMetalCompute::new(&shader)?
+            };
+            *cache = Some((shader, raw, pipeline));
         }
-        let pipeline = &mut cache.as_mut().expect("pipeline was prepared").1;
-        if let Some((slot, _)) = cbv_info {
+        let pipeline = &mut cache.as_mut().expect("pipeline was prepared").2;
+        if let Some((_, srv, uav)) = raw_info {
+            pipeline.dispatch_raw_views(&mut buffer, &input, srv, uav, &constants, groups)?;
+        } else if let Some((slot, _)) = cbv_info {
             pipeline.dispatch_with_root_cbv(&mut buffer, &constants, groups, slot, &cbv)?;
         } else {
             pipeline.dispatch(&mut buffer, &constants, groups)?;
@@ -160,16 +184,16 @@ mod host {
     fn request(
         stream: &mut TcpStream,
         expected_token: &[u8; 16],
-        cache: &mut Option<(Vec<u8>, victory_gpu::WineMetalCompute)>,
+        cache: &mut Option<(Vec<u8>, bool, victory_gpu::WineMetalCompute)>,
         presentation_enabled: bool,
     ) -> Result<Vec<u8>, String> {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7) {
             return Err("invalid protocol header".into());
         }
-        if matches!(fields[1], 1 | 6) {
+        if matches!(fields[1], 1 | 6 | 7) {
             let shader_len = fields[2] as usize;
             let buffer_len = fields[3] as usize;
             if shader_len == 0 || shader_len > MAX_SHADER || buffer_len == 0
@@ -189,7 +213,7 @@ mod host {
             return Err("authentication failed".into());
         }
         match fields[1] {
-            1 | 6 => compute_request(stream, fields, cache),
+            1 | 6 | 7 => compute_request(stream, fields, cache),
             2 => graphics_request(stream, fields),
             5 => {
                 let mut payload = vec![0; fields[2] as usize];

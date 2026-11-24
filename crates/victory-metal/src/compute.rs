@@ -30,6 +30,23 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
+    fn victory_metal_compute_dispatch_raw_views(
+        handle: *mut c_void,
+        output: *mut u8,
+        output_len: usize,
+        input: *const u8,
+        input_len: usize,
+        srv_offset: usize,
+        srv_len: usize,
+        uav_offset: usize,
+        uav_len: usize,
+        constants: *const u32,
+        constant_bytes: usize,
+        groups: *const u32,
+        threads: *const u32,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> bool;
     fn victory_metal_compute_destroy(handle: *mut c_void);
 }
 
@@ -82,6 +99,49 @@ impl Compute {
         threads: [u32; 3],
     ) -> Result<(), String> {
         self.dispatch_impl(buffer, constants, groups, threads, None)
+    }
+
+    /// Dispatches with a raw SRV and UAV at resource heap indices 0 and 1.
+    /// View offsets and lengths are in bytes relative to their respective buffers.
+    pub fn dispatch_raw_views(
+        &mut self,
+        output: &mut [u8],
+        input: &[u8],
+        srv: (usize, usize),
+        uav: (usize, usize),
+        constants: &[u32],
+        groups: [u32; 3],
+        threads: [u32; 3],
+    ) -> Result<(), String> {
+        if output.is_empty() || input.is_empty()
+            || output.len() > u32::MAX as usize || input.len() > u32::MAX as usize
+        {
+            return Err("buffer size must be nonzero and fit in 32 bits".into());
+        }
+        if srv.1 == 0 || srv.0.checked_add(srv.1).is_none_or(|end| end > input.len())
+            || uav.1 == 0 || uav.0.checked_add(uav.1).is_none_or(|end| end > output.len())
+        {
+            return Err("raw view must be nonempty and contained in its buffer".into());
+        }
+        if constants.len() < 4 || constants.len() % 4 != 0
+            || constants.len() > (u32::MAX / 4) as usize
+        {
+            return Err("constant size must be at least 16 bytes, a multiple of 16 bytes, and fit in 32 bits".into());
+        }
+        if groups.contains(&0) || threads.contains(&0) {
+            return Err("group and thread dimensions must be nonzero".into());
+        }
+        let mut error = [0 as c_char; 1024];
+        // The native call synchronously uploads both buffers and copies output back.
+        let ok = unsafe {
+            victory_metal_compute_dispatch_raw_views(
+                self.handle.as_ptr(), output.as_mut_ptr(), output.len(), input.as_ptr(),
+                input.len(), srv.0, srv.1, uav.0, uav.1, constants.as_ptr(),
+                constants.len() * 4, groups.as_ptr(), threads.as_ptr(), error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
     /// Dispatches with a root CBV at the argument offset returned by

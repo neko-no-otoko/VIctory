@@ -14,6 +14,7 @@ static bool compute_fail(char *dst, size_t len, NSString *message) {
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
 @property(nonatomic, strong) id<MTLBuffer> dataBuffer;
+@property(nonatomic, strong) id<MTLBuffer> inputBuffer;
 @property(nonatomic, strong) id<MTLBuffer> constantBuffer;
 @property(nonatomic, strong) id<MTLBuffer> rootCBVBuffer;
 @property(nonatomic, strong) id<MTLBuffer> resourceHeap;
@@ -47,7 +48,7 @@ void *victory_metal_compute_create(const uint8_t *bytes, size_t len, const char 
         c.pipeline = [c.device newComputePipelineStateWithFunction:function error:&e];
         if (!c.pipeline) FAIL(e.localizedDescription ?: @"compute pipeline creation failed");
         c.queue = [c.device newCommandQueue];
-        c.resourceHeap = [c.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
+        c.resourceHeap = [c.device newBufferWithLength:48 options:MTLResourceStorageModeShared];
         c.arguments = [c.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
         if (!c.queue || !c.resourceHeap || !c.arguments) FAIL(@"compute queue or descriptor allocation failed");
 #undef FAIL
@@ -55,11 +56,13 @@ void *victory_metal_compute_create(const uint8_t *bytes, size_t len, const char 
     }
 }
 
-bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer_len,
-                                    const uint32_t *constants, size_t constant_bytes,
-                                    const uint8_t *cbv, size_t cbv_len, size_t cbv_offset,
-                                    const uint32_t *groups, const uint32_t *threads,
-                                    char *error, size_t error_len) {
+static bool compute_dispatch(void *handle, uint8_t *buffer, size_t buffer_len,
+                             const uint8_t *input, size_t input_len,
+                             size_t srv_offset, size_t srv_len, size_t uav_offset, size_t uav_len,
+                             const uint32_t *constants, size_t constant_bytes,
+                             const uint8_t *cbv, size_t cbv_len, size_t cbv_offset,
+                             const uint32_t *groups, const uint32_t *threads,
+                             char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalCompute *c = (__bridge VictoryMetalCompute *)handle;
@@ -72,6 +75,10 @@ bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer
                      cbv_offset > SIZE_MAX - 24)) ||
             (!cbv && (cbv_len || cbv_offset)))
             return compute_fail(error, error_len, @"invalid compute root CBV arguments");
+        if (input && (!input_len || input_len > UINT32_MAX || !srv_len || !uav_len ||
+                      srv_offset > input_len || srv_len > input_len - srv_offset ||
+                      uav_offset > buffer_len || uav_len > buffer_len - uav_offset))
+            return compute_fail(error, error_len, @"invalid raw compute buffer views");
         size_t argument_len = cbv && cbv_offset + 24 > 24 ? cbv_offset + 24 : 24;
         if (argument_len > c.device.maxBufferLength)
             return compute_fail(error, error_len, @"compute argument buffer exceeds Metal device limit");
@@ -84,6 +91,11 @@ bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer
             id<MTLBuffer> replacement = [c.device newBufferWithLength:buffer_len options:MTLResourceStorageModeShared];
             if (!replacement) return compute_fail(error, error_len, @"compute data buffer allocation failed");
             c.dataBuffer = replacement;
+        }
+        if (input && c.inputBuffer.length < input_len) {
+            id<MTLBuffer> replacement = [c.device newBufferWithLength:input_len options:MTLResourceStorageModeShared];
+            if (!replacement) return compute_fail(error, error_len, @"compute input buffer allocation failed");
+            c.inputBuffer = replacement;
         }
         if (c.constantBuffer.length < constant_bytes) {
             id<MTLBuffer> replacement = [c.device newBufferWithLength:constant_bytes options:MTLResourceStorageModeShared];
@@ -101,11 +113,20 @@ bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer
             c.arguments = replacement;
         }
         memcpy(c.dataBuffer.contents, buffer, buffer_len);
+        if (input) memcpy(c.inputBuffer.contents, input, input_len);
         memcpy(c.constantBuffer.contents, constants, constant_bytes);
         if (cbv) memcpy(c.rootCBVBuffer.contents, cbv, cbv_len);
         // IRDescriptorTableEntry: GPU address, texture ID, and byte length.
         uint64_t *heap = c.resourceHeap.contents;
-        heap[0] = c.dataBuffer.gpuAddress; heap[1] = 0; heap[2] = buffer_len;
+        if (input) {
+            if (c.inputBuffer.gpuAddress > UINT64_MAX - srv_offset ||
+                c.dataBuffer.gpuAddress > UINT64_MAX - uav_offset)
+                return compute_fail(error, error_len, @"compute view GPU address overflow");
+            heap[0] = c.inputBuffer.gpuAddress + srv_offset; heap[1] = 0; heap[2] = srv_len;
+            heap[3] = c.dataBuffer.gpuAddress + uav_offset; heap[4] = 0; heap[5] = uav_len;
+        } else {
+            heap[0] = c.dataBuffer.gpuAddress; heap[1] = 0; heap[2] = buffer_len;
+        }
         memset(c.arguments.contents, 0, argument_len);
         if (!cbv || cbv_offset >= 24) {
             uint64_t *args = c.arguments.contents;
@@ -124,6 +145,7 @@ bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer
         [encoder setBuffer:c.arguments offset:0 atIndex:2];
         // GPU addresses in descriptors are indirect: explicitly declare residency.
         [encoder useResource:c.dataBuffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        if (input) [encoder useResource:c.inputBuffer usage:MTLResourceUsageRead];
         [encoder useResource:c.constantBuffer usage:MTLResourceUsageRead];
         if (cbv) [encoder useResource:c.rootCBVBuffer usage:MTLResourceUsageRead];
         [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
@@ -136,6 +158,30 @@ bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer
         memcpy(buffer, c.dataBuffer.contents, buffer_len);
         return true;
     }
+}
+
+bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer_len,
+                                    const uint32_t *constants, size_t constant_bytes,
+                                    const uint8_t *cbv, size_t cbv_len, size_t cbv_offset,
+                                    const uint32_t *groups, const uint32_t *threads,
+                                    char *error, size_t error_len) {
+    return compute_dispatch(handle, buffer, buffer_len, NULL, 0, 0, 0, 0, 0,
+                            constants, constant_bytes, cbv, cbv_len, cbv_offset,
+                            groups, threads, error, error_len);
+}
+
+bool victory_metal_compute_dispatch_raw_views(void *handle, uint8_t *output, size_t output_len,
+                                              const uint8_t *input, size_t input_len,
+                                              size_t srv_offset, size_t srv_len,
+                                              size_t uav_offset, size_t uav_len,
+                                              const uint32_t *constants, size_t constant_bytes,
+                                              const uint32_t *groups, const uint32_t *threads,
+                                              char *error, size_t error_len) {
+    if (!input) return compute_fail(error, error_len, @"invalid compute input buffer");
+    return compute_dispatch(handle, output, output_len, input, input_len,
+                            srv_offset, srv_len, uav_offset, uav_len,
+                            constants, constant_bytes, NULL, 0, 0,
+                            groups, threads, error, error_len);
 }
 
 void victory_metal_compute_destroy(void *handle) {
