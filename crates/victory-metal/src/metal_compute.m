@@ -1,0 +1,117 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <stdint.h>
+#import <stdio.h>
+#import <string.h>
+
+static bool compute_fail(char *dst, size_t len, NSString *message) {
+    if (len) snprintf(dst, len, "%s", message.UTF8String ?: "Metal compute error");
+    return false;
+}
+
+@interface VictoryMetalCompute : NSObject
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) id<MTLCommandQueue> queue;
+@property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
+@property(nonatomic, strong) id<MTLBuffer> dataBuffer;
+@property(nonatomic, strong) id<MTLBuffer> constantBuffer;
+@property(nonatomic, strong) id<MTLBuffer> resourceHeap;
+@property(nonatomic, strong) id<MTLBuffer> arguments;
+@end
+@implementation VictoryMetalCompute
+@end
+
+void *victory_metal_compute_create(const uint8_t *bytes, size_t len, const char *entry,
+                                   char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+#define FAIL(message) do { compute_fail(error, error_len, (message)); return NULL; } while (0)
+        VictoryMetalCompute *c = [VictoryMetalCompute new];
+        c.device = MTLCreateSystemDefaultDevice();
+        if (!c.device) FAIL(@"no Metal device");
+        if (c.device.argumentBuffersSupport != MTLArgumentBuffersTier2)
+            FAIL(@"compute resource heap requires argument buffers tier 2");
+        NSData *owned = [NSData dataWithBytes:bytes length:len];
+        if (!owned) FAIL(@"metallib allocation failed");
+        dispatch_data_t data = dispatch_data_create(owned.bytes, owned.length,
+                                                    dispatch_get_main_queue(), ^{ (void)owned; });
+        if (!data) FAIL(@"metallib dispatch data allocation failed");
+        NSError *e = nil;
+        id<MTLLibrary> library = [c.device newLibraryWithData:data error:&e];
+        if (!library) FAIL(e.localizedDescription ?: @"compute library loading failed");
+        NSString *name = [NSString stringWithUTF8String:entry];
+        if (!name) FAIL(@"invalid compute entry name");
+        id<MTLFunction> function = [library newFunctionWithName:name];
+        if (!function) FAIL(@"compute function not found");
+        c.pipeline = [c.device newComputePipelineStateWithFunction:function error:&e];
+        if (!c.pipeline) FAIL(e.localizedDescription ?: @"compute pipeline creation failed");
+        c.queue = [c.device newCommandQueue];
+        c.resourceHeap = [c.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
+        c.arguments = [c.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
+        if (!c.queue || !c.resourceHeap || !c.arguments) FAIL(@"compute queue or descriptor allocation failed");
+#undef FAIL
+        return (__bridge_retained void *)c;
+    }
+}
+
+bool victory_metal_compute_dispatch(void *handle, uint8_t *buffer, size_t buffer_len,
+                                    const uint32_t *constants, size_t constant_bytes,
+                                    const uint32_t *groups, const uint32_t *threads,
+                                    char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalCompute *c = (__bridge VictoryMetalCompute *)handle;
+        if (!c || !buffer || !constants || !groups || !threads || !buffer_len ||
+            buffer_len > UINT32_MAX || constant_bytes < 16 || constant_bytes % 16 ||
+            constant_bytes > UINT32_MAX || !groups[0] || !groups[1] || !groups[2] ||
+            !threads[0] || !threads[1] || !threads[2])
+            return compute_fail(error, error_len, @"invalid compute dispatch arguments");
+        MTLSize maximum = c.device.maxThreadsPerThreadgroup;
+        if (threads[0] > maximum.width || threads[1] > maximum.height || threads[2] > maximum.depth ||
+            (uint64_t)threads[0] * threads[1] > c.pipeline.maxTotalThreadsPerThreadgroup ||
+            (uint64_t)threads[0] * threads[1] * threads[2] > c.pipeline.maxTotalThreadsPerThreadgroup)
+            return compute_fail(error, error_len, @"threadgroup dimensions exceed Metal pipeline limits");
+        if (c.dataBuffer.length < buffer_len) {
+            id<MTLBuffer> replacement = [c.device newBufferWithLength:buffer_len options:MTLResourceStorageModeShared];
+            if (!replacement) return compute_fail(error, error_len, @"compute data buffer allocation failed");
+            c.dataBuffer = replacement;
+        }
+        if (c.constantBuffer.length < constant_bytes) {
+            id<MTLBuffer> replacement = [c.device newBufferWithLength:constant_bytes options:MTLResourceStorageModeShared];
+            if (!replacement) return compute_fail(error, error_len, @"compute constant buffer allocation failed");
+            c.constantBuffer = replacement;
+        }
+        memcpy(c.dataBuffer.contents, buffer, buffer_len);
+        memcpy(c.constantBuffer.contents, constants, constant_bytes);
+        // IRDescriptorTableEntry: GPU address, texture ID, and byte length.
+        uint64_t *heap = c.resourceHeap.contents;
+        heap[0] = c.dataBuffer.gpuAddress; heap[1] = 0; heap[2] = buffer_len;
+        uint64_t *args = c.arguments.contents;
+        args[0] = c.constantBuffer.gpuAddress; args[1] = 0; args[2] = constant_bytes;
+        id<MTLCommandBuffer> command = [c.queue commandBuffer];
+        if (!command) return compute_fail(error, error_len, @"compute command buffer creation failed");
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return compute_fail(error, error_len, @"compute encoder creation failed");
+        [encoder setComputePipelineState:c.pipeline];
+        [encoder setBuffer:c.resourceHeap offset:0 atIndex:0];
+        [encoder setBuffer:c.arguments offset:0 atIndex:2];
+        // GPU addresses in descriptors are indirect: explicitly declare residency.
+        [encoder useResource:c.dataBuffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [encoder useResource:c.constantBuffer usage:MTLResourceUsageRead];
+        [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
+               threadsPerThreadgroup:MTLSizeMake(threads[0], threads[1], threads[2])];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return compute_fail(error, error_len, command.error.localizedDescription ?: @"compute command failed");
+        memcpy(buffer, c.dataBuffer.contents, buffer_len);
+        return true;
+    }
+}
+
+void victory_metal_compute_destroy(void *handle) {
+    @autoreleasepool {
+        if (handle) { (void)(__bridge_transfer VictoryMetalCompute *)handle; }
+    }
+}
