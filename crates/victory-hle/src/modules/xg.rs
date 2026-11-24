@@ -21,24 +21,8 @@ use crate::{HleModule, hle_export};
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
-/// `D3D12_RESOURCE_DESC`, whose layout field carries `0x100 | swizzle
-/// mode` on the console (1 row major, 0 "pick one").
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ResourceDesc {
-    pub dimension: u32,
-    pub alignment: u64,
-    pub width: u64,
-    pub height: u32,
-    pub depth_or_array: u16,
-    pub mips: u16,
-    pub format: u32,
-    pub samples: u32,
-    pub quality: u32,
-    pub layout: u32,
-    pub flags: u32,
-}
-const _: () = assert!(size_of::<ResourceDesc>() == 0x38);
+pub use victory_xg::ResourceDesc;
+use victory_xg::suggested;
 
 const SWIZZLED: u32 = 0x100;
 const ROW_MAJOR: u32 = 1;
@@ -47,25 +31,6 @@ const ALLOW_DEPTH_STENCIL: u32 = 2;
 const TEXTURE_1D: u32 = 2;
 const TEXTURE_3D: u32 = 4;
 
-/// The mode the console's library picks for a description: linear for 1D,
-/// the XOR render and depth modes for targets, else 4 KiB standard
-/// (`.ttpf` textures without a mode of their own use it).
-///
-/// shortcut: the rule of the library's older optimal-mode function (any
-/// size, 2D, 3D and cubes alike); `XGSuggestSwizzleMode` itself is newer
-/// than every copy we could check. Revisit if streamed textures come out
-/// scrambled.
-fn suggested(desc: &ResourceDesc) -> Swizzle {
-    if desc.dimension == TEXTURE_1D {
-        Swizzle::LINEAR
-    } else if desc.flags & ALLOW_DEPTH_STENCIL != 0 {
-        Swizzle::SW_64KB_Z_X
-    } else if desc.flags & ALLOW_RENDER_TARGET != 0 {
-        Swizzle::SW_64KB_R_X
-    } else {
-        Swizzle::SW_4KB_S
-    }
-}
 
 /// `(desc, flags, out layout)`; the title passes flags 0 and puts the
 /// result in the description's layout field.
@@ -74,15 +39,8 @@ pub extern "system" fn XGSuggestSwizzleMode(
     _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for the layout
-    // (either may be null).
-    match unsafe { (desc.as_ref(), out.as_mut()) } {
-        (Some(desc), Some(out)) => {
-            *out = SWIZZLED | suggested(desc).0;
-            S_OK
-        }
-        _ => E_INVALIDARG,
-    }
+    // SAFETY: the title supplies valid pointers under the XG API contract.
+    unsafe { victory_xg::suggest(desc, out) }
 }
 
 #[repr(C)]

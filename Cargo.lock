@@ -726,6 +726,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-xg",
  "windows",
  "windows-core",
  "windows-sys",
@@ -782,6 +783,16 @@ dependencies = [
  "thiserror",
  "windows",
  "windows-sys",
+]
+
+[[package]]
+name = "victory-xg"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "victory-formats",
+ "victory-loader",
+ "victory-pe",
 ]
 
 [[package]]

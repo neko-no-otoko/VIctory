@@ -24,6 +24,19 @@ attaches if an initializer fails; `detach` runs in reverse order. The set
 owns its mappings until drop; callers must explicitly detach before dropping
 an attached set, and must not use its export pointers afterward.
 
+`victory_xg::NativeResolver` is a separate, deliberately limited resolver for
+x86-64 macOS. It exposes only `xg_xs.dll!XGSuggestSwizzleMode`, through an
+explicit Windows x64 ABI wrapper using the same selection logic as the
+Windows HLE implementation. Every other import remains unresolved. The
+mode-selection rule is upstream's older optimal-mode approximation, not
+verified complete console behavior. It does not expose the Windows HLE
+registry, COM objects, or other Xbox APIs.
+
+With the LLVM-MinGW and Rust setup below, run the synthetic guest test with
+`cargo test -p victory-xg --target x86_64-apple-darwin --test native_guest`.
+It checks four texture decisions and null-pointer errors through a real PE
+import under Rosetta, without game data.
+
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls
 the executable's actual entry RVA, and detaches the DLLs if that call returns.
