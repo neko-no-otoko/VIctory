@@ -78,6 +78,8 @@ mod windows {
 
     #[unsafe(no_mangle)]
     pub extern "system" fn D3D12XboxCreateDevice(adapter: *const c_void, parameters: *const u32, iid: *const Iid, out: *mut *const Object) -> HRESULT {
+        static CONSOLE: LazyLock<Result<(), ()>> = LazyLock::new(victory_hle::runtime::initialize_wine_console);
+        if CONSOLE.is_err() { return 0x8007_0057u32 as i32; }
         // Install the shared backend before the HLE's OnceLocks are populated.
         // Otherwise xmem.dll and the GPU would track different physical pages.
         if super::xmem::install().is_err() { return 0x8000_4005u32 as i32; }

@@ -195,7 +195,8 @@ fn clean_bridge_env(command: &mut Command) {
         .env_remove("VICTORY_WINE_METAL_TOKEN")
         .env_remove("VICTORY_WINE_TITLE_DATA")
         .env_remove("VICTORY_WINE_RELAUNCH_ADDR")
-        .env_remove("VICTORY_WINE_PLS_DRIVE");
+        .env_remove("VICTORY_WINE_PLS_DRIVE")
+        .env_remove("VICTORY_WINE_CONSOLE");
 }
 
 struct Relaunch {
@@ -586,7 +587,7 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, console: crate::Console, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -682,7 +683,11 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         clean_bridge_env(&mut command);
         command.env("VICTORY_WINE_METAL_ADDR", address.to_string())
             .env("VICTORY_WINE_METAL_TOKEN", &token)
-            .env("VICTORY_WINE_RELAUNCH_ADDR", &relaunch_address);
+            .env("VICTORY_WINE_RELAUNCH_ADDR", &relaunch_address)
+            .env("VICTORY_WINE_CONSOLE", match console {
+                crate::Console::SeriesX => "series-x",
+                crate::Console::SeriesS => "series-s",
+            });
         if let Some(root) = &windows_save_root { command.env("VICTORY_WINE_TITLE_DATA", root); }
         if let Some(letter) = storage_drive { command.env("VICTORY_WINE_PLS_DRIVE", letter.to_string()); }
         command
@@ -741,8 +746,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, console: crate::Console, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, console, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

@@ -63,6 +63,7 @@ mod windows {
     }
 
     static INITIALIZED: LazyLock<Result<(), HRESULT>> = LazyLock::new(|| {
+        title_runtime::initialize_wine_console().map_err(|()| E_INVALIDARG)?;
         let executable = std::env::current_exe().map_err(|_| E_INVALIDARG)?;
         let root = std::env::var_os("VICTORY_WINE_TITLE_DATA");
         let title = configured_title(root.as_deref().map(Path::new), &executable)?;

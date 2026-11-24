@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Initialize this independently linked Wine provider's console selection.
+/// An absent setting preserves the Series X default outside the launcher.
+pub fn initialize_wine_console() -> Result<(), ()> {
+    let value = std::env::var_os("VICTORY_WINE_CONSOLE");
+    let console = match value.as_deref() {
+        None => crate::console::Console::SeriesX,
+        Some(value) if value == "series-x" => crate::console::Console::SeriesX,
+        Some(value) if value == "series-s" => crate::console::Console::SeriesS,
+        Some(_) => return Err(()),
+    };
+    crate::console::set(console);
+    Ok(())
+}
+
 static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Records where the title's main image is mapped. The title expects

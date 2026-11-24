@@ -9,6 +9,28 @@ typedef void (WINAPI *LaunchNewGame)(void *, const char *, const char *, const v
 static const GUID title_provider = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
 static const GUID title_iid = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
 static const char sentinel[] = "first guest completed before relaunch";
+typedef struct { unsigned short major, minor, build, revision; } Version;
+typedef struct { Version os, hosting_os; char family[64], form[64]; } AnalyticsInfo;
+typedef struct { size_t title_limit, title_used, tools_limit, tools_used; unsigned stack_used, physical_pages; size_t gpu_limit, gpu_used, tools_gpu_limit, tools_gpu_used; unsigned kernel_used, kernel_limit; } WorkingSet;
+static int check_console(void) {
+    const GUID id = {0xb884675d, 0xb738, 0x4a9c, {0x81,0x5d,0x9a,0x9a,0x1e,0x0c,0x6c,0x9b}};
+    void *object = NULL;
+    if (QueryApiImpl(&id, &id, &object) || !object) return 0;
+    typedef AnalyticsInfo *(WINAPI *GetInfo)(void *, AnalyticsInfo *);
+    AnalyticsInfo info;
+    if (((GetInfo)(*(void ***)object)[3])(object, &info) != &info ||
+        strcmp(info.form, "Xbox Series S")) return 0;
+    HMODULE xmem = LoadLibraryW(L"xmem.dll");
+    if (!xmem) return 0;
+    typedef BOOL (WINAPI *GetStats)(unsigned, WorkingSet *);
+    typedef BOOL (WINAPI *Transfer)(unsigned, size_t);
+    GetStats get = (GetStats)GetProcAddress(xmem, "XMemGetWorkingSetStatistics");
+    Transfer transfer = (Transfer)GetProcAddress(xmem, "XMemTransferMemory");
+    WorkingSet stats;
+    return get && transfer && get(0, &stats) && stats.title_limit == ((size_t)7776 << 20) &&
+        stats.gpu_limit == 0 && transfer(0, 1) && get(0, &stats) &&
+        stats.title_limit == ((size_t)7774 << 20);
+}
 
 static int env_path(const char *name, char *path, DWORD size) {
     DWORD len = GetEnvironmentVariableA(name, path, size);
@@ -19,6 +41,7 @@ int main(int argc, char **argv) {
     char target[32768], marker[32768], image[32768], expected[32768], data[sizeof(sentinel)];
     DWORD count;
     HANDLE file;
+    if (!check_console()) return 21;
     if (!env_path("VICTORY_RELAUNCH_TEST_TARGET", target, sizeof(target)) ||
         !env_path("VICTORY_RELAUNCH_TEST_MARKER", marker, sizeof(marker))) return 10;
     if (argc == 1) {

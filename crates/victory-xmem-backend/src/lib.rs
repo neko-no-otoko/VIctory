@@ -15,6 +15,10 @@ mod windows {
     fn initialize() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
+            if runtime::initialize_wine_console().is_err() {
+                eprintln!("VIctory XMem: invalid VICTORY_WINE_CONSOLE");
+                std::process::abort();
+            }
             // SAFETY: a null name requests the process executable's module.
             let image = unsafe { GetModuleHandleW(std::ptr::null()) };
             if image.is_null() {

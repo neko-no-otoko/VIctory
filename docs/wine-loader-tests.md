@@ -1177,6 +1177,22 @@ The D3D12.X DLL uses the same backend for its allocator and page-mapper
 callbacks; the backend's `VIctoryXMemMapAlias` is a VIctory-private interface,
 not an Xbox export.
 
+`wine-run --console series-x|series-s` selects the model; the default is
+`series-x`. The launcher supplies its selection to each newly launched Wine
+process, including title-provider relaunches, overriding an inherited
+`VICTORY_WINE_CONSOLE`. Independently linked XGameRuntime, XMem backend and
+D3D12.X copies initialize from that setting. XSystem analytics reports the
+selected Xbox name; the local D3D12.X HLE's DXGI adapter description reports
+the same memory split. XMem reports Series X's 10 GiB GPU-optimal plus 3.5 GiB
+standard budget or Series S's 7,776 MiB standard budget; transfers reduce the
+standard portion in 2 MiB increments and reset for a new process.
+
+This does not intercept Wine registry calls: a title reading `ConsoleMode`
+directly through Wine does not receive VIctory's native-loader registry
+override. The environment and guest are trusted; providers used without
+the launcher default to Series X if the setting is absent, and reject an
+invalid setting (XGameRuntime and D3D12.X return an error; XMem aborts).
+
 This carries forward the upstream HLE's limitations: memory budgets use its
 current console setting, virtual queries report committed memory as
 graphics-accessible, and not every console page/commit behavior is modelled.
@@ -1198,6 +1214,13 @@ mapping callback against the same backend. It rejected an unknown import and
 the launcher rejected XMem and companion collisions. The queue check selects
 the local HLE path; the separate Metal launcher regression performs actual GPU
 compute readback, not a Metal tiled-page-mapping test.
+
+With a clean committed-HEAD snapshot plus the console changes, Wine 11 under
+Rosetta passed both XMem tests, all three `wine_relaunch` tests and the real
+Metal launcher compute regression. The XMem guest checks default, explicit X
+and S analytics and local DXGI budgets, transfer boundaries and invalid CLI
+selection. The relaunch guest checks S analytics and a fresh S XMem budget in
+both processes. The DXGI check uses the local HLE path, not the Metal proxy.
 
 ## Normal Wine AcpHal HLE DLL
 

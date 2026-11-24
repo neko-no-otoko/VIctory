@@ -24,6 +24,22 @@ __declspec(dllimport) BOOL WINAPI XMemVirtualQuery(HANDLE, const void *, BasicIn
 typedef struct { size_t title_limit, title_used, tools_limit, tools_used; uint32_t stack_used, physical_pages; size_t gpu_limit, gpu_used, tools_gpu_limit, tools_gpu_used; uint32_t kernel_used, kernel_limit; } WorkingSet;
 __declspec(dllimport) BOOL WINAPI XMemGetWorkingSetStatistics(unsigned, WorkingSet *);
 __declspec(dllimport) BOOL WINAPI XMemTransferMemory(unsigned, size_t);
+typedef struct { unsigned short major, minor, build, revision; } Version;
+typedef struct { Version os, hosting_os; char family[64], form[64]; } AnalyticsInfo;
+static int check_analytics(const char *expected) {
+    const GUID id = {0xb884675d, 0xb738, 0x4a9c, {0x81,0x5d,0x9a,0x9a,0x1e,0x0c,0x6c,0x9b}};
+    HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
+    if (!runtime) return 0;
+    typedef HRESULT (WINAPI *Query)(const GUID *, const GUID *, void **);
+    Query query = (Query)GetProcAddress(runtime, "QueryApiImpl");
+    void *object = NULL;
+    if (!query || query(&id, &id, &object) || !object) return 0;
+    typedef AnalyticsInfo *(WINAPI *GetInfo)(void *, AnalyticsInfo *);
+    AnalyticsInfo info;
+    GetInfo get_info = (GetInfo)(*(void ***)object)[3];
+    return get_info(object, &info) == &info && !strcmp(info.family, "Xbox") &&
+        !strcmp(info.form, expected);
+}
 #define CHECK(x) do { if (!(x)) { printf("XMem check failed at line %d (error %lu)\n", __LINE__, GetLastError()); return 1; } } while (0)
 
 static volatile LONG hook_allocs, hook_frees;
@@ -124,9 +140,25 @@ int main(void) {
     CHECK(p && !((uintptr_t)p & 4095)); memset(p, 0xa5, 4096); CHECK(p[0] == 0xa5 && p[4095] == 0xa5);
     XMemFreeDefault(p, (uint64_t)12 << 24); CHECK(hook_allocs == 2 && hook_frees == 2);
     CHECK(!XMemIsToolsMemAvailable());
-    WorkingSet stats; CHECK(XMemGetWorkingSetStatistics(0, &stats) && stats.title_limit);
+    char model[32];
+    DWORD model_len = GetEnvironmentVariableA("VICTORY_TEST_EXPECT_CONSOLE", model, sizeof(model));
+    CHECK(model_len && model_len < sizeof(model));
+    int series_s = !strcmp(model, "series-s");
+    CHECK(series_s || !strcmp(model, "series-x"));
+    CHECK(check_analytics(series_s ? "Xbox Series S" : "Xbox Series X"));
+    size_t standard = series_s ? ((size_t)7776 << 20) : ((size_t)7 << 29);
+    size_t gpu = series_s ? 0 : ((size_t)10 << 30);
+    WorkingSet stats; CHECK(XMemGetWorkingSetStatistics(0, &stats));
+    CHECK(stats.title_limit == standard + gpu && stats.gpu_limit == gpu);
     CHECK(!XMemGetWorkingSetStatistics(0, NULL));
     CHECK(!XMemTransferMemory(1, 1));
+    CHECK(!XMemTransferMemory(0, SIZE_MAX));
+    CHECK(XMemTransferMemory(0, 1));
+    CHECK(XMemGetWorkingSetStatistics(0, &stats) && stats.title_limit == standard + gpu - (2u << 20));
+    CHECK(!XMemTransferMemory(0, standard));
+    CHECK(XMemTransferMemory(0, standard - (2u << 20)));
+    CHECK(!XMemTransferMemory(0, 1));
+    CHECK(XMemGetWorkingSetStatistics(0, &stats) && stats.title_limit == gpu && stats.gpu_limit == gpu);
     p = XMemVirtualAlloc(NULL, 65536, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
     CHECK(p); p[0] = 42; p[65535] = 81;
     BasicInformation info; memset(&info, 0xcc, sizeof(info));
@@ -158,6 +190,24 @@ int main(void) {
     unsigned version = 0x00020004;
     void *device = NULL, *queue = NULL;
     CHECK(create_device && create_device(NULL, &version, &device_iid, &device) == 0 && device);
+    const GUID dxgi_iid = {0x54ec77fa, 0x1377, 0x44e6, {0x8c,0x32,0x88,0xfd,0x5f,0x44,0xc8,0x4c}};
+    typedef HRESULT (WINAPI *QueryInterface)(void *, const GUID *, void **);
+    typedef HRESULT (WINAPI *GetAdapter)(void *, void **);
+    struct AdapterDescription {
+        WCHAR name[128];
+        unsigned vendor, device, subsystem, revision;
+        size_t dedicated_video, dedicated_system, shared_system;
+        unsigned luid[2];
+    } description;
+    typedef HRESULT (WINAPI *GetDescription)(void *, struct AdapterDescription *);
+    void *dxgi = NULL, *adapter = NULL;
+    CHECK(((QueryInterface)(*(void ***)device)[0])(device, &dxgi_iid, &dxgi) == 0 && dxgi);
+    CHECK(((GetAdapter)(*(void ***)dxgi)[7])(dxgi, &adapter) == 0 && adapter);
+    CHECK(((GetDescription)(*(void ***)adapter)[8])(adapter, &description) == 0);
+    CHECK(description.dedicated_video == gpu && description.shared_system == standard);
+    typedef ULONG (WINAPI *Release)(void *);
+    ((Release)(*(void ***)adapter)[2])(adapter);
+    ((Release)(*(void ***)dxgi)[2])(dxgi);
     struct QueueDesc { unsigned kind; int priority; unsigned flags, nodes; } queue_desc = {0,0,0,1};
     typedef HRESULT (WINAPI *CreateQueue)(void *, const struct QueueDesc *, const GUID *, void **);
     CreateQueue create_queue = (CreateQueue)(*(void ***)device)[8];
@@ -171,7 +221,6 @@ int main(void) {
     range.kind = 2;
     CHECK(copy_pages(queue, 1, &batch, 0, 0, 0) == 0);
     CHECK(XMemVirtualQuery(GetCurrentProcess(), dest, &info) && info.host.State == MEM_RESERVE);
-    typedef ULONG (WINAPI *Release)(void *);
     ((Release)(*(void ***)queue)[2])(queue);
     ((Release)(*(void ***)device)[2])(device);
     CHECK(XMemMapPhysicalPages(source, 2, NULL) == source);

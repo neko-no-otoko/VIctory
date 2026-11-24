@@ -24,7 +24,7 @@ mod translate;
 use std::path::PathBuf;
 
 use anyhow::Result;
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 
@@ -209,6 +209,9 @@ enum Command {
         /// Use an existing Wine drive mapped to the save root's storage directory.
         #[arg(long, requires = "save_root")]
         storage_drive: Option<char>,
+        /// Console model reported by VIctory's runtime and memory providers.
+        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        console: Console,
         /// Arguments passed to the guest after `--`.
         #[arg(last = true)]
         guest_args: Vec<std::ffi::OsString>,
@@ -246,7 +249,7 @@ enum Unimplemented {
     Zero,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
 #[derive(Clone, Copy, ValueEnum)]
 enum Console {
     SeriesX,
@@ -302,8 +305,8 @@ fn main() -> Result<()> {
         Command::WineImports { exe, dll_dir, provision_gameinput, guest_dll } =>
             wine_imports::run(&exe, &dll_dir, provision_gameinput, &guest_dll),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, guest_args } => {
-            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, &guest_dll, title_root.as_deref(), save_root.as_deref(), storage_drive, &guest_args)?;
+        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, console, guest_args } => {
+            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, &guest_dll, title_root.as_deref(), save_root.as_deref(), storage_drive, console, &guest_args)?;
             if code != 0 { std::process::exit(code); }
             Ok(())
         }

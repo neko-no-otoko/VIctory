@@ -118,6 +118,9 @@ impl Fixture {
         exe
     }
     fn execute(&self, exe: &Path, xmem: &str, backend: &str, d3d: &str) -> Output {
+        self.execute_console(exe, xmem, backend, d3d, None)
+    }
+    fn execute_console(&self, exe: &Path, xmem: &str, backend: &str, d3d: &str, console: Option<&str>) -> Output {
         let wrapper = self.temp.path().join("host-wrapper");
         fs::write(&wrapper, format!("#!/bin/sh\necho $$ > {}\nexec {} \"$@\"\n", quote(&self.host_pid), quote(&self.host))).unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
@@ -129,7 +132,10 @@ impl Fixture {
             .current_dir(self.temp.path()).env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .env("WINEDEBUG", "-all").env("VICTORY_WINE_METAL_PRESENT", "0")
             .env("VICTORY_EXPECT_XMEM_DLL", xmem).env("VICTORY_EXPECT_XMEM_BACKEND_DLL", backend)
-            .env("VICTORY_EXPECT_D3D12X_DLL", d3d);
+            .env("VICTORY_EXPECT_D3D12X_DLL", d3d)
+            .env("VICTORY_TEST_EXPECT_CONSOLE", console.unwrap_or("series-x"))
+            .env("VICTORY_WINE_CONSOLE", "invalid-ambient-value");
+        if let Some(console) = console { cmd.arg("--console").arg(console); }
         run(&mut cmd, self.temp.path())
     }
 }
@@ -169,6 +175,12 @@ fn wine_launcher_imports_xmem_and_shares_backend_page_state() {
     let out = fixture.execute(&exe, &dll, &backend, &d3d);
     assert_eq!(out.status.code(), Some(0), "{}\n{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("XMem named imports, TLS, hooks, virtual memory and shared physical aliases passed"), "{}\n{}", out.stdout, out.stderr);
+    for model in ["series-x", "series-s"] {
+        let out = fixture.execute_console(&exe, &dll, &backend, &d3d, Some(model));
+        assert_eq!(out.status.code(), Some(0), "{model}: {}\n{}", out.stdout, out.stderr);
+    }
+    let invalid = fixture.execute_console(&exe, &dll, &backend, &d3d, Some("series-z"));
+    assert!(!invalid.status.success() && invalid.stderr.contains("invalid value"), "{}\n{}", invalid.stdout, invalid.stderr);
     let wrong = fixture.execute(&exe, "Z:\\wrong\\xmem.dll", &backend, &d3d);
     assert!(!wrong.status.success(), "wrong module identity accepted: {}\n{}", wrong.stdout, wrong.stderr);
     let missing = fixture.execute(&unsupported, &dll, &backend, &d3d);

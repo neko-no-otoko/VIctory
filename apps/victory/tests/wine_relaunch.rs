@@ -116,6 +116,7 @@ impl Fixture {
             .arg("--winepath").arg(&self.winepath).arg("--metal-host").arg(host)
             .arg("--converter").arg(&self.converter).arg("--dll-dir").arg(&self.dll_dir)
             .arg("--wine-prefix").arg(&self.prefix).arg("--allow-unverified-dll-search")
+            .args(["--console", "series-s"])
             .current_dir(self.temp.path()).env("WINEDEBUG", "-all")
             .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .env("VICTORY_WINE_METAL_PRESENT", "0")
