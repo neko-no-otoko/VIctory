@@ -263,9 +263,22 @@ Supported patterns are a literal name, `*`, `*.*`, or a literal prefix followed
 by one `*` (not after a dot); `?`, other wildcard positions, and wildcards in
 parent components return `ERROR_NOT_SUPPORTED`. This is a limited subset,
 not full Windows DOS wildcard behavior.
-Without `--file-root`, these imports remain unresolved. This path binding is
-not a process sandbox: guest machine code and host callbacks execute
+Without `--file-root`, file and discovery imports remain unresolved.
+This path binding is not a process sandbox: guest code and host callbacks execute
 unsandboxed and must be trusted.
+
+The native resolver also exposes a restricted `VirtualAlloc`, `VirtualFree`,
+and `VirtualProtect` implementation without requiring a file root. It tracks
+only its own anonymous reservations and uses 64-KiB reservation alignment and
+the host's translated page size. It supports reserve, reserve-and-commit,
+commit within a tracked reservation, nonzero-range decommit, and whole-region
+release. Supported protections are `PAGE_NOACCESS`, `PAGE_READONLY`, and
+`PAGE_READWRITE`; executable pages and other flags are rejected. Explicit
+addresses for new reservations and null-address commit-only calls are not
+supported. Recommitted pages are zeroed; protection changes require committed
+pages. `GetLastError` and `SetLastError` share the file provider's thread-local
+error state and are available without a file root. This is not Windows process
+initialization or executable guest memory support.
 
 With `--execute`, executable and DLL code runs **unsandboxed in the CLI
 process** and can crash, hang or corrupt it. Only pass trusted images with

@@ -749,3 +749,125 @@ unsigned entry(void) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
 }
+
+#[test]
+fn native_fixture_virtual_memory_is_isolated_and_enforced() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nVirtualAlloc\nVirtualFree\nVirtualProtect\nGetLastError\nSetLastError\n").unwrap();
+    std::fs::write(dir.path().join("memory.c"), r#"
+typedef unsigned long DWORD;
+typedef unsigned long long SIZE_T;
+typedef int BOOL;
+__declspec(dllimport) void *VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
+__declspec(dllimport) BOOL VirtualFree(void *, SIZE_T, DWORD);
+__declspec(dllimport) BOOL VirtualProtect(void *, SIZE_T, DWORD, DWORD *);
+__declspec(dllimport) DWORD GetLastError(void);
+__declspec(dllimport) void SetLastError(DWORD);
+#define COMMIT 0x1000
+#define RESERVE 0x2000
+#define DECOMMIT 0x4000
+#define RELEASE 0x8000
+#define NOACCESS 0x01
+#define READONLY 0x02
+#define READWRITE 0x04
+#define EXECUTE_READWRITE 0x40
+#define BLOCK 65536ULL
+int marker = 7;
+int *volatile relocated_marker = &marker;
+unsigned entry(void) {
+    volatile unsigned char *p;
+    DWORD old = 0, untouched;
+    SIZE_T i;
+    if (*relocated_marker != 7) return 1;
+    SetLastError(1234);
+    if (GetLastError() != 1234) return 2;
+    p = (volatile unsigned char *)VirtualAlloc(0, 2 * BLOCK, RESERVE, NOACCESS);
+    if (!p || ((SIZE_T)p & (BLOCK - 1))) return 3;
+    if (VirtualAlloc((void *)p, BLOCK, COMMIT, READWRITE) != (void *)p) return 4;
+    for (i = 0; i < BLOCK; ++i) if (p[i]) return 5;
+    p[0] = 0x5a;
+    p[BLOCK - 1] = 0xa5;
+    if (!VirtualProtect((void *)p, BLOCK, READONLY, &old) || old != READWRITE) return 6;
+    if (p[0] != 0x5a || p[BLOCK - 1] != 0xa5) return 7;
+#if defined(FAULT_READONLY)
+    p[0] = 1;
+    return 90;
+#endif
+    if (!VirtualProtect((void *)p, BLOCK, READWRITE, &old) || old != READONLY) return 8;
+    untouched = 0xdeadbeef;
+    SetLastError(0);
+    if (VirtualProtect((void *)p, 2 * BLOCK, NOACCESS, &untouched) ||
+        !GetLastError() || untouched != 0xdeadbeef) return 9;
+    p[0] = 0x33;
+    if (p[BLOCK - 1] != 0xa5) return 10;
+    SetLastError(0);
+    if (VirtualProtect((void *)p, BLOCK, EXECUTE_READWRITE, &old) || !GetLastError()) return 11;
+    SetLastError(0);
+    if (VirtualAlloc(0, BLOCK, RESERVE | COMMIT, EXECUTE_READWRITE) || !GetLastError()) return 12;
+    SetLastError(0);
+    if (VirtualAlloc(0, BLOCK, RESERVE | 0x100000, READWRITE) || !GetLastError()) return 13;
+    SetLastError(0);
+    if (VirtualFree((void *)p, BLOCK, RELEASE) || !GetLastError()) return 14;
+    SetLastError(0);
+    if (VirtualFree((void *)(p + BLOCK), 0, RELEASE) || !GetLastError()) return 15;
+    SetLastError(0);
+    if (VirtualFree((void *)p, ~(SIZE_T)0, DECOMMIT) || !GetLastError()) return 16;
+    if (p[0] != 0x33 || p[BLOCK - 1] != 0xa5) return 17;
+    SetLastError(0);
+    if (VirtualProtect((void *)&marker, sizeof(marker), NOACCESS, &old) || !GetLastError()) return 18;
+    SetLastError(0);
+    if (VirtualFree((void *)&marker, 0, RELEASE) || !GetLastError()) return 19;
+    if (*relocated_marker != 7) return 20;
+    if (!VirtualProtect((void *)p, BLOCK, NOACCESS, &old) || old != READWRITE) return 21;
+#if defined(FAULT_NOACCESS)
+    return p[0];
+#endif
+    if (!VirtualProtect((void *)p, BLOCK, READWRITE, &old) || old != NOACCESS) return 22;
+    if (!VirtualFree((void *)p, BLOCK, DECOMMIT)) return 23;
+#if defined(FAULT_DECOMMITTED)
+    return p[0];
+#endif
+    SetLastError(0);
+    if (VirtualProtect((void *)p, BLOCK, READONLY, &old) || !GetLastError()) return 24;
+    if (VirtualAlloc((void *)p, BLOCK, COMMIT, READWRITE) != (void *)p) return 25;
+    for (i = 0; i < BLOCK; ++i) if (p[i]) return 26;
+    p[0] = 0x77;
+    if (!VirtualFree((void *)p, 0, RELEASE)) return 27;
+    SetLastError(0);
+    if (VirtualFree((void *)p, 0, RELEASE) || !GetLastError()) return 28;
+    p = (volatile unsigned char *)VirtualAlloc(0, BLOCK, RESERVE | COMMIT, READWRITE);
+    if (!p) return 29;
+    if (p[0] || p[BLOCK - 1]) return 30;
+    p[0] = 1;
+    if (!VirtualFree((void *)p, 0, RELEASE)) return 31;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    for (name, define) in [
+        ("memory", ""),
+        ("readonly", "-DFAULT_READONLY"),
+        ("noaccess", "-DFAULT_NOACCESS"),
+        ("decommitted", "-DFAULT_DECOMMITTED"),
+    ] {
+        let object = format!("{name}.obj");
+        let executable = format!("{name}.exe");
+        let mut args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"];
+        if !define.is_empty() {
+            args.push(define);
+        }
+        args.extend(["-c", "memory.c", "-o", &object]);
+        tool(dir.path(), "x86_64-w64-mingw32-clang", &args);
+        tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", &format!("/out:{executable}"), &object, "kernel32.lib"]);
+        let exe = dir.path().join(executable);
+        let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+        if name == "memory" {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+        } else {
+            assert!(matches!(output.status.signal(), Some(10 | 11)), "{name}: status {:?}, stdout {}, stderr {}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}

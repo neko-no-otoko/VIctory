@@ -114,12 +114,17 @@ impl Drop for FileScope {
     }
 }
 
-/// Resolve only the supported kernel32 exports, and only within a scope.
+/// Resolve last-error exports independently of file scope; file operations
+/// remain available only while a scope is active.
 pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
-    if !dll.eq_ignore_ascii_case("kernel32.dll") || !CONTEXT.with(|slot| slot.borrow().is_some()) {
-        return None;
-    }
+    if !dll.eq_ignore_ascii_case("kernel32.dll") { return None; }
     let ImportSymbol::Name { name, .. } = symbol else { return None };
+    match name.as_str() {
+        "GetLastError" => return Some(get_last_error as *const () as usize),
+        "SetLastError" => return Some(set_last_error as *const () as usize),
+        _ => {}
+    }
+    if !CONTEXT.with(|slot| slot.borrow().is_some()) { return None; }
     Some(match name.as_str() {
         "CreateFileW" => create_file_w as *const () as usize,
         "CreateDirectoryW" => create_directory_w as *const () as usize,
@@ -135,13 +140,11 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
         "SetFilePointerEx" => set_file_pointer_ex as *const () as usize,
         "GetFileSizeEx" => get_file_size_ex as *const () as usize,
         "CloseHandle" => close_handle as *const () as usize,
-        "GetLastError" => get_last_error as *const () as usize,
-        "SetLastError" => set_last_error as *const () as usize,
         _ => return None,
     })
 }
 
-fn fail(code: u32) {
+pub(crate) fn fail(code: u32) {
     LAST_ERROR.with(|error| error.set(code));
 }
 
