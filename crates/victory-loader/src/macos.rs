@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail, ensure};
 use victory_pe::{ImageInfo, layout};
 
 use crate::{ImportResolver, Resolution};
+mod graph;
+pub use graph::ModuleSet;
 
 const READ: u32 = 0x4000_0000;
 const WRITE: u32 = 0x8000_0000;

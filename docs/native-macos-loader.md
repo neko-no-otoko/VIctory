@@ -16,10 +16,18 @@ calls `DLL_PROCESS_DETACH` with a null reserved pointer. A failed attach is
 not followed by detach. Duplicate attach or detach is rejected. An image
 without an entry point still has explicit attach/detach state.
 
+`ModuleSet::load` maps an explicit, nonempty set of named DLLs in dependency
+order, resolving imports from members before using the external resolver.
+Cycles, duplicate names and imported forwarded exports are rejected. Unsafe
+`ModuleSet::attach` initializes dependencies first and rolls back prior
+attaches if an initializer fails; `detach` runs in reverse order. The set
+owns its mappings until drop; callers must explicitly detach before dropping
+an attached set, and must not use its export pointers afterward.
+
 The caller must ensure the DLL and all callbacks are trusted, ABI-correct,
 properly initialized and safely serialized, and that users are quiescent
 before detach. Windows loader-lock semantics, thread notifications, the TEB,
-GS-based TLS, exception handling, other DLL loading and Windows APIs are not
+GS-based TLS, exception handling, dynamic DLL loading and Windows APIs are not
 provided. The caller must detach before dropping an attached image: `Drop`
 only unmaps memory and never invokes arbitrary code. Export addresses remain
 valid only while the image is alive. Calling an export executes arbitrary
@@ -48,7 +56,9 @@ relocation, maps it, calls its export using the Windows x64 ABI, checks the
 host callback and rebased pointer, and checks that writes to read-only data
 and executable code fault in child processes. It also checks missing imports,
 invalid entry points, attach failure, module and reserved arguments, and
-exactly-once detach. Passing these tests is not evidence of title execution,
-D3D12 translation, or Metal support. See
+exactly-once detach. A two-DLL synthetic test checks cross-module imports,
+dependency initialization, reverse teardown, failure rollback, cycles and
+forwarded-export rejection. Passing these tests is not evidence of title
+execution, D3D12 translation, or Metal support. See
 [rosetta-avx-probe.md](rosetta-avx-probe.md) for the separate instruction
 experiment; CPUID reporting and execution can differ under Rosetta.

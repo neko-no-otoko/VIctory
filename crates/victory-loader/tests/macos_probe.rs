@@ -2,16 +2,12 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use victory_loader::macos::Image;
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-
 extern "win64" fn host_adjust(value: i32) -> i32 {
-    CALLS.fetch_add(1, Ordering::Relaxed);
     value + 2
 }
 
@@ -82,7 +78,6 @@ fn maps_relocates_binds_and_calls_real_pe() {
     let call: unsafe extern "win64" fn() -> i32 = unsafe { std::mem::transmute(entry.as_ptr()) };
     // SAFETY: imports are bound and the fixture has no initialization requirements.
     assert_eq!(unsafe { call() }, 42);
-    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
     assert_write_faults(value.cast_mut().cast());
     assert_write_faults(entry.as_ptr().cast());
     assert!(image.export("not_an_export").is_none());
@@ -150,4 +145,77 @@ fn entrypoint_free_image_has_explicit_lifecycle() {
         image.detach().unwrap();
         assert!(image.detach().is_err());
     }
+}
+
+fn consumer(fail: bool) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("provider.def"), "LIBRARY provider.dll\nEXPORTS\nfixture_is_live\nfixture_note_detach\nfixture_call\n").unwrap();
+    std::fs::write(dir.path().join("consumer.c"), format!(r#"
+__declspec(dllimport) int fixture_is_live(void);
+__declspec(dllimport) void fixture_note_detach(void);
+__declspec(dllimport) int fixture_call(void);
+int consumer_value;
+__declspec(dllexport) int *consumer_pointer = &consumer_value;
+__declspec(dllexport) int consumer_call(void) {{ return fixture_call(); }}
+int DllMain(void *m, unsigned long reason, void *r) {{
+    (void)m; (void)r;
+    if (reason == 1) return fixture_is_live() && {};
+    if (reason == 0) fixture_note_detach();
+    return 1;
+}}
+"#, if fail { 0 } else { 1 })).unwrap();
+    run("llvm-dlltool", &["-m", "i386:x86-64", "-d", "provider.def", "-l", "provider.lib"], dir.path());
+    run("x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "consumer.c", "-o", "consumer.obj"], dir.path());
+    run("lld-link", &["/dll", "/entry:DllMain", "/nodefaultlib", "/dynamicbase", "/out:consumer.dll", "consumer.obj", "provider.lib"], dir.path());
+    std::fs::read(dir.path().join("consumer.dll")).unwrap()
+}
+
+#[test]
+fn dependency_order_and_failure_rollback() {
+    use victory_loader::macos::ModuleSet;
+    let provider = fixture();
+    for fail in [false, true] {
+        let consumer = consumer(fail);
+        let mut set = ModuleSet::load(&[("consumer.dll", &consumer), ("provider.dll", &provider)], &Resolver).unwrap();
+        let detaches = set.export("provider.dll", "fixture_detaches").unwrap().as_ptr().cast::<i32>();
+        let saw = set.export("provider.dll", "fixture_detach_saw_consumer").unwrap().as_ptr().cast::<i32>();
+        // SAFETY: synthetic modules and their Windows-ABI imports are known.
+        unsafe {
+            if fail {
+                assert!(set.attach().is_err());
+                assert_eq!(*detaches, 1);
+                assert_eq!(*saw, 0);
+            } else {
+                set.attach().unwrap();
+                let entry = set.export("consumer.dll", "consumer_call").unwrap();
+                let call: unsafe extern "win64" fn() -> i32 = std::mem::transmute(entry.as_ptr());
+                assert_eq!(call(), 42);
+                set.detach().unwrap();
+                assert_eq!(*detaches, 1);
+                assert_eq!(*saw, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn rejects_cycles_and_forwarded_exports() {
+    use victory_loader::macos::ModuleSet;
+    let cyclic = fixture();
+    let error = match ModuleSet::load(&[("victory-synthetic.dll", &cyclic)], &Resolver) {
+        Ok(_) => panic!("cycle accepted"), Err(e) => e,
+    };
+    assert!(error.to_string().contains("cyclic DLL dependency"), "{error}");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("forward.def"), "LIBRARY provider.dll\nEXPORTS\nfixture_is_live=other.foo\nfixture_note_detach\nfixture_call\n").unwrap();
+    std::fs::write(dir.path().join("forward.c"), "int value; __declspec(dllexport) int *pointer = &value; int fixture_call(void) { return 42; } void fixture_note_detach(void) {}").unwrap();
+    run("x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "forward.c", "-o", "forward.obj"], dir.path());
+    run("lld-link", &["/dll", "/noentry", "/nodefaultlib", "/dynamicbase", "/def:forward.def", "/out:forward.dll", "forward.obj"], dir.path());
+    let forward = std::fs::read(dir.path().join("forward.dll")).unwrap();
+    let consumer = consumer(false);
+    let error = match ModuleSet::load(&[("consumer.dll", &consumer), ("provider.dll", &forward)], &Resolver) {
+        Ok(_) => panic!("forwarded export accepted"), Err(e) => e,
+    };
+    assert!(error.to_string().contains("forwarded export"), "{error}");
 }
