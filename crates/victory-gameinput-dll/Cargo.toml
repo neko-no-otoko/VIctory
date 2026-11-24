@@ -1,0 +1,19 @@
+[package]
+name = "victory-gameinput-dll"
+description = "Wine-loadable GameInput HLE import DLL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gameinput"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+victory-hle.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true

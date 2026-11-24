@@ -710,6 +710,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-gameinput-dll"
+version = "0.1.0"
+dependencies = [
+ "victory-hle",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-gpu"
 version = "0.1.0"
 dependencies = [

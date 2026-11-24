@@ -502,9 +502,9 @@ The manual VIctory loader first looks up an HLE export by DLL and name, or
 import if neither resolves it. For example, its GameInput registry maps
 ordinal 1 to `GameInputCreate`. Normal Wine instead resolves the PE import
 table through the DLLs actually supplied to Wine; it does not invoke this
-manual resolver or inherit its API-set overrides. VIctory does not currently
-supply a Wine GameInput DLL implementing that ordinal. No guessed console
-ordinal mappings are provided by the D3D12.X DLL.
+manual resolver or inherit its API-set overrides. The separate Wine GameInput
+DLL described below explicitly provides the confirmed ordinal 1; the D3D12.X
+DLL does not provide guessed console ordinal mappings.
 
 When the Wine Metal proxy is enabled, `D3D12XboxCreateDevice` supports the base
 device IID and the newer Device11 IID documented in the upstream device
@@ -629,6 +629,57 @@ XSystem/XUser identity, handle, gamertag and error checks. The existing
 normally launched D3D12.X-to-Metal compute regression also passed with real
 GPU readback. No game files were used; these results do not establish game
 compatibility or ARM-native PE execution.
+
+## Normal Wine GameInput HLE DLL
+
+`victory-gameinput-dll` builds `gameinput.dll` with one explicit PE export:
+`GameInputCreate`, also at ordinal 1. Both forms enter the existing GameInput
+HLE implementation and return its same process-wide singleton; no other
+ordinal mapping is claimed. A valid create pins the DLL for the process
+lifetime before the HLE starts its polling worker, so unloading a loader
+reference cannot invalidate its objects or thread. A null output returns the
+provider's `E_INVALIDARG`; a failure to pin returns `E_FAIL`.
+
+Build for Wine using the LLVM-MinGW setup above:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/victory-gameinput-win-target
+cargo build --locked -p victory-gameinput-dll --target x86_64-pc-windows-gnullvm
+```
+
+For a trusted executable, place the resulting `gameinput.dll` beside the guest
+EXE, make the LLVM-MinGW `x86_64-w64-mingw32/bin` runtime available via
+`WINEPATH`, and launch normally with `WINEDLLOVERRIDES=gameinput=n`. Do not
+overwrite an existing title DLL without considering its provenance. In the
+tested Wine 11 prefix, a Wine `system32` GameInput placeholder takes
+precedence over a provider directory supplied only through `WINEPATH`; the
+application-directory placement was necessary. Wine DLL search is not a
+sandbox. The integrated launcher does not install, override, or preflight
+GameInput.
+
+This exposes the upstream provider's existing subset, not a new complete input
+stack: it polls XInput controllers and focused-window keyboard state under Wine,
+provides its keyboard/gamepad fallback, readings and callbacks, and retains
+its singleton/device reference behavior. Dispatcher and aggregate-device
+creation return `E_NOTIMPL`; platform-device lookup and other interfaces remain
+limited by the provider. Input availability depends on Wine and host focus.
+Physical device operation and title compatibility are not established.
+
+With the Wine and LLVM-MinGW tools on `PATH`, run the isolated Wine fixture:
+
+```sh
+export VICTORY_TEST_HLE_DLL_DIR=/tmp/victory-gameinput-win-target/x86_64-pc-windows-gnullvm/debug
+export CARGO_TARGET_DIR=/tmp/victory-gameinput-host-target
+cargo test --locked -p victory --target x86_64-apple-darwin \
+  --test wine_gameinput -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, the normally launched synthetic PE passed actual
+named and ordinal import-table checks, matching export addresses, singleton,
+reading, callback, error and reference-lifetime checks. A separate dynamically
+loaded guest verified the module remains pinned after its sole loader reference
+is released. The seven existing GameInput HLE unit tests also passed as Windows
+executables under Wine. No game binary or physical controller was tested.
 
 ## Integrated Wine launcher
 
