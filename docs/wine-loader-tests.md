@@ -420,7 +420,10 @@ reflection mapping semantic names and indices to Metal attributes. Supported
 formats are R32G32B32A32_FLOAT, R32G32_FLOAT, R16G16_FLOAT, and R16G16_UNORM.
 Offsets may be explicit or D3D12_APPEND_ALIGNED_ELEMENT; each slot has a single
 stride and per-vertex or per-instance classification, and per-instance step
-rates must be nonzero. All declared slots must have bounded vertex buffer views.
+rates must be nonzero. For draw-local instance `i`, the fetched record is
+`StartInstanceLocation + floor(i / InstanceDataStepRate)`, following the
+[Direct3D input-assembler address rules](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm) (§8.4.1).
+All declared slots must have bounded vertex buffer views.
 Unsupported formats, system-value vertex inputs, invalid layouts, and
 out-of-range fetches are rejected. This is not general D3D12 vertex input
 support.

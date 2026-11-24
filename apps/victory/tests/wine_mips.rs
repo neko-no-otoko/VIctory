@@ -263,3 +263,22 @@ fn launcher_runs_flexible_vertex_inputs() {
         f.assert_host_gone();
     }
 }
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn launcher_checks_instance_step_fetch_and_bounds() {
+    let f = Fixture::new();
+    let exe = f.build("wine_launcher_mips.c");
+    let host = f.tracked_host();
+    for (variant, code, marker) in [
+        ("--instance-step-boundary", 42, "D3D12X flexible vertex inputs passed"),
+        ("--invalid-instance-range", 43, "invalid vertex range rejected"),
+    ] {
+        let mut cmd = f.command(&exe, &host);
+        cmd.arg("--").arg(variant);
+        let out = run(&mut cmd, f.temp.path());
+        assert_eq!(out.status.code(), Some(code), "{variant}: {}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains(marker), "{variant}: {}\n{}", out.stdout, out.stderr);
+        f.assert_host_gone();
+    }
+}

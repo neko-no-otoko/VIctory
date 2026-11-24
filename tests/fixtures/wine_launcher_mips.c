@@ -77,8 +77,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1],"--vertex-semantic")) vertex_case=6;
         else if (!strcmp(argv[1],"--vertex-unorm")) vertex_case=7;
         else if (!strcmp(argv[1],"--vertex-indexed")) vertex_case=8;
+        else if (!strcmp(argv[1],"--instance-step-boundary")) vertex_case=9;
+        else if (!strcmp(argv[1],"--invalid-instance-range")) vertex_case=10;
         else return 90;
     } else if (argc!=1) return 90;
+    int instance_step=vertex_case==9 || vertex_case==10;
+    /* StartInstanceLocation=1, step=2, count=3 must fetch records 1,1,2.
+       The additive result distinguishes both records and their frequencies. */
+    int instance_input=vertex_case==2 || vertex_case==7 || instance_step;
+    if (instance_step) additive=1;
     if (tls_value!=17) return 91;
     tls_value=23;
     HANDLE thread=CreateThread(0,0,tls_thread,0,0,0); DWORD code=1;
@@ -91,7 +98,7 @@ int main(int argc, char **argv) {
     D3D12_HEAP_PROPERTIES hp={D3D12_HEAP_TYPE_DEFAULT,0,0,0,0};
     D3D12_RESOURCE_DESC rd={D3D12_RESOURCE_DIMENSION_BUFFER,0,vertex_case?112:72,1,1,1,DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,0};
     if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&vb)!=S_OK) return 2;
-    if (vertex_case==2 || vertex_case==7) {rd.Width=16;if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&uvb)!=S_OK) return 28;}
+    if (instance_input) {rd.Width=16;if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&uvb)!=S_OK) return 28;}
     if (vertex_case==8) {rd.Width=8;if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&uvb)!=S_OK) return 28;}
     rd.Width=4096; if (make(dev,&hp,0,&rd,0x400,0,&IID_ID3D12Resource,&out)!=S_OK) return 3;
     rd.Width=4096; if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&upload)!=S_OK) return 4;
@@ -116,10 +123,10 @@ int main(int argc, char **argv) {
     if (vertex_case) {
         memset(v,0xcc,112);
         for (unsigned i=0;i<3;i++) memcpy((unsigned char *)v+i*32+4,tri+i*6,16);
-        if (vertex_case!=2 && vertex_case!=7) for (unsigned i=0;i<3;i++) memcpy((unsigned char *)v+i*32+20,tri+i*6+4,8);
-        if (vertex_case==2 || vertex_case==7) {
+        if (!instance_input) for (unsigned i=0;i<3;i++) memcpy((unsigned char *)v+i*32+20,tri+i*6+4,8);
+        if (instance_input) {
             void *u=0;if (SLOT(uvb,0x40,Map)(uvb,0,0,&u)!=S_OK) return 29;
-            memset(u,0,16); ((unsigned short *)u)[6]=vertex_case==7?0xffff:0x3c00; /* instance record 3: UV=(1,0) */
+            memset(u,0,16); ((unsigned short *)u)[instance_step?4:6]=vertex_case==7?0xffff:0x3c00;
         }
         if (vertex_case==8) {
             void *u=0;if (SLOT(uvb,0x40,Map)(uvb,0,0,&u)!=S_OK) return 29;
@@ -134,6 +141,9 @@ int main(int argc, char **argv) {
         memcpy((unsigned char *)t+offsets[m]+y*pitches[m]+4*x,colors[m],4);
     if (vertex_case==2 || vertex_case==7) for (unsigned y=0;y<heights[0];y++)
         memset((unsigned char *)t+offsets[0]+y*pitches[0],0,4); /* UV=(0,0) differs */
+    const unsigned char first_color[4]={3,5,7,9};
+    if (instance_step) for (unsigned m=0;m<2;m++) for (unsigned y=0;y<heights[m];y++)
+        memcpy((unsigned char *)t+offsets[m]+y*pitches[m],first_color,4);
     void *heaps[5]={0}; U64 cpu[5],gpu[5];
     for (unsigned i=0;i<5;i++) {
         HeapDesc hd={{i==0?2:(i==4?1:0),1,i==0?0:1,0},{0,0}};
@@ -158,7 +168,7 @@ int main(int argc, char **argv) {
         {"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
         {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}
     };
-    if (vertex_case==2 || vertex_case==7) {
+    if (instance_input) {
         elements[0]=(D3D12_INPUT_ELEMENT_DESC){"TEXCOORD",0,vertex_case==7?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R16G16_FLOAT,1,0,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,2};
         elements[1]=(D3D12_INPUT_ELEMENT_DESC){"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,4,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0};
     } else if (vertex_case) {
@@ -237,7 +247,7 @@ int main(int argc, char **argv) {
     float viewport[6]={0,0,8,8,0,1};
     SLOT(list,0xa0,Topology)(list,4); SLOT(list,0xa8,SetArray)(list,1,viewport);
     SLOT(list,0x180,Vertices)(list,0,1,&view); SLOT(list,0x190,Targets)(list,1,&cpu[0],0,0);
-    if (vertex_case==2 || vertex_case==7) {D3D12_VERTEX_BUFFER_VIEW uv={SLOT(uvb,0x58,Handle)(uvb),16,4};SLOT(list,0x180,Vertices)(list,1,1,&uv);}
+    if (instance_input) {D3D12_VERTEX_BUFFER_VIEW uv={SLOT(uvb,0x58,Handle)(uvb),instance_step?(vertex_case==10?8:12):16,4};SLOT(list,0x180,Vertices)(list,1,1,&uv);}
     if (vertex_case==8) {D3D12_INDEX_BUFFER_VIEW ib={SLOT(uvb,0x58,Handle)(uvb),8,DXGI_FORMAT_R16_UINT};SLOT(list,0x178,IndexBuffer)(list,&ib);}
     if (additive || blend_case) {
         const float clear[4]={0.125f,blend_case?0.25f:0.125f,blend_case?0.5f:0.125f,blend_case?0.75f:0.125f};
@@ -248,8 +258,8 @@ int main(int argc, char **argv) {
         SLOT(list,0xb0,SetArray)(list,1,scissor); SLOT(list,0x100,SetHeaps)(list,2,pair);
         SLOT(list,0x120,SetTable)(list,1,gpu[4]); SLOT(list,0x120,SetTable)(list,2,gpu[m+1]);
         if (vertex_case==8) SLOT(list,0x68,DrawIndexed)(list,3,1,1,-1,0);
-        else SLOT(list,0x60,Draw)(list,3,(vertex_case==2 || vertex_case==7)?3:1,0,(vertex_case==2 || vertex_case==7)?2:0);
-        if (additive) SLOT(list,0x60,Draw)(list,3,1,0,0);
+        else SLOT(list,0x60,Draw)(list,3,instance_input?3:1,0,instance_step?1:instance_input?2:0);
+        if (additive && !instance_step) SLOT(list,0x60,Draw)(list,3,1,0,0);
     }
     Barrier texture_read={0,0,texture,{0xffffffffULL | (0x80ULL<<32),0x800}}; SLOT(list,0xd0,BarrierFn)(list,1,&texture_read);
     D3D12_TEXTURE_COPY_LOCATION mipdst={0},mipsrc={0};
@@ -264,7 +274,7 @@ int main(int argc, char **argv) {
     dst.PlacedFootprint.Footprint.Format=DXGI_FORMAT_R8G8B8A8_UNORM; dst.PlacedFootprint.Footprint.Width=8; dst.PlacedFootprint.Footprint.Height=8; dst.PlacedFootprint.Footprint.Depth=1; dst.PlacedFootprint.Footprint.RowPitch=256;
     src.pResource=target; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; SLOT(list,0x80,Copy)(list,&dst,0,0,0,&src,0);
     hr=ID3D12GraphicsCommandList_Close(list);
-    if (vertex_case==3) {
+    if (vertex_case==3 || vertex_case==10) {
         if (FAILED(hr)) {say("invalid vertex range rejected\r\n");return 43;} return 97;
     }
     if (invalid) {
@@ -284,7 +294,8 @@ int main(int argc, char **argv) {
     for (unsigned m=0;m<3;m++) for (unsigned c=0;c<4;c++) {
         int s=colors[m][c], d=(int[]){32,64,128,191}[c];
         int want=s;
-        if (additive) want=32+2*s;
+        if (instance_step) want=32+(m<2 ? 2*first_color[c]+s : 3*s);
+        else if (additive) want=32+2*s;
         else if (blend_case==1) want=(s*s+d*(255-d)+127)/255;
         else if (blend_case==2) want=c==3?d-s:s-d;
         else if (blend_case==3) want=c==3?(s>d?s:d):(s<d?s:d);
@@ -307,7 +318,7 @@ int main(int argc, char **argv) {
     }
     for (unsigned y=0;y<2;y++) {
         for (unsigned x=0;x<3;x++) for (unsigned c=0;c<4;c++)
-            if (pixels[2048+y*256+x*4+c]!=colors[1][c]) return 25;
+            if (pixels[2048+y*256+x*4+c]!=(instance_step && x==0?first_color[c]:colors[1][c])) return 25;
         for (unsigned x=12;x<256;x++) if (pixels[2048+y*256+x]!=0x77) return 26;
     }
     for (unsigned y=0;y<8;y++) for (unsigned x=32;x<256;x++) if (pixels[y*256+x]!=0x77) return 24;
