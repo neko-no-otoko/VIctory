@@ -425,6 +425,23 @@ fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path) -> Result<()>
     Ok(())
 }
 
+// Verify Wine's existing G: drive without creating a mount or rewriting
+// title paths. The guest still uses Wine's ordinary Win32 file APIs.
+fn checked_title_root(prefix: &Path, root: &Path) -> Result<PathBuf> {
+    let root = directory(root, "title root")?;
+    let mapping = prefix.join("dosdevices").join("g:");
+    let metadata = fs::symlink_metadata(&mapping)
+        .with_context(|| format!("Wine G: mapping is missing: {}", mapping.display()))?;
+    if !metadata.file_type().is_symlink() {
+        bail!("Wine G: mapping is not a symlink: {}", mapping.display());
+    }
+    let target = fs::canonicalize(&mapping).context("resolving Wine G: mapping")?;
+    if target != root {
+        bail!("Wine G: mapping {} does not match title root {}", target.display(), root.display());
+    }
+    Ok(root)
+}
+
 // Wine's system32 GameInput placeholder shadows WINEPATH. Provision only in
 // a prefix that was empty at entry; never replace anything in an existing one.
 fn gameinput_file(dir: &Path) -> Result<Option<PathBuf>> {
@@ -536,7 +553,7 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -544,6 +561,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let converter = regular_file(converter, "Metal converter")?;
     let dll_dir = directory(dll_dir, "DLL directory")?;
     let wine_prefix = directory(wine_prefix, "Wine prefix")?;
+    let title_root = title_root.map(|root| checked_title_root(&wine_prefix, root)).transpose()?;
     reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
     preflight(&exe, &dll_dir, provision_gameinput)?;
     let overrides = wine_overrides(provision_gameinput)?;
@@ -574,6 +592,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         .context("winepath unexpectedly still running")?;
     path_child.reaped = true;
     drop(path_child);
+    if let Some(root) = &title_root { checked_title_root(&wine_prefix, root)?; }
     if let Some(provider) = &input_provider {
         if fresh_prefix { install_gameinput(&wine_prefix, provider)?; }
         checked_gameinput_installation(&wine_prefix, provider)?;
@@ -598,6 +617,10 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let address: SocketAddrV4 = std::str::from_utf8(address).context("invalid Metal host address")?.parse().context("invalid Metal host address")?;
     if *address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 { bail!("Metal host announced a non-loopback or zero address"); }
     if let Some(status) = host.try_wait()? { bail!("Metal host exited after readiness: {status}"); }
+    if let Some(root) = &title_root {
+        checked_title_root(&wine_prefix, root)?;
+        eprintln!("Wine G: currently maps to {}; the mapping and guest file access are not sandboxed.", root.display());
+    }
     let mut wine_command = Command::new(&wine);
     wine_command.arg(&exe).args(args).env("WINEPREFIX", &wine_prefix)
         .env("WINEPATH", wine_path).env("WINEDLLOVERRIDES", overrides);
@@ -628,8 +651,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

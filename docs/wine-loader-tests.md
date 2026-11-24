@@ -808,6 +808,36 @@ check does not undo initialization. The launcher does not modify or copy
 guest files; the unsandboxed guest can modify files and Wine may write to the
 prefix.
 
+For a trusted title that expects its files on `G:`, an optional
+`--title-root /absolute/path/to/title` checks that the existing
+`<wine-prefix>/dosdevices/g:` is a symlink resolving to that directory.
+Configure the drive in Wine first (for example, with that prefix's `winecfg`);
+the launcher does not create or change it. The launcher checks before running
+Wine, again after `winepath`, and immediately before starting the guest; an
+absent, dangling, non-symlink or different mapping fails the launch. With no
+option, drive behavior is unchanged. The guest uses Wine's normal file APIs,
+not VIctory's native-fixture file provider.
+
+These are checks at instants in time, not an enforced file-root sandbox:
+another process or the guest can change a mapping after a check, and Wine's
+normal permissions, other drives, symlinks and guest write access still apply.
+Use only trusted guests and stable prefixes and files. No title files are
+modified by this option; Wine itself can modify its prefix and the guest can
+modify files it can access.
+
+With the launcher test environment above, run:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_title_root -- --ignored --nocapture --test-threads=1
+```
+
+On Wine 11 under Rosetta, two synthetic tests passed. The normal Wine PE read
+a UTF-16 title path with case variations, exercised Windows sharing and
+missing-file errors, and used compiler-generated TLS in two worker threads.
+The test checked that the guest executable, title data and preconfigured drive
+link were unchanged. A separate test rejected seven invalid root or mapping
+cases before starting the Metal host.
+
 Wine's [loader](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/ntdll/loader.c#L3205-L3259)
 handles activation contexts and previously loaded modules before ordinary
 directory lookup. Its native/builtin
@@ -925,7 +955,19 @@ title compatibility.
 `xcrdapi.dll` (DirectStorage) remains a separate gap: its upstream HLE calls
 the mapped-title file layer and XMem physical-page state. Linking an
 independent copy into another Wine DLL would split that state; it is not
-provided by the launcher.
+provided by the launcher. A `G:` mapping does not implement DirectStorage.
+
+Microsoft's public [Xbox OpenFile documentation](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragefactoryx/methods/idstoragefactoryx_openfile)
+requires a file interface IID from `dstorage_xs.h`; public method lists do not
+establish all interface IIDs or vtable order. The central directory of the
+public `Microsoft.GDK.Windows` NuGet package 2610.0.9661 contains no
+`dstorage` or `xcrdapi`-named member. Microsoft's
+[GDK repository](https://github.com/microsoft/GDK) describes Xbox Extensions
+as licensed partner-only, and its [access guidance](https://learn.microsoft.com/en-us/gaming/gdk/docs/gdk-dev/development-downloads/access-resources)
+describes the partner agreement and secure-download requirements. Availability
+of a header to a licensed partner does not itself establish permission to
+publish or reuse its contents. Desktop interfaces and guessed slots are not
+substitutes for the applicable console ABI.
 
 With the launcher test environment above:
 
