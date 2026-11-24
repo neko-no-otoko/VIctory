@@ -198,7 +198,10 @@ pub(crate) extern "system" fn create_allocator(
     out: *mut This,
 ) -> HRESULT {
     let allocator = Box::new(Allocator {
+        #[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
         object: Object::new(&ALLOCATOR_FUNCTIONS),
+        #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+        object: Object::new(&native::ALLOCATOR_FUNCTIONS),
         kind,
     });
     object::hand_out(ALLOCATOR, allocator, iid, &ALLOCATOR_IIDS, out)
@@ -266,10 +269,17 @@ fn new_list(
     #[cfg(not(target_os = "macos"))]
     let _ = pipeline;
     let list = Box::new(List {
+        #[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
         } else {
             Object::new(&LIST_FUNCTIONS)
+        },
+        #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+        object: if crate::device::newer() {
+            Object::new(&native::NEWER_LIST_FUNCTIONS)
+        } else {
+            Object::new(&native::LIST_FUNCTIONS)
         },
         kind,
         put: [0; 5],
@@ -1751,6 +1761,97 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn allocator_query_native(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        allocator_query(this, iid, out)
+    }
+    extern "win64" fn allocator_release_native(this: This) -> u32 { allocator_release(this) }
+    extern "win64" fn allocator_reset_native(this: This) -> HRESULT { allocator_reset(this) }
+    extern "win64" fn list_query_native(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        list_query(this, iid, out)
+    }
+    extern "win64" fn list_release_native(this: This) -> u32 { list_release(this) }
+    extern "win64" fn close_native(this: This) -> HRESULT { close(this) }
+    extern "win64" fn reset_native(this: This, allocator: This, pipeline: This) -> HRESULT {
+        reset(this, allocator, pipeline)
+    }
+    extern "win64" fn dispatch_native(this: This, x: u32, y: u32, z: u32) {
+        state::dispatch(this, x, y, z)
+    }
+    extern "win64" fn copy_buffer_native(this: This, dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64) {
+        copy_buffer_region(this, dst, dst_offset, src, src_offset, len)
+    }
+    extern "win64" fn copy_texture_native(this: This, dst: *const CopyLocation, x: u32, y: u32, z: u32, src: *const CopyLocation, source_box: *const [u32; 6]) {
+        copy_texture_region(this, dst, x, y, z, src, source_box)
+    }
+    extern "win64" fn copy_resource_native(this: This, dst: This, src: This) {
+        copy_resource(this, dst, src)
+    }
+    extern "win64" fn pipeline_native(this: This, pipeline: This) { set_pipeline(this, pipeline) }
+    extern "win64" fn barrier_native(this: This, count: u32, barriers: *const Barrier) -> u32 {
+        barrier(this, count, barriers)
+    }
+    extern "win64" fn heaps_native(this: This, count: u32, heaps: *const This) {
+        state::heaps(this, count, heaps)
+    }
+    extern "win64" fn table_native(this: This, slot: u32, handle: u64) {
+        state::compute_table(this, slot, handle)
+    }
+    extern "win64" fn constant_native(this: This, slot: u32, value: u32, offset: u32) {
+        state::compute_constant(this, slot, value, offset)
+    }
+    extern "win64" fn constants_native(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
+        state::compute_constants(this, slot, count, values, offset)
+    }
+    extern "win64" fn copy_texture_x_native(this: This, dst: *const CopyLocation, x: u32, y: u32, z: u32, src: *const CopyLocation, source_box: *const [u32; 6], flags: u32) {
+        copy_texture_region_x(this, dst, x, y, z, src, source_box, flags)
+    }
+    extern "win64" fn copy_resource_x_native(this: This, dst: This, src: This, flags: u32) {
+        copy_resource_x(this, dst, src, flags)
+    }
+    extern "win64" fn dispatch_x_native(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        dispatch_x(this, x, y, z, flags)
+    }
+
+    pub(super) static ALLOCATOR_FUNCTIONS: Table<24> = {
+        let mut f = object::native_table::<24>();
+        f[0] = allocator_query_native as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = allocator_release_native as *const ();
+        f[8] = allocator_reset_native as *const ();
+        Table(f)
+    };
+
+    const fn list_table(newer: bool) -> [*const (); 160] {
+        let mut f = object::native_table::<160>();
+        f[0] = list_query_native as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = list_release_native as *const ();
+        f[9] = close_native as *const ();
+        f[10] = reset_native as *const ();
+        f[14] = dispatch_native as *const ();
+        f[15] = copy_buffer_native as *const ();
+        f[16] = copy_texture_native as *const ();
+        f[17] = copy_resource_native as *const ();
+        f[25] = pipeline_native as *const ();
+        f[26] = barrier_native as *const ();
+        f[32] = heaps_native as *const ();
+        f[35] = table_native as *const ();
+        f[37] = constant_native as *const ();
+        f[39] = constants_native as *const ();
+        f[if newer { newer_slot(78) } else { 78 }] = dispatch_x_native as *const ();
+        f[if newer { newer_slot(83) } else { 83 }] = copy_texture_x_native as *const ();
+        f[if newer { newer_slot(84) } else { 84 }] = copy_resource_x_native as *const ();
+        f
+    }
+    pub(super) static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
+    pub(super) static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+}
 
 #[cfg(test)]
 mod tests {

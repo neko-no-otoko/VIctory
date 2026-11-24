@@ -112,7 +112,10 @@ const _: () = assert!(size_of::<Device>() == 0x58);
 
 /// One device per process, as on the console.
 pub(crate) static DEVICE: Device = Device {
+    #[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
     object: Object::new(&FUNCTIONS),
+    #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+    object: Object::new(&NATIVE_FUNCTIONS),
     null_constant_buffer: 0,
     out_of_line: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
@@ -153,6 +156,17 @@ pub extern "system" fn create(
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     object::answer(object::DEVICE, iid, Some(device()), out)
+}
+
+/// Creates the actual device for a native Win64 guest.
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+pub unsafe extern "win64" fn native_create(
+    adapter: *const c_void,
+    parameters: *const u32,
+    iid: *const Iid,
+    out: *mut *const Object,
+) -> HRESULT {
+    create(adapter, parameters, iid, out)
 }
 
 /// Set when the title creates the device as `ID3D12Device11`. Its lists and
@@ -402,6 +416,62 @@ static FUNCTIONS: Table<160> = {
     f[133] = resource::create_at_address as *const (); // 0x428
     Table(f)
 };
+
+// Guest tables never contain host-ABI function pointers, including for
+// unsupported interfaces and object methods.
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        object::answer(object::DEVICE, iid, is_device(iid).then_some(this), out)
+    }
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn release(this: This) -> u32 { object::release(this) }
+    extern "win64" fn queue(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
+        queue::create(this, desc.cast(), iid, out)
+    }
+    extern "win64" fn allocator(this: This, kind: u32, iid: *const Iid, out: *mut This) -> HRESULT {
+        list::create_allocator(this, kind, iid, out)
+    }
+    extern "win64" fn compute(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
+        pipeline::create_compute(this, desc.cast(), iid, out)
+    }
+    extern "win64" fn list(this: This, nodes: u32, kind: u32, allocator: This, pipeline: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        list::create_list(this, nodes, kind, allocator, pipeline, iid, out)
+    }
+    extern "win64" fn heap(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
+        descriptor::create_heap(this, desc.cast(), iid, out)
+    }
+    extern "win64" fn uav(this: This, resource: This, counter: This, desc: *const [u32; 10], handle: u64) {
+        descriptor::create_uav(this, resource, counter, desc, handle)
+    }
+    extern "win64" fn committed(this: This, heap: *const c_void, flags: u32, desc: *const c_void, state: u32, clear: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
+        resource::create_committed(this, heap.cast(), flags, desc.cast(), state, clear, iid, out)
+    }
+    extern "win64" fn fence(this: This, initial: u64, flags: u32, iid: *const Iid, out: *mut This) -> HRESULT {
+        fence::create(this, initial, flags, iid, out)
+    }
+
+    pub(super) static FUNCTIONS: Table<160> = {
+        let mut f = object::native_table::<160>();
+        f[0] = query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = release as *const ();
+        f[8] = queue as *const ();
+        f[9] = allocator as *const ();
+        f[11] = compute as *const ();
+        f[12] = list as *const ();
+        f[14] = heap as *const ();
+        f[19] = uav as *const ();
+        f[27] = committed as *const ();
+        f[36] = fence as *const ();
+        Table(f)
+    };
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+use native::FUNCTIONS as NATIVE_FUNCTIONS;
 
 #[cfg(test)]
 mod tests {
