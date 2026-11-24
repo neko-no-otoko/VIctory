@@ -1023,7 +1023,8 @@ launcher waits for the old Wine child to exit, tears down its process group,
 checks the requested executable and its imports again, and launches it with the
 same prefix, provider configuration, Metal host and save-root lock. An empty
 executable requests the current guest; a nonempty executable must be an
-absolute Windows drive path, not a relative or UNC path. A missing target,
+absolute Windows drive path, not a relative or UNC path. The executable and
+argument strings must be UTF-8 and at most 32,767 bytes each. A missing target,
 invalid request or unavailable launcher channel fails explicitly instead of
 silently restarting the wrong image. The guest and prefix remain trusted; the
 inherited token is not a security boundary against same-user processes.
