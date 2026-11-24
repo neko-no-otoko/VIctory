@@ -123,6 +123,9 @@ enum Command {
         /// Trusted dependent DLL path; repeat for each dependency.
         #[arg(long)]
         dll: Vec<PathBuf>,
+        /// Allow the restricted read-only file API under this directory.
+        #[arg(long)]
+        file_root: Option<PathBuf>,
         /// Execute trusted code in this process (unsafe; no isolation).
         #[arg(long)]
         execute: bool,
@@ -209,7 +212,7 @@ fn main() -> Result<()> {
             stage,
         } => metal::convert(&input, &output, &library, stage),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        Command::NativeFixture { exe, dll, execute } => native_fixture::run(&exe, &dll, execute),
+        Command::NativeFixture { exe, dll, execute, file_root } => native_fixture::run(&exe, &dll, execute, file_root.as_deref()),
         #[cfg(windows)]
         Command::Run {
             exe,

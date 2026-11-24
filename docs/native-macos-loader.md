@@ -134,16 +134,17 @@ users remain when the entry returns. A crash, process exit or nonreturning
 entry cannot be handled by this API.
 
 This is **not Windows process startup**. It does not construct the Windows
-process parameters, PEB/TEB, startup stack, CRT, TLS, exception handling or
-Windows APIs. An ordinary Windows or Xbox executable cannot be assumed to
-meet the controlled entry contract, and this is not title execution support.
+process parameters, PEB/TEB, startup stack, CRT, TLS, exception handling or a
+complete Windows API environment. An ordinary Windows or Xbox executable
+cannot be assumed to meet the controlled entry contract, and this is not
+title execution support.
 The same unsupported-image checks apply to executables and DLLs.
 
 The caller must ensure the DLL and all callbacks are trusted, ABI-correct,
 properly initialized and safely serialized, and that users are quiescent
 before detach. Windows loader-lock semantics, thread notifications, the TEB,
-GS-based TLS, exception handling, dynamic DLL loading and Windows APIs are not
-provided. The caller must detach before dropping an attached image: `Drop`
+GS-based TLS, exception handling and dynamic DLL loading are not provided.
+The caller must detach before dropping an attached image: `Drop`
 only unmaps memory and never invokes arbitrary code. Export addresses remain
 valid only while the image is alive. Calling an export executes arbitrary
 machine code.
@@ -168,6 +169,19 @@ paths with the same basename are rejected even if they are in different
 directories. The loader attaches DLLs in dependency order and detaches in
 reverse order; cycles, forwarded exports, unsupported images and missing
 imports are rejected. DLLs are not searched for or loaded dynamically.
+
+Passing `--file-root /path/to/directory` enables a restricted synchronous
+read-only `kernel32.dll` file API for the executing thread. It accepts relative
+UTF-16 paths within that directory and rejects absolute paths, traversal and
+symlink components; file handles are closed when the execution scope ends.
+The API provides `CreateFileW`, `ReadFile`, `SetFilePointerEx`, `GetFileSizeEx`,
+`CloseHandle`, `GetLastError`, and `SetLastError`. Only regular files opened
+for reading with `OPEN_EXISTING` and `FILE_SHARE_READ` are supported; other
+access modes, creation modes, flags, and overlapped I/O are rejected. Windows
+sharing restrictions against external host processes are not enforced.
+Without `--file-root`, these imports remain unresolved. This path binding is
+not a process sandbox: guest machine code and host callbacks execute
+unsandboxed and must be trusted.
 
 With `--execute`, executable and DLL code runs **unsandboxed in the CLI
 process** and can crash, hang or corrupt it. Only pass trusted images with

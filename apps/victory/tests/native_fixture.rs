@@ -219,3 +219,92 @@ unsigned entry(void) { return *relocate == 7 ? consumer_call() : 0; }
     std::fs::write(&invalid, b"not a PE").unwrap();
     assert!(!cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), invalid.as_os_str()]).status.success());
 }
+
+#[test]
+fn native_fixture_reads_scoped_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("café.bin"), b"0123456789").unwrap();
+    std::fs::write(dir.path().join("outside.bin"), b"outside").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside.bin"), root.join("link")).unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateFileW\nReadFile\nSetFilePointerEx\nGetFileSizeEx\nCloseHandle\nGetLastError\n").unwrap();
+    std::fs::write(dir.path().join("files.c"), r#"
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef int BOOL;
+typedef unsigned short WCHAR;
+__declspec(dllimport) HANDLE CreateFileW(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE);
+__declspec(dllimport) BOOL ReadFile(HANDLE, void *, DWORD, DWORD *, void *);
+__declspec(dllimport) BOOL SetFilePointerEx(HANDLE, long long, long long *, DWORD);
+__declspec(dllimport) BOOL GetFileSizeEx(HANDLE, long long *);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) DWORD GetLastError(void);
+#define INVALID ((HANDLE)-1)
+#define READ 0x80000000UL
+#define WRITE 0x40000000UL
+#define OPEN_EXISTING 3
+#define NORMAL 0x80
+static const WCHAR name[] = {'c','a','f',0xe9,'.','b','i','n',0};
+static const WCHAR missing[] = {'m','i','s','s','i','n','g',0};
+static const WCHAR traversal[] = {'.','.','/','o','u','t','s','i','d','e','.','b','i','n',0};
+static const WCHAR link[] = {'l','i','n','k',0};
+int marker = 7; int *volatile relocated_marker = &marker;
+unsigned entry(void) {
+    HANDLE h, bad;
+    DWORD n;
+    long long size, position;
+    char buf[16];
+    unsigned long long overlapped[4] = {0};
+    if (*relocated_marker != 7) return 1;
+    h = CreateFileW(name, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (h == INVALID || !h) return 2;
+    size = -1;
+    if (!GetFileSizeEx(h, &size) || size != 10) return 3;
+    n = 99;
+    if (!ReadFile(h, buf, 4, &n, 0) || n != 4 ||
+        buf[0] != '0' || buf[1] != '1' || buf[2] != '2' || buf[3] != '3') return 4;
+    position = -1;
+    if (!SetFilePointerEx(h, -3, &position, 2) || position != 7) return 5;
+    n = 99;
+    if (!ReadFile(h, buf, sizeof(buf), &n, 0) || n != 3 ||
+        buf[0] != '7' || buf[1] != '8' || buf[2] != '9') return 6;
+    n = 99;
+    if (!ReadFile(h, buf, sizeof(buf), &n, 0) || n != 0) return 7;
+    if (!SetFilePointerEx(h, 1, &position, 0) || position != 1) return 8;
+    if (!SetFilePointerEx(h, 2, &position, 1) || position != 3) return 9;
+    n = 99;
+    if (!ReadFile(h, buf, 3, &n, 0) || n != 3 ||
+        buf[0] != '3' || buf[1] != '4' || buf[2] != '5') return 10;
+    if (ReadFile(h, buf, 1, &n, overlapped) || GetLastError() != 50) return 11;
+    if (!CloseHandle(h)) return 12;
+    if (CloseHandle(h) || GetLastError() != 6) return 13;
+    if (ReadFile(h, buf, 1, &n, 0) || GetLastError() != 6) return 14;
+    if (GetFileSizeEx(h, &size) || GetLastError() != 6) return 15;
+    if (SetFilePointerEx(h, 0, &position, 0) || GetLastError() != 6) return 16;
+    if (CloseHandle((HANDLE)12345) || GetLastError() != 6) return 17;
+    bad = CreateFileW(missing, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 2) return 18;
+    bad = CreateFileW(traversal, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 19;
+    bad = CreateFileW(name, WRITE, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 50) return 20;
+    bad = CreateFileW(name, READ, 1, 0, 2, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 50) return 21;
+    bad = CreateFileW(name, READ, 1, 0, OPEN_EXISTING, 0x40000000UL, 0);
+    if (bad != INVALID || GetLastError() != 50) return 22;
+    bad = CreateFileW(link, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 23;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "files.c", "-o", "files.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:files.exe", "files.obj", "kernel32.lib"]);
+    let exe = dir.path().join("files.exe");
+    let no_root = cli(&["native-fixture".as_ref(), exe.as_os_str()]);
+    assert!(!no_root.status.success(), "file APIs must require --file-root");
+    let executed = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--file-root".as_ref(), root.as_os_str(), "--execute".as_ref()]);
+    assert!(executed.status.success(), "{}", String::from_utf8_lossy(&executed.stderr));
+    assert!(String::from_utf8_lossy(&executed.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&executed.stdout));
+}

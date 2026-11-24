@@ -1,6 +1,11 @@
 //! Limited native guest services for x86-64 macOS.
 //!
 //! This is not the Windows HLE registry or a complete Xbox runtime.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod files;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub use files::FileScope;
+
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod macos {
@@ -13,6 +18,9 @@ mod macos {
 
     impl ImportResolver for NativeResolver {
         fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+            if let Some(address) = crate::files::resolve(dll, symbol) {
+                return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
+            }
             if dll.eq_ignore_ascii_case("d3d12_xs.dll")
                 && matches!(symbol, ImportSymbol::Name { name, .. } if name == "D3D12XboxCreateDevice")
             {

@@ -762,6 +762,7 @@ dependencies = [
 name = "victory-native"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempfile",
  "victory-gpu",
  "victory-loader",

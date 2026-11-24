@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use victory_loader::macos::Executable;
 
-pub fn run(path: &Path, dlls: &[PathBuf], execute: bool) -> Result<()> {
+pub fn run(path: &Path, dlls: &[PathBuf], execute: bool, file_root: Option<&Path>) -> Result<()> {
     eprintln!("WARNING: trusted controlled fixtures only; this is not Windows process startup or game support. --execute runs unsandboxed code in this process; it may crash, hang, or corrupt the process.");
+    let _files = file_root.map(victory_native::FileScope::enter).transpose()
+        .context("opening native fixture file root")?;
     let mut names: Vec<&str> = Vec::with_capacity(dlls.len());
     for dll in dlls {
         let name = dll.file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty())

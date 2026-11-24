@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+libc = "0.2"
 victory-loader.workspace = true
 victory-pe.workspace = true
 victory-runtime = { path = "../victory-runtime" }
