@@ -84,7 +84,7 @@ impl Fixture {
         assert!(out.status.success(), "{command:?}: {}\n{}\n{}", out.status, out.stdout, out.stderr);
     }
 
-    fn build(&self) -> PathBuf {
+    fn build(&self, fixture: &str) -> PathBuf {
         let dir = self.temp.path();
         let exports = [
             ("d3d12_xs", "D3D12XboxCreateDevice"),
@@ -98,8 +98,8 @@ impl Fixture {
             cmd.args(["-m", "i386:x86-64", "-d"]).arg(def).arg("-l").arg(dir.join(format!("{name}.lib")));
             self.checked(&mut cmd);
         }
-        let exe = dir.join("mips.exe");
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wine_launcher_mips.c");
+        let exe = dir.join("fixture.exe");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../tests/fixtures/{fixture}"));
         let mut cmd = Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"));
         cmd.args(["-std=c11", "-fno-emulated-tls", "-O1"]).arg(source);
         for (name, _) in exports { cmd.arg(dir.join(format!("{name}.lib"))); }
@@ -172,7 +172,7 @@ impl Drop for Fixture {
 #[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
 fn launcher_runs_real_mip_sampling_and_rejects_invalid_cases() {
     let f = Fixture::new();
-    let exe = f.build();
+    let exe = f.build("wine_launcher_mips.c");
     let host = f.tracked_host();
     let out = run(&mut f.command(&exe, &host), f.temp.path());
     assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
@@ -216,6 +216,26 @@ fn launcher_runs_real_mip_sampling_and_rejects_invalid_cases() {
         assert!(out.status.code() == Some(43) && out.stdout.contains("D3D12X invalid mip case rejected")
             || !out.status.success() && out.stderr.contains("Wine Metal proxy:"),
             "{variant}: {}: {}\n{}", out.status, out.stdout, out.stderr);
+        f.assert_host_gone();
+    }
+}
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn launcher_runs_real_depth_stencil() {
+    let f = Fixture::new();
+    let exe = f.build("wine_launcher_stencil.c");
+    let host = f.tracked_host();
+    let out = run(&mut f.command(&exe, &host), f.temp.path());
+    assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("Wine Metal depth stencil passed"), "{}\n{}", out.stdout, out.stderr);
+    f.assert_host_gone();
+    for variant in ["--invalid-op", "--invalid-format"] {
+        let mut cmd = f.command(&exe, &host);
+        cmd.arg("--").arg(variant);
+        let out = run(&mut cmd, f.temp.path());
+        assert_eq!(out.status.code(), Some(43), "{variant}: {}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("rejected"), "{variant}: {}\n{}", out.stdout, out.stderr);
         f.assert_host_gone();
     }
 }

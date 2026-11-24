@@ -56,11 +56,11 @@ fn copy_texture(rs:&mut HashMap<u64,Resource>,c:CopyTexture)->Result<(),String> 
 }
 enum Indices { U16(Vec<u16>), U32(Vec<u32>) }
 fn depth_image(r:&Resource)->Result<(u32,u32),String> {
-    let ResourceKind::Texture {width,height,format:40,mips:1}=r.kind else {return Err("expected single-mip D32_FLOAT texture".into())};
-    let size=texture_size(40,width,height,1).ok_or("invalid depth texture dimensions")?;
+    let ResourceKind::Texture {width,height,format:fmt @ (20|40),mips:1}=r.kind else {return Err("expected single-mip D32_FLOAT or D32_FLOAT_S8X24 texture".into())};
+    let size=texture_size(fmt,width,height,1).ok_or("invalid depth texture dimensions")?;
     if r.bytes.len()!=size {return Err("invalid depth texture size".into())} Ok((width,height))
 }
-fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,Prepared>,d:Draw)->Result<(),String> {
+fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,Prepared>,d:Draw,stencil_reference:u32)->Result<(),String> {
     let p=pipelines.get(&d.pipeline).ok_or("unknown pipeline")?;
     if d.instance_count!=1 || d.first_instance!=0 || d.topology!=4 || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride || d.vertex_count==0 || d.vertex_count%3!=0 {return Err("unsupported draw topology, instances or vertex layout".into())}
     if d.target==d.vertex_buffer || d.texture==Some(d.target) || d.depth==Some(d.target) || d.depth==d.texture && d.depth.is_some() {return Err("draw resource alias is unsupported".into())}
@@ -83,7 +83,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         else {let v:Vec<u32>=bytes.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();if v.iter().any(|&x|!check(x)) {return Err("index out of bounds".into())} Some(Indices::U32(v))}
     } else {None};
     if !prepared.contains_key(&d.pipeline) {
-        let depth=if let Some(z)=&p.depth {if !(1..=8).contains(&z.compare) {return Err("unsupported depth comparison".into())} Some(DepthState {write:z.write,compare:z.compare})} else {None};
+        let depth=if let Some(z)=&p.depth {if !(1..=8).contains(&z.compare) {return Err("unsupported depth comparison".into())} Some(DepthState {write:z.write,compare:z.compare,stencil:z.stencil.as_ref().map(|s|victory_metal::StencilState {enabled:s.enabled,read_mask:s.read_mask,write_mask:s.write_mask,front:s.front,back:s.back})})} else {None};
         if p.blend.write_mask>15 {return Err("invalid blend mask".into())}
         let state=GraphicsState {depth,blend:BlendState {enabled:p.blend.enabled,write_mask:p.blend.write_mask,factors:p.blend.factors},input_uv:p.vertex_stride==24,color_format};
         prepared.insert(d.pipeline,Prepared::new(&p.vertex_shader,&p.pixel_shader,state)?);
@@ -98,7 +98,8 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     let clip=|v:i32,limit:u32| i64::from(v).clamp(0,i64::from(limit)) as u32;
     let (left,top,right,bottom)=(clip(sc[0],width),clip(sc[1],height),clip(sc[2],width),clip(sc[3],height));
     let viewport=d.viewport.map(f64::from); let scissor=[left,top,right-left,bottom-top];
-    let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} Some(r.bytes.chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
+    let mut stencil=None;
+    let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} let combined=matches!(r.kind,ResourceKind::Texture {format:20,..});if combined != p.depth.as_ref().is_some_and(|z|z.stencil.is_some()) {return Err("pipeline depth format mismatch".into())} let size=(width as usize)*(height as usize)*4;if combined {stencil=Some(r.bytes[size..].to_vec());} Some(r.bytes[..size].chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
     let mut target=rs.remove(&d.target).ok_or("unknown target")?;
     let sampled=if let Some(id)=d.texture {
         let r=rs.get(&id).ok_or("unknown sampled texture")?;let (w,h,mips,f)=image(r)?;
@@ -111,19 +112,19 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         Some(Texture {width:view_width,height:view_height,levels:d.mip_count,pixels:&r.bytes[start..end_offset],filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:f,min_lod:0.,max_lod:0.})
     } else {if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())} None};
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
-    let result=if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),&constants,sampled,&mut target.bytes)};
+    let result=if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,sampled,&mut target.bytes)};
     rs.insert(d.target,target);result?;
-    if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;for (bytes,value) in r.bytes.chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}}
+    if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;let size=depth.len()*4;for (bytes,value) in r.bytes[..size].chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}if let Some(stencil)=stencil {r.bytes[size..].copy_from_slice(&stencil);}}
     Ok(())
 }
 /// Execute a complete batch in order. Returned snapshots are the only committed state.
 pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
     let mut rs=HashMap::new(); for r in batch.resources {
-        if let ResourceKind::Texture {format:fmt,..}=r.kind {if fmt==40 {depth_image(&r)?;} else {image(&r)?;}}
+        if let ResourceKind::Texture {format:fmt,..}=r.kind {if matches!(fmt,20|40) {depth_image(&r)?;} else {image(&r)?;}}
         if r.id==0 || rs.insert(r.id,r).is_some() {return Err("duplicate resource id".into())}
     }
     let mut pipelines=HashMap::new();for p in batch.pipelines {if p.id==0 || pipelines.insert(p.id,p).is_some() {return Err("duplicate pipeline id".into())}}
-    let mut prepared=HashMap::new();let mut touched=HashMap::new();
+    let mut prepared=HashMap::new();let mut touched=HashMap::new();let mut stencil_reference=0;
     for c in batch.commands {match c {
         Command::Barrier {id,before,after}=>{
             let r=rs.get_mut(&id).ok_or("unknown barrier resource")?;let texture=matches!(r.kind,ResourceKind::Texture {..});
@@ -136,10 +137,35 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}
             if let Some(id)=d.texture {access(&mut rs,&mut touched,id,0x80)?;}
             if let Some(id)=d.depth {access(&mut rs,&mut touched,id,0x10)?;}
-            draw(&mut rs,&pipelines,&mut prepared,d)?;
+            draw(&mut rs,&pipelines,&mut prepared,d,stencil_reference)?;
         },
         Command::CopyTexture(c)=>{access(&mut rs,&mut touched,c.src,0x800)?;access(&mut rs,&mut touched,c.dst,0x400)?;copy_texture(&mut rs,c)?;},
-        Command::ClearDepth {target,depth}=>{access(&mut rs,&mut touched,target,0x10)?;if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {return Err("invalid depth clear".into())} let r=rs.get_mut(&target).ok_or("unknown depth target")?;depth_image(r)?;for bytes in r.bytes.chunks_exact_mut(4) {bytes.copy_from_slice(&depth.to_bits().to_le_bytes());}},
+        Command::ClearDepth {target,depth}=>{access(&mut rs,&mut touched,target,0x10)?;if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {return Err("invalid depth clear".into())} let r=rs.get_mut(&target).ok_or("unknown depth target")?;depth_image(r)?;if !matches!(r.kind,ResourceKind::Texture {format:40,..}) {return Err("expected D32_FLOAT target".into())}for bytes in r.bytes.chunks_exact_mut(4) {bytes.copy_from_slice(&depth.to_bits().to_le_bytes());}},
+        Command::SetStencilRef(value)=>{stencil_reference=value & 255;},
+        Command::ClearStencil {target,flags,depth,stencil}=>{
+            access(&mut rs,&mut touched,target,0x10)?;
+            if flags==0 || flags & !3 != 0 || (flags & 1 != 0 && (!depth.is_finite() || !(0.0..=1.0).contains(&depth))) {return Err("invalid depth stencil clear".into())}
+            let r=rs.get_mut(&target).ok_or("unknown depth target")?;
+            let (w,h)=depth_image(r)?;if !matches!(r.kind,ResourceKind::Texture {format:20,..}) {return Err("expected depth stencil target".into())}
+            let size=w as usize*h as usize*4;
+            if flags & 1 != 0 {for bytes in r.bytes[..size].chunks_exact_mut(4) {bytes.copy_from_slice(&depth.to_bits().to_le_bytes());}}
+            if flags & 2 != 0 {r.bytes[size..].fill(stencil);}
+        },
+        Command::CopyDepthStencil {src,dst,offset,pitch,width,height,plane,upload}=>{
+            access(&mut rs,&mut touched,src,0x800)?;access(&mut rs,&mut touched,dst,0x400)?;
+            let (tid,bid)=if upload {(dst,src)}else{(src,dst)};
+            if tid==bid || plane>1 {return Err("invalid depth stencil copy".into())}
+            let tex=rs.get(&tid).ok_or("unknown depth texture")?;
+            if !matches!(tex.kind,ResourceKind::Texture {format:20,mips:1,..}) || depth_image(tex)?!=(width,height) {return Err("invalid depth stencil copy texture".into())}
+            let row=(width as usize).checked_mul(if plane==0 {4}else{1}).ok_or("copy row overflow")?;
+            let plane_offset=if plane==0 {0}else{(width as usize)*(height as usize)*4};
+            if offset%512!=0 || pitch%256!=0 || (pitch as usize)<row {return Err("invalid depth stencil copy pitch".into())}
+            let span=(height as usize-1).checked_mul(pitch as usize).and_then(|n|n.checked_add(row)).ok_or("copy overflow")?;
+            let buf=rs.get(&bid).ok_or("unknown copy buffer")?;buffer(buf)?;let start=range(offset,span as u64,buf.bytes.len())?.start;
+            let mut dest=rs.remove(&dst).ok_or("unknown destination")?;let source=rs.get(&src).ok_or("unknown source")?;
+            for y in 0..height as usize {let a=plane_offset+y*row;let b=start+y*pitch as usize;if upload {dest.bytes[a..a+row].copy_from_slice(&source.bytes[b..b+row]);}else{dest.bytes[b..b+row].copy_from_slice(&source.bytes[a..a+row]);}}
+            rs.insert(dst,dest);
+        },
         Command::CopyBuffer {src,dst,src_offset,dst_offset,size}=>{access(&mut rs,&mut touched,src,0x800)?;access(&mut rs,&mut touched,dst,0x400)?;let s=rs.get(&src).ok_or("unknown source")?;buffer(s)?;let a=range(src_offset,size,s.bytes.len())?;let d=rs.get(&dst).ok_or("unknown destination")?;buffer(d)?;let b=range(dst_offset,size,d.bytes.len())?;if src==dst {rs.get_mut(&dst).unwrap().bytes.copy_within(a,b.start);} else {let mut d=rs.remove(&dst).unwrap();d.bytes[b].copy_from_slice(&rs.get(&src).unwrap().bytes[a]);rs.insert(dst,d);}},
     }}
     for (id,decay) in touched {if decay {rs.get_mut(&id).unwrap().state=0;}}

@@ -177,6 +177,8 @@ bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, ui
 @property(nonatomic, strong) id<MTLTexture> texture;
 @property(nonatomic, strong) id<MTLTexture> depthTexture;
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;
+@property(nonatomic) BOOL hasStencil;
+@property(nonatomic) uint32_t stencilReference;
 @property(nonatomic, strong) id<MTLBuffer> readback;
 @property(nonatomic, strong) id<MTLBuffer> vertices;
 @property(nonatomic, strong) id<MTLBuffer> indices;
@@ -238,13 +240,40 @@ static MTLBlendOperation blendOperation(uint32_t op) {
 static bool alphaBlendFactor(uint32_t factor) {
     return factor == 1 || factor == 2 || (factor >= 5 && factor <= 8);
 }
+static MTLStencilOperation stencilOp(uint32_t op) {
+    switch (op) {
+        case 1: return MTLStencilOperationKeep;
+        case 2: return MTLStencilOperationZero;
+        case 3: return MTLStencilOperationReplace;
+        case 4: return MTLStencilOperationIncrementClamp;
+        case 5: return MTLStencilOperationDecrementClamp;
+        case 6: return MTLStencilOperationInvert;
+        case 7: return MTLStencilOperationIncrementWrap;
+        case 8: return MTLStencilOperationDecrementWrap;
+        default: return (MTLStencilOperation)NSUIntegerMax;
+    }
+}
+
+static MTLStencilDescriptor *stencilFace(const uint32_t *face, uint32_t readMask, uint32_t writeMask) {
+    if (face[3] < 1 || face[3] > 8) return nil;
+    for (unsigned i = 0; i < 3; ++i) if (face[i] < 1 || face[i] > 8) return nil;
+    MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+    s.stencilFailureOperation = stencilOp(face[0]);
+    s.depthFailureOperation = stencilOp(face[1]);
+    s.depthStencilPassOperation = stencilOp(face[2]);
+    s.stencilCompareFunction = (MTLCompareFunction)(face[3] - 1);
+    s.readMask = readMask;
+    s.writeMask = writeMask;
+    return s;
+}
+
 
 
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
-                           bool blend_enabled, uint8_t write_mask, const uint32_t *blend_factors,
+                           const uint32_t *stencil, bool blend_enabled, uint8_t write_mask, const uint32_t *blend_factors,
                            bool vertex_uv, uint32_t format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
@@ -302,7 +331,8 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         color.destinationRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[1]);
         color.sourceAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[3]);
         color.destinationAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[4]);
-        if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        if (depth_compare) desc.depthAttachmentPixelFormat = stencil ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatDepth32Float;
+        if (stencil) desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");
         MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:colorFormat width:width height:height mipmapped:NO];
@@ -315,12 +345,18 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
             MTLDepthStencilDescriptor *depth = [MTLDepthStencilDescriptor new];
             depth.depthCompareFunction = (MTLCompareFunction)(depth_compare - 1);
             depth.depthWriteEnabled = depth_write;
+            if (stencil && stencil[0]) {
+                depth.frontFaceStencil = stencilFace(stencil + 3, stencil[1], stencil[2]);
+                depth.backFaceStencil = stencilFace(stencil + 7, stencil[1], stencil[2]);
+                if (!depth.frontFaceStencil || !depth.backFaceStencil) FAIL(@"invalid stencil state");
+            }
             r.depthState = [r.device newDepthStencilStateWithDescriptor:depth];
-            MTLTextureDescriptor *depthTexture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:width height:height mipmapped:NO];
+            MTLTextureDescriptor *depthTexture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:stencil ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatDepth32Float width:width height:height mipmapped:NO];
             depthTexture.storageMode = MTLStorageModePrivate;
             depthTexture.usage = MTLTextureUsageRenderTarget;
             r.depthTexture = [r.device newTextureWithDescriptor:depthTexture];
             if (!r.depthState || !r.depthTexture) FAIL(@"depth attachment allocation failed");
+            r.hasStencil = stencil != NULL;
         }
         size_t row = (size_t)width * 4;
         r.stride = (row + 255) & ~(size_t)255;
@@ -335,6 +371,12 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
             pass.depthAttachment.loadAction = MTLLoadActionClear;
             pass.depthAttachment.clearDepth = 1.0;
             pass.depthAttachment.storeAction = MTLStoreActionStore;
+            if (r.hasStencil) {
+                pass.stencilAttachment.texture = r.depthTexture;
+                pass.stencilAttachment.loadAction = MTLLoadActionClear;
+                pass.stencilAttachment.clearStencil = 0;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
             id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
             if (!command || !encoder) FAIL(@"depth initialization command failed");
             [encoder endEncoding];
@@ -380,14 +422,15 @@ static bool depthTransfer(id<MTLCommandQueue> queue, id<MTLTexture> texture, id<
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     if (!command || !blit) return fail(error, error_len, @"depth transfer command failed");
     MTLSize size = MTLSizeMake(texture.width, texture.height, 1);
+    MTLBlitOption options = texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;
     if (upload)
         [blit copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:stride
          sourceBytesPerImage:stride * texture.height sourceSize:size toTexture:texture
-         destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+         destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0) options:options];
     else
         [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
          sourceSize:size toBuffer:buffer destinationOffset:0 destinationBytesPerRow:stride
-         destinationBytesPerImage:stride * texture.height];
+         destinationBytesPerImage:stride * texture.height options:options];
     [blit endEncoding];
     [command commit];
     [command waitUntilCompleted];
@@ -405,6 +448,39 @@ bool victory_metal_depth_pixels(void *handle, float *pixels, bool upload, char *
         if (!r.depthTexture) return fail(error, error_len, @"depth attachment is not enabled");
         return depthTransfer(r.queue, r.depthTexture, r.readback, r.stride, (uint8_t *)pixels,
                              (size_t)r.width * sizeof(float), upload, error, error_len);
+    }
+}
+
+void victory_metal_stencil_reference(void *handle, uint32_t reference) {
+    VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+    r.stencilReference = reference & 255;
+}
+
+bool victory_metal_stencil_pixels(void *handle, uint8_t *pixels, bool upload, char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+        if (!r.hasStencil) return fail(error, error_len, @"stencil attachment is not enabled");
+        if (upload) for (NSUInteger y = 0; y < r.height; ++y)
+            memcpy((uint8_t *)r.readback.contents + y * r.stride, pixels + y * r.width, r.width);
+        id<MTLCommandBuffer> command = [r.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!command || !blit) return fail(error, error_len, @"stencil transfer command failed");
+        MTLSize size = MTLSizeMake(r.width, r.height, 1);
+        if (upload)
+            [blit copyFromBuffer:r.readback sourceOffset:0 sourceBytesPerRow:r.stride sourceBytesPerImage:r.stride*r.height sourceSize:size
+                      toTexture:r.depthTexture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0) options:MTLBlitOptionStencilFromDepthStencil];
+        else
+            [blit copyFromTexture:r.depthTexture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size
+                          toBuffer:r.readback destinationOffset:0 destinationBytesPerRow:r.stride destinationBytesPerImage:r.stride*r.height options:MTLBlitOptionStencilFromDepthStencil];
+        [blit endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return fail(error, error_len, command.error.localizedDescription ?: @"stencil transfer failed");
+        if (!upload) for (NSUInteger y = 0; y < r.height; ++y)
+            memcpy(pixels + y * r.width, (const uint8_t *)r.readback.contents + y * r.stride, r.width);
+        return true;
     }
 }
 
@@ -601,6 +677,11 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
             pass.depthAttachment.texture = r.depthTexture;
             pass.depthAttachment.loadAction = MTLLoadActionLoad;
             pass.depthAttachment.storeAction = MTLStoreActionStore;
+            if (r.hasStencil) {
+                pass.stencilAttachment.texture = r.depthTexture;
+                pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
         }
         id<MTLRenderCommandEncoder> render = [command renderCommandEncoderWithDescriptor:pass];
         if (!command || !render) return fail(error, error_len, @"render command creation failed");
@@ -615,6 +696,12 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
         [render setRenderPipelineState:r.pipeline];
         [render setVertexBuffer:r.vertices offset:0 atIndex:6];
         if (r.depthState) [render setDepthStencilState:r.depthState];
+        if (r.hasStencil) {
+            // D3D's default clockwise front face is measured after its
+            // viewport Y flip; Metal's winding uses the opposite convention.
+            [render setFrontFacingWinding:MTLWindingCounterClockwise];
+            [render setStencilReferenceValue:r.stencilReference];
+        }
         if (r.fragmentConstants) {
             [render setFragmentBuffer:r.fragmentArguments offset:0 atIndex:2];
             [render useResource:r.fragmentConstants usage:MTLResourceUsageRead stages:MTLRenderStageFragment];

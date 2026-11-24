@@ -401,8 +401,8 @@ full texture uploads and readbacks, resource transitions, and multiple
 nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
 and pipeline changes. Committed default-heap resources are limited to
 RGBA8_UNORM and typed BC1/BC3 linear or sRGB sampled textures (including
-multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT
-depth textures, and buffers.
+multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT or
+D32_FLOAT_S8X24_UINT depth/stencil textures, and buffers.
 Graphics supports POSITION float4, optionally followed by TEXCOORD0
 float2; one color target and optional depth target per draw; the native depth
 comparison/write subset; restricted single-target D3D blending and color write
@@ -412,12 +412,24 @@ Shader constants must be contiguous and use one root slot. Texture copy row pitc
 
 This remains restricted: no partial clears, cross-process shared fences,
 other tiled layouts, BGRA or uncompressed sRGB formats through this proxy, BC2
-and other compressed formats, stencil, arbitrary sampler/address modes, or
+and other compressed formats, arbitrary sampler/address modes, or
 general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
 4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
 and 64 MiB per request. Shader translation and drawing use the existing
 native Metal path, not MetalVulkan.
+
+The Wine depth/stencil path uses D32_FLOAT_S8X24_UINT with Metal
+Depth32Float_Stencil8, not D24_UNORM_S8_UINT. The latter is rejected:
+the tested M3 Max reports that its Metal device does not support D24S8.
+The path supports full depth/stencil clears, 8-bit stencil reference and
+read/write masks, and separate front/back D3D stencil comparisons and
+operations. Plane readback uses D3D12's R32_FLOAT depth and R8_UINT stencil
+footprints. Only whole-resource transitions, single-mip 2D textures, null DSV
+descriptors, and clockwise front faces are supported; partial clears,
+per-plane barriers, stencil SRVs and copyable-footprint queries for this
+format remain unsupported. The launcher fixture tests both faces, stencil
+and depth pass/fail, masks, plane readback, and invalid formats and states.
 
 Blending supports `ADD`, `SUBTRACT`, `REV_SUBTRACT`, `MIN`, and `MAX`
 independently for RGB and alpha. RGB factors are zero, one, source or

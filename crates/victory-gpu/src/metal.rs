@@ -1667,6 +1667,8 @@ impl State {
                         *viewport,
                         *scissor,
                         depth_layout.map(|_| self.depth_scratch.as_mut_slice()),
+                        None,
+                        0,
                         constants,
                         binding,
                         &mut self.scratch,

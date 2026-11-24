@@ -38,6 +38,10 @@ pub fn mip_layout(format:u32,width:u32,height:u32,mips:u32,mip:u32)->Option<(u32
 
 /// Returns the byte length of all tightly packed mip levels.
 pub fn texture_size(format:u32,width:u32,height:u32,mips:u32)->Option<usize> {
+    if format == 20 {
+        if width == 0 || height == 0 || mips != 1 { return None; }
+        return (width as usize).checked_mul(height as usize)?.checked_mul(5);
+    }
     let (_,_,offset,len)=mip_layout(format,width,height,mips,mips.checked_sub(1)?)?;
     offset.checked_add(len)
 }
@@ -54,6 +58,9 @@ pub enum Command {
     Barrier { id: u64, before: u32, after: u32 }, CopyTexture(CopyTexture),
     CopyBuffer { src: u64, dst: u64, src_offset: u64, dst_offset: u64, size: u64 },
     ClearDepth { target:u64, depth:f32 },
+    SetStencilRef(u32),
+    ClearStencil { target:u64, flags:u32, depth:f32, stencil:u8 },
+    CopyDepthStencil { src:u64, dst:u64, offset:u64, pitch:u32, width:u32, height:u32, plane:u32, upload:bool },
 }
 #[derive(Clone, Debug)]
 pub struct Draw {
@@ -69,7 +76,15 @@ pub struct Draw {
 #[derive(Clone, Debug)]
 pub struct Index { pub buffer:u64, pub offset:u64, pub size:u32, pub format:u32, pub first:u32, pub base_vertex:i32 }
 #[derive(Clone, Debug)]
-pub struct PipelineDepth { pub write:bool, pub compare:u32 }
+pub struct PipelineDepth { pub write:bool, pub compare:u32, pub stencil:Option<Stencil> }
+#[derive(Clone, Debug)]
+pub struct Stencil { pub enabled:bool, pub read_mask:u8, pub write_mask:u8, pub front:[u32;4], pub back:[u32;4] }
+impl Stencil {
+    pub fn valid(&self) -> bool {
+        [&self.front,&self.back].iter().all(|face|
+            face[..3].iter().all(|op| (1..=8).contains(op)) && (1..=8).contains(&face[3]))
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend }
 #[derive(Clone, Debug)]
@@ -181,7 +196,7 @@ pub fn decode_results(data:&[u8])->Result<Vec<Resource>,String> { if data.len()>
 pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
     validate_commands(&batch.resources,&batch.commands)?;
     let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?; count(&mut w,batch.pipelines.len())?;
-    let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(1);w.u32(z.write as u32);w.u32(z.compare);} else {w.u32(0);} if Blend::new(p.blend.enabled,p.blend.write_mask,p.blend.factors).is_none() {return Err("invalid blend state".into())} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.encode());}
+    let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(if z.stencil.is_some(){2}else{1});w.u32(z.write as u32);w.u32(z.compare);if let Some(s)=&z.stencil {if s.enabled && !s.valid() {return Err("invalid stencil state".into())} w.u32(s.enabled as u32);w.u32(s.read_mask as u32);w.u32(s.write_mask as u32);for v in s.front.into_iter().chain(s.back) {w.u32(v);}}} else {w.u32(0);} if Blend::new(p.blend.enabled,p.blend.write_mask,p.blend.factors).is_none() {return Err("invalid blend state".into())} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.encode());}
     count(&mut w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
@@ -195,11 +210,14 @@ pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
         Command::CopyTexture(c) => {w.u32(3);w.u64(c.src);w.u64(c.dst);w.u64(c.offset);for v in [c.pitch,c.width,c.height,c.format,c.mip,c.buffer_to_texture as u32] {w.u32(v);}},
         Command::CopyBuffer {src,dst,src_offset,dst_offset,size} => {w.u32(4);for v in [src,dst,src_offset,dst_offset,size] {w.u64(*v);}},
         Command::ClearDepth {target,depth}=>{w.u32(5);w.u64(*target);w.u32(depth.to_bits());},
+        Command::SetStencilRef(value)=>{w.u32(6);w.u32(*value);},
+        Command::ClearStencil {target,flags,depth,stencil}=>{w.u32(7);w.u64(*target);w.u32(*flags);w.u32(depth.to_bits());w.u32(u32::from(*stencil));},
+        Command::CopyDepthStencil {src,dst,offset,pitch,width,height,plane,upload}=>{w.u32(8);w.u64(*src);w.u64(*dst);w.u64(*offset);for v in [*pitch,*width,*height,*plane,*upload as u32] {w.u32(v);}},
     }} finish(w)
 }
 pub fn decode_batch(data:&[u8])->Result<Batch,String> {
     if data.len()>MAX_PAYLOAD {return Err("wire payload exceeds limit".into());} let mut r=Reader {data,pos:0}; let resources=read_resources(&mut r)?;
-    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();for _ in 0..n {let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())} let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;let vertex_stride=r.u32()?;let format=r.u32()?;let depth=if r.boolean()? {Some(PipelineDepth {write:r.boolean()?,compare:r.u32()?})} else {None};let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())} let blend=Blend::decode(enabled,mask as u8,r.u32()?).ok_or("invalid blend flags")?;pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend});}
+    let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();for _ in 0..n {let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())} let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;let vertex_stride=r.u32()?;let format=r.u32()?;let depth=match r.u32()? {0=>None,k @ (1|2)=>{let write=r.boolean()?;let compare=r.u32()?;let stencil=if k==2 {let enabled=r.boolean()?;let read_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;let write_mask=u8::try_from(r.u32()?).map_err(|_|"invalid stencil mask")?;let mut front=[0;4];let mut back=[0;4];for v in front.iter_mut().chain(back.iter_mut()) {*v=r.u32()?;} let s=Stencil {enabled,read_mask,write_mask,front,back};if enabled && !s.valid() {return Err("invalid stencil state".into())} Some(s)}else{None};Some(PipelineDepth {write,compare,stencil})},_=>return Err("invalid depth state".into())};let enabled=r.boolean()?;let mask=r.u32()?;if mask>15 {return Err("invalid blend mask".into())} let blend=Blend::decode(enabled,mask as u8,r.u32()?).ok_or("invalid blend flags")?;pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend});}
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
@@ -211,6 +229,9 @@ pub fn decode_batch(data:&[u8])->Result<Batch,String> {
         3=> {let src=r.u64()?;let dst=r.u64()?;let offset=r.u64()?;let pitch=r.u32()?;let width=r.u32()?;let height=r.u32()?;let format=r.u32()?;let mip=r.u32()?;let buffer_to_texture=match r.u32()? {0=>false,1=>true,_=>return Err("invalid copy direction".into())};Command::CopyTexture(CopyTexture {src,dst,offset,pitch,width,height,format,mip,buffer_to_texture})},
         4=>Command::CopyBuffer {src:r.u64()?,dst:r.u64()?,src_offset:r.u64()?,dst_offset:r.u64()?,size:r.u64()?},
         5=>Command::ClearDepth {target:r.u64()?,depth:f32::from_bits(r.u32()?)},
+        6=>Command::SetStencilRef(r.u32()?),
+        7=>Command::ClearStencil {target:r.u64()?,flags:r.u32()?,depth:f32::from_bits(r.u32()?),stencil:u8::try_from(r.u32()?).map_err(|_|"invalid stencil clear")?},
+        8=>Command::CopyDepthStencil {src:r.u64()?,dst:r.u64()?,offset:r.u64()?,pitch:r.u32()?,width:r.u32()?,height:r.u32()?,plane:r.u32()?,upload:r.boolean()?},
         _=>return Err("unknown wire command".into()),
     }); } r.done()?;validate_commands(&resources,&commands)?;Ok(Batch {resources,pipelines,commands})
 }
@@ -286,7 +307,7 @@ mod tests {
     fn pipeline_and_draw_round_trip() {
         let mut b=batch();
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
-            depth:Some(PipelineDepth {write:true,compare:4}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap()});
+            depth:Some(PipelineDepth {write:true,compare:4,stencil:None}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap()});
         b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
@@ -294,6 +315,21 @@ mod tests {
         let encoded=encode_batch(&b).unwrap();
         assert_eq!(encode_batch(&decode_batch(&encoded).unwrap()).unwrap(),encoded);
         b.pipelines.push(b.pipelines[0].clone());
+        assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
+    fn stencil_wire_round_trip() {
+        let mut b=batch();
+        b.resources.push(Resource {id:3,state:0x10,kind:ResourceKind::Texture {width:1,height:1,format:20,mips:1},bytes:vec![0;5]});
+        b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
+            depth:Some(PipelineDepth {write:true,compare:2,stencil:Some(Stencil {enabled:true,read_mask:0xf0,write_mask:0x0f,front:[1,2,3,4],back:[5,6,7,8]})}),
+            blend:Blend::new(false,15,[0;6]).unwrap()});
+        b.commands.extend([Command::SetStencilRef(0xa5),Command::ClearStencil {target:3,flags:3,depth:0.5,stencil:0xa0},
+            Command::CopyDepthStencil {src:3,dst:1,offset:0,pitch:256,width:1,height:1,plane:1,upload:false}]);
+        let encoded=encode_batch(&b).unwrap();
+        assert_eq!(encode_batch(&decode_batch(&encoded).unwrap()).unwrap(),encoded);
+        b.pipelines[0].depth.as_mut().unwrap().stencil.as_mut().unwrap().front[0]=9;
         assert!(encode_batch(&b).is_err());
     }
 

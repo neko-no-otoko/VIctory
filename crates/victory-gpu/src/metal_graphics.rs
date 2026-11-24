@@ -78,6 +78,8 @@ impl Prepared {
         viewport: [f64; 6],
         scissor: [u32; 4],
         mut depth: Option<&mut [f32]>,
+        mut stencil: Option<&mut [u8]>,
+        stencil_reference: u32,
         constants: &[u32],
         texture: Option<Texture<'_>>,
         pixels: &mut [u8],
@@ -105,6 +107,10 @@ impl Prepared {
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
         }
+        if let Some(pixels) = stencil.as_deref_mut() {
+            renderer.stencil_pixels(pixels, true).map_err(|e| e.to_string())?;
+            renderer.set_stencil_reference(stencil_reference);
+        }
         if let Some(texture) = texture {
             renderer
                 .set_fragment_texture_mips(texture.width, texture.height, texture.levels, texture.pixels,
@@ -118,6 +124,9 @@ impl Prepared {
         }.map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref_mut() {
             renderer.read_depth_pixels(pixels).map_err(|e| e.to_string())?;
+        }
+        if let Some(pixels) = stencil.as_deref_mut() {
+            renderer.stencil_pixels(pixels, false).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -193,7 +202,7 @@ impl WineMetalGraphics {
         self.prepared.draw(
             width, height, Vertices::Position(vertices), None,
             [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
-            [0, 0, width, height], None, &constants, None, &mut pixels,
+            [0, 0, width, height], None, None, 0, &constants, None, &mut pixels,
         )?;
         Ok(pixels)
     }
@@ -670,7 +679,7 @@ impl StreamState {
             11 => {
                 let (enabled, write, compare, stencil) = (get(4), get(8), get(12), get(16));
                 if enabled == 1 && write <= 1 && (1..=8).contains(&compare) && stencil == 0 {
-                    self.depth = Some(victory_metal::DepthState { write: write == 1, compare });
+                    self.depth = Some(victory_metal::DepthState { write: write == 1, compare, stencil: None });
                     true
                 } else {
                     enabled == 0 && stencil == 0

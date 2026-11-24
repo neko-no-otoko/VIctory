@@ -102,6 +102,7 @@ unsafe extern "C" {
         fragment_texture: bool,
         depth_compare: u32,
         depth_write: bool,
+        stencil: *const u32,
         blend_enabled: bool,
         write_mask: u8,
         blend_factors: *const u32,
@@ -169,6 +170,9 @@ unsafe extern "C" {
     ) -> bool;
     fn victory_metal_depth_pixels(renderer: *mut c_void, pixels: *mut f32, upload: bool,
                                   error: *mut c_char, error_len: usize) -> bool;
+    fn victory_metal_stencil_pixels(renderer: *mut c_void, pixels: *mut u8, upload: bool,
+                                    error: *mut c_char, error_len: usize) -> bool;
+    fn victory_metal_stencil_reference(renderer: *mut c_void, reference: u32);
     fn victory_metal_clear_depth(width: u32, height: u32, pitch: usize, pixels: *mut u8,
                                 value: f32, rects: *const [u32; 4], count: usize,
                                 error: *mut c_char, error_len: usize) -> bool;
@@ -278,6 +282,16 @@ pub fn clear_depth32(width: u32, height: u32, pitch: usize, pixels: &mut [u8],
 pub struct DepthState {
     pub write: bool,
     pub compare: u32,
+    pub stencil: Option<StencilState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StencilState {
+    pub enabled: bool,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub front: [u32; 4],
+    pub back: [u32; 4],
 }
 
 /// D3D12 blend factors and operations in RGB source, destination, operation,
@@ -307,6 +321,7 @@ pub struct Renderer {
     fragment_texture: bool,
     texture_bound: bool,
     depth_enabled: bool,
+    stencil_enabled: bool,
     vertex_uv: bool,
     width: u32,
     height: u32,
@@ -427,6 +442,11 @@ impl Renderer {
         let vertex_entry = entry(vertex_entry)?;
         let fragment_entry = entry(fragment_entry)?;
         let mut error = [0 as c_char; 1024];
+        let stencil = depth.and_then(|d| d.stencil).map(|s| [
+            s.enabled as u32, s.read_mask as u32, s.write_mask as u32,
+            s.front[0],s.front[1],s.front[2],s.front[3],
+            s.back[0],s.back[1],s.back[2],s.back[3],
+        ]);
         // SAFETY: input slices and strings remain alive for the synchronous call;
         // Metal owns the resulting libraries and pipeline independently.
         let ptr = unsafe {
@@ -443,6 +463,7 @@ impl Renderer {
                 fragment_texture,
                 depth.map_or(0, |s| s.compare),
                 depth.is_some_and(|s| s.write),
+                stencil.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 blend.enabled,
                 blend.write_mask,
                 blend.factors.as_ptr(),
@@ -460,6 +481,7 @@ impl Renderer {
             fragment_texture,
             texture_bound: false,
             depth_enabled: depth.is_some(),
+            stencil_enabled: stencil.is_some(),
             vertex_uv,
             width,
             height,
@@ -489,6 +511,20 @@ impl Renderer {
         // SAFETY: native download writes exactly the checked slice synchronously.
         let ok = unsafe { victory_metal_depth_pixels(self.handle.as_ptr(), pixels.as_mut_ptr(), false,
                                                      error.as_mut_ptr(), error.len()) };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
+    pub fn set_stencil_reference(&mut self, value: u32) {
+        unsafe { victory_metal_stencil_reference(self.handle.as_ptr(), value); }
+    }
+
+    pub fn stencil_pixels(&mut self, pixels: &mut [u8], upload: bool) -> Result<(), RenderError> {
+        if !self.stencil_enabled || pixels.len() != self.pixel_len / 4 {
+            return Err(RenderError("expected exact-sized stencil attachment pixels".into()));
+        }
+        let mut error = [0 as c_char; 1024];
+        let ok = unsafe { victory_metal_stencil_pixels(self.handle.as_ptr(), pixels.as_mut_ptr(), upload,
+                                                       error.as_mut_ptr(), error.len()) };
         if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
