@@ -25,6 +25,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "macos_pe_fixture.c",
     "windows_cli_probe.c",
     "windows_d3d12x_probe.c",
+    "windows_d3d12x_compute.c",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",

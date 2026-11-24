@@ -158,6 +158,29 @@ fence value. The test requires the host D3D12 device to initialize. The
 fence operation is implemented in HLE; the empty list performs no rendering,
 compute, or GPU readback and does not establish title compatibility.
 
+### Synthetic D3D12.X compute and readback
+
+With the import libraries created above, compile the separate self-authored
+compute fixture and run its ignored test:
+
+```sh
+x86_64-w64-mingw32-clang -O2 -c tests/fixtures/windows_d3d12x_compute.c \
+  -o /tmp/victory-cli-fixture/compute.obj
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib \
+  /out:/tmp/victory-cli-fixture/compute.exe /tmp/victory-cli-fixture/compute.obj \
+  /tmp/victory-cli-fixture/kernel32.lib /tmp/victory-cli-fixture/d3d12_xs.lib
+export VICTORY_TEST_D3D12X_COMPUTE_PE="$(winepath -w /tmp/victory-cli-fixture/compute.exe)"
+cargo test -p victory --test windows_run --target x86_64-pc-windows-gnullvm \
+  executes_synthetic_d3d12x_compute_through_cli -- --ignored --nocapture
+```
+
+The guest creates a buffer and an explicitly described raw UAV, binds a
+self-authored console shader, and dispatches through VIctory's D3D12.X HLE.
+The test requires shader translation and a host pipeline, then checks that
+the GPU-written value is copied back into guest memory as 42 (from initial
+value 7). On the M3 Max/Wine/MetalVulkan configuration above it passed.
+This is one synthetic compute workload, not game or native Metal support.
+
 In that same prefix, the synthetic loader integration tests passed 2/2. A
 separate GPU compute experiment compiled self-authored HLSL with Microsoft
 DXC v1.9.2609 and used an adapted MetalVulkan compute probe: after dispatch,

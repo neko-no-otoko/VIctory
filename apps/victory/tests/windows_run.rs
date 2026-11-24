@@ -13,6 +13,7 @@ fn executes_synthetic_pe_through_cli() {
         .args(["run"])
         .arg(fixture)
         .arg("--execute")
+        .current_dir(temp.path())
         .env_remove("VICTORY_CONFIG")
         .env("VICTORY_CACHE_DIR", temp.path().join("cache"))
         .env("VICTORY_DATA_DIR", temp.path().join("data"))
@@ -37,6 +38,7 @@ fn executes_synthetic_d3d12x_through_cli() {
     let temp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_victory"))
         .arg("run").arg(fixture).arg("--execute")
+        .current_dir(temp.path())
         .env_remove("VICTORY_CONFIG")
         .env("VICTORY_LOG", "info")
         .env("VICTORY_CACHE_DIR", temp.path().join("cache"))
@@ -51,4 +53,30 @@ fn executes_synthetic_d3d12x_through_cli() {
     assert!(!stdout.contains("no host GPU runs") && !stderr.contains("no host GPU runs"), "{stdout}\n{stderr}");
     assert!(stdout.contains("D3D12X device list and fence passed"), "{stdout}\n{stderr}");
     assert!(stdout.contains("title exited with 42"), "{stdout}\n{stderr}");
+}
+
+#[test]
+#[ignore = "requires a separately built compute PE and working D3D12 host; see docs/wine-loader-tests.md"]
+fn executes_synthetic_d3d12x_compute_through_cli() {
+    let fixture = std::env::var_os("VICTORY_TEST_D3D12X_COMPUTE_PE")
+        .expect("set VICTORY_TEST_D3D12X_COMPUTE_PE to the synthetic compute fixture");
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
+        .arg("run").arg(fixture).arg("--execute")
+        .current_dir(temp.path())
+        .env_remove("VICTORY_CONFIG")
+        .env("VICTORY_LOG", "info")
+        .env("VICTORY_CACHE_DIR", temp.path().join("cache"))
+        .env("VICTORY_DATA_DIR", temp.path().join("data"))
+        .output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(output.status.success(), "status: {}\n{logs}", output.status);
+    assert!(stdout.contains("1 hle,") && stdout.contains("0 missing"), "{logs}");
+    assert!(logs.contains("host D3D12 device ready"), "{logs}");
+    assert!(logs.contains("shader translated") && logs.contains("host pipeline shaders"), "{logs}");
+    assert!(!logs.contains("dispatch without a host pipeline dropped"), "{logs}");
+    assert!(stdout.contains("D3D12X synthetic compute readback 42"), "{logs}");
+    assert!(stdout.contains("title exited with 42"), "{logs}");
 }
