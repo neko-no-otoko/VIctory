@@ -11,8 +11,8 @@ pub(crate) struct GraphicsState {
 
 
 pub(crate) struct Prepared {
-    vertex: Vec<u8>,
-    pixel: Vec<u8>,
+    pub(crate) vertex: Vec<u8>,
+    pub(crate) pixel: Vec<u8>,
     pub(crate) user_data: Vec<emit::UserData>,
     pub(crate) dwords: usize,
     pub(crate) texture_slot: Option<u8>,
@@ -20,8 +20,21 @@ pub(crate) struct Prepared {
     pub(crate) depth: Option<victory_metal::DepthState>,
     pub(crate) vertex_stride: u32,
     pub(crate) color_format: victory_metal::ColorFormat,
-    blend: victory_metal::BlendState,
+    pub(crate) blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
+}
+
+/// A supplied input-layout element and the Metal attribute assigned to it.
+pub(crate) struct ResolvedVertexInput {
+    pub(crate) layout_index: usize,
+    pub(crate) attribute_index: u8,
+}
+
+struct VertexSignature {
+    row: u8,
+    mask: u8,
+    layout_index: usize,
+    reflected_name: String,
 }
 
 // The renderer owns Metal objects and is only accessed through the pipeline's
@@ -47,9 +60,9 @@ pub(crate) struct Texture<'a> {
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
         let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
-        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0), graphics.input_uv)?;
+        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0), graphics.input_uv, None)?;
         let (pixel_host, texture_slot, sampler_slot) =
-            validate(pixel, HwStage::Ps, varying.map(|v| v.1), false)?;
+            validate(pixel, HwStage::Ps, varying.map(|v| v.1), false, None)?;
         let vertex = convert(&vertex_host, HwStage::Vs, false)?;
         let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
         let dwords = pixel_host.user_data_dwords() as usize;
@@ -69,6 +82,39 @@ impl Prepared {
         })
     }
 
+    /// Prepare against D3D input elements; indices come only from converter reflection.
+    /// The returned mapping identifies each consumed element in `inputs`.
+    pub(crate) fn new_inputs(
+        vertex: &[u8], pixel: &[u8], graphics: GraphicsState,
+        inputs: &[crate::wine_transport::VertexInput],
+    ) -> Result<(Self, Vec<ResolvedVertexInput>), String> {
+        let signatures = vertex_signatures(vertex, inputs)?;
+        let varying = varying_signatures_for_stages(vertex, pixel)?;
+        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0), false, Some(&signatures))?;
+        let (pixel_host, texture_slot, sampler_slot) =
+            validate(pixel, HwStage::Ps, varying.map(|v| v.1), false, None)?;
+        let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
+        let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(
+            std::path::Path::new(&path), &vertex_host.dxil,
+        )?;
+        if reflected.len() != signatures.len() {
+            return Err("converter vertex reflection does not match the input signature".into());
+        }
+        let mut resolved = Vec::with_capacity(signatures.len());
+        for sig in &signatures {
+            let attribute = reflected.iter().find(|a| a.name.eq_ignore_ascii_case(&sig.reflected_name))
+                .ok_or("converter vertex reflection is missing an input semantic")?;
+            resolved.push(ResolvedVertexInput { layout_index: sig.layout_index, attribute_index: attribute.index });
+        }
+        let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
+        let dwords = pixel_host.user_data_dwords() as usize;
+        Ok((Self {
+            vertex, pixel, user_data: pixel_host.user_data, dwords, texture_slot, sampler_slot,
+            depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
+            color_format: graphics.color_format, renderer: None,
+        }, resolved))
+    }
+
     pub(crate) fn draw(
         &mut self,
         width: u32,
@@ -84,6 +130,9 @@ impl Prepared {
         texture: Option<Texture<'_>>,
         pixels: &mut [u8],
     ) -> Result<(), String> {
+        if self.vertex_stride == 0 {
+            return Err("generic input pipeline requires layout-aware rendering".into());
+        }
         if texture.is_some() != self.texture_slot.is_some() {
             return Err("texture binding does not match pixel shader".into());
         }
@@ -275,13 +324,71 @@ fn signature(
     Ok(varying)
 }
 
+// The converter names inputs as the semantic followed by its decimal index.
+fn vertex_signatures(
+    vertex: &[u8], inputs: &[crate::wine_transport::VertexInput],
+) -> Result<Vec<VertexSignature>, String> {
+    let container = Container::parse(vertex).map_err(|e| e.to_string())?;
+    let data = container.part(FourCC::ISG1).ok_or("missing ISG1 signature")?.data;
+    let count = word(data, 0)? as usize;
+    if count > 31 || inputs.len() > 32 {
+        return Err("too many vertex input elements".into());
+    }
+    for (i, input) in inputs.iter().enumerate() {
+        if input.semantic.is_empty() || !input.semantic.is_ascii()
+            || inputs[..i].iter().any(|other| other.semantic_index == input.semantic_index
+                && other.semantic.eq_ignore_ascii_case(&input.semantic))
+        {
+            return Err("invalid or duplicate input layout semantic".into());
+        }
+    }
+    let base = word(data, 4)? as usize;
+    let mut result: Vec<VertexSignature> = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = base.checked_add(i * 32).ok_or("signature offset overflow")?;
+        let name_at = word(data, at + 4)? as usize;
+        let tail = data.get(name_at..).ok_or("signature name out of bounds")?;
+        let end = tail.iter().position(|&b| b == 0).ok_or("unterminated signature name")?;
+        let name = std::str::from_utf8(&tail[..end]).map_err(|_| "invalid signature name")?;
+        let index = word(data, at + 8)?;
+        let row = word(data, at + 20)?;
+        let mask = *data.get(at + 24).ok_or("truncated signature")?;
+        if name.is_empty() || !name.is_ascii() || word(data, at)? != 0
+            || word(data, at + 12)? != 0 || word(data, at + 16)? != 3
+            || word(data, at + 28)? != 0 || row > u8::MAX as u32
+            || !matches!(mask, 1 | 3 | 7 | 15)
+            || data.get(at + 26..at + 28) != Some(&[0, 0])
+        {
+            return Err("unsupported vertex input signature metadata".into());
+        }
+        let layout_index = inputs.iter().position(|input| input.semantic_index == index
+            && input.semantic.eq_ignore_ascii_case(name)).ok_or("vertex input semantic missing from layout")?;
+        if !matches!(inputs[layout_index].format, 2 | 16 | 34 | 35) {
+            return Err("unsupported vertex input format".into());
+        }
+        let reflected_name = format!("{name}{index}");
+        if result.iter().any(|other| other.row == row as u8
+            || other.layout_index == layout_index || other.reflected_name.eq_ignore_ascii_case(&reflected_name))
+        {
+            return Err("ambiguous vertex input signature".into());
+        }
+        result.push(VertexSignature { row: row as u8, mask, layout_index, reflected_name });
+    }
+    Ok(result)
+}
+
 fn varying_signatures(vertex: &[u8], pixel: &[u8], input_uv: bool) -> Result<Option<(u8, u8)>, String> {
     let vs = Container::parse(vertex).map_err(|e| e.to_string())?;
-    let ps = Container::parse(pixel).map_err(|e| e.to_string())?;
     let vertex_uv = signature(&vs, FourCC::ISG1, Some((b"POSITION", 0)), false, input_uv)?;
     if vertex_uv != input_uv.then_some(1) {
         return Err("vertex input signature does not match input layout".into());
     }
+    varying_signatures_for_stages(vertex, pixel)
+}
+
+fn varying_signatures_for_stages(vertex: &[u8], pixel: &[u8]) -> Result<Option<(u8, u8)>, String> {
+    let vs = Container::parse(vertex).map_err(|e| e.to_string())?;
+    let ps = Container::parse(pixel).map_err(|e| e.to_string())?;
     let output = signature(&vs, FourCC::OSG1, Some((b"SV_Position", 1)), false, true)?;
     let input = signature(&ps, FourCC::ISG1, None, true, true)?;
     signature(&ps, FourCC::OSG1, Some((b"SV_Target", 64)), false, false)?;
@@ -299,6 +406,7 @@ fn validate(
     stage: HwStage,
     varying: Option<u8>,
     input_uv: bool,
+    vertex_signatures: Option<&[VertexSignature]>,
 ) -> Result<(emit::HostShader, Option<u8>, Option<u8>), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
@@ -393,13 +501,28 @@ fn validate(
     }
     match (&p.io, stage, varying) {
         (native::StageIo::Vs { inputs, outputs }, HwStage::Vs, row)
-            if inputs.len() == (if input_uv { 2 } else { 1 })
-                && inputs[0].usage == native::Usage::Generic
-                && inputs[0].row == 0
-                && inputs[0].mask == 15
-                && (!input_uv || (inputs[0].vgpr == 4
-                    && inputs[1].usage == native::Usage::Generic && inputs[1].row == 1
-                    && inputs[1].mask == 3 && inputs[1].vgpr == 8))
+            if (if let Some(signatures) = vertex_signatures {
+                inputs.len() == signatures.len() && inputs.iter().enumerate().all(|(i, input)| {
+                    input.usage == native::Usage::Generic
+                        && signatures.iter().any(|s| s.row == input.row && s.mask == input.mask)
+                        && input.vgpr >= 4
+                        && u16::from(input.vgpr) + (32 - input.mask.leading_zeros()) as u16 <= p.vgprs
+                        && inputs[..i].iter().all(|other| {
+                            input.row != other.row && (0..4).all(|a| (0..4).all(|b| {
+                                input.mask & (1 << a) == 0 || other.mask & (1 << b) == 0
+                                    || u16::from(input.vgpr) + a != u16::from(other.vgpr) + b
+                            }))
+                        })
+                })
+            } else {
+                inputs.len() == (if input_uv { 2 } else { 1 })
+                    && inputs[0].usage == native::Usage::Generic
+                    && inputs[0].row == 0
+                    && inputs[0].mask == 15
+                    && (!input_uv || (inputs[0].vgpr == 4
+                        && inputs[1].usage == native::Usage::Generic && inputs[1].row == 1
+                        && inputs[1].mask == 3 && inputs[1].vgpr == 8))
+            })
                 && match row {
                     None => outputs.is_empty(),
                     Some(row) => outputs.len() == 1
@@ -495,8 +618,13 @@ fn validate(
     }
     let raised = io::raise(&program, p).map_err(|e| e.to_string())?;
     if raised.inputs.iter().any(|(_, input)| match stage {
-        HwStage::Vs => !matches!(input, io::Input::Attribute { row: 0, .. })
-            && !(input_uv && matches!(input, io::Input::Attribute { row: 1, channel: 0 | 1 })),
+        HwStage::Vs => if let Some(signatures) = vertex_signatures {
+            !matches!(input, io::Input::Attribute { row, channel }
+                if signatures.iter().any(|s| s.row == *row && s.mask & (1 << channel) != 0))
+        } else {
+            !matches!(input, io::Input::Attribute { row: 0, .. })
+                && !(input_uv && matches!(input, io::Input::Attribute { row: 1, channel: 0 | 1 }))
+        },
         HwStage::Ps => !matches!(input, io::Input::Position(_))
             && !(varying.is_some() && matches!(input, io::Input::Barycentric {
                 kind: io::Barycentric::PerspectiveCenter, index: 0 | 1

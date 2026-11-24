@@ -1,6 +1,6 @@
 //! Runtime DXIL conversion through Apple's Metal Shader Converter C API.
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::Path;
 use std::ptr;
 
@@ -40,6 +40,37 @@ struct ResourceLocation {
     name: *const c_char,
 }
 
+// IRVersionedVSInfo / IRVSInfo_1_0 in metal_irconverter.h.
+#[repr(C)]
+struct VertexInputInfo {
+    name: *const c_char,
+    attribute_index: u8,
+}
+
+#[repr(C)]
+struct VertexInfoV1 {
+    instance_id_index: c_int,
+    vertex_id_index: c_int,
+    vertex_output_size_in_bytes: u32,
+    needs_draw_params: bool,
+    vertex_inputs: *mut VertexInputInfo,
+    num_vertex_inputs: usize,
+}
+
+#[repr(C)]
+struct VertexInfo {
+    version: c_int,
+    info: VertexInfoV1,
+}
+
+/// A converter-reported vertex semantic (including its decimal index) and
+/// the Metal vertex attribute index assigned to it.
+#[derive(Debug, Clone)]
+pub struct VertexAttribute {
+    pub name: String,
+    pub index: u8,
+}
+
 struct Handle {
     ptr: Pointer,
     destroy: Destroy,
@@ -67,7 +98,17 @@ impl Drop for Handle {
 /// Loading the supplied dynamic library executes its initializers; callers must
 /// supply a trusted Apple Metal Shader Converter library.
 pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, stage, None, false, None).map(|(data, _)| data)
+    convert_impl(library, dxil, stage, None, false, None, false).map(|(data, _, _)| data)
+}
+
+/// Convert a vertex shader and obtain its authoritative Metal attribute indices.
+/// `library` must be a trusted Metal Shader Converter library.
+pub fn convert_vertex_with_reflection(
+    library: &Path,
+    dxil: &[u8],
+) -> Result<(Vec<u8>, Vec<VertexAttribute>), String> {
+    let (data, _, attributes) = convert_impl(library, dxil, Stage::Vertex, None, false, None, true)?;
+    Ok((data, attributes.ok_or("missing vertex reflection")?))
 }
 
 /// Convert a fragment shader after verifying its automatic resource layout.
@@ -82,8 +123,8 @@ pub fn convert_fragment_with_b0(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false, None)
-        .map(|(data, _)| data)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false, None, false)
+        .map(|(data, _, _)| data)
 }
 
 /// Convert a sampled fragment shader using the same checked automatic b0 ABI.
@@ -96,8 +137,8 @@ pub fn convert_sampled_fragment(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true, None)
-        .map(|(data, _)| data)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true, None, false)
+        .map(|(data, _, _)| data)
 }
 
 /// Convert a compute shader and return its reflected root-CBV argument offset.
@@ -113,7 +154,7 @@ pub fn convert_compute_with_root_cbv(
     if root_slot > 63 {
         return Err("root CBV slot must be in 0..64".into());
     }
-    let (data, offset) = convert_impl(library, dxil, Stage::Compute, None, false, Some(root_slot))?;
+    let (data, offset, _) = convert_impl(library, dxil, Stage::Compute, None, false, Some(root_slot), false)?;
     Ok((data, offset.ok_or("missing reflected root CBV")?))
 }
 
@@ -124,7 +165,8 @@ fn convert_impl(
     expected_b0: Option<bool>,
     force_texture_array: bool,
     root_cbv: Option<u8>,
-) -> Result<(Vec<u8>, Option<usize>), String> {
+    reflect_vertex: bool,
+) -> Result<(Vec<u8>, Option<usize>, Option<Vec<VertexAttribute>>), String> {
     // SAFETY: the caller supplies the path to a trusted converter library.
     let lib = unsafe { libloading::Library::new(library) }
         .map_err(|error| format!("loading converter {}: {error}", library.display()))?;
@@ -202,7 +244,8 @@ fn convert_impl(
             "Metal Shader Converter could not create converted object".to_string()
         })?;
         let mut cbv_offset = None;
-        if expected_b0.is_some() || root_cbv.is_some() {
+        let mut vertex_attributes = None;
+        if expected_b0.is_some() || root_cbv.is_some() || reflect_vertex {
             let reflection_create = api!(
                 "IRShaderReflectionCreate",
                 unsafe extern "C" fn() -> Pointer
@@ -224,6 +267,47 @@ fn convert_impl(
                 Handle::new(reflection_create(), reflection_destroy, "shader reflection")?;
             if !reflect(result.ptr, stage.raw(), reflection.ptr) {
                 return Err("converter could not reflect shader".into());
+            }
+            if reflect_vertex {
+                let copy = api!("IRShaderReflectionCopyVertexInfo",
+                    unsafe extern "C" fn(Pointer, c_int, *mut VertexInfo) -> bool);
+                let release = api!("IRShaderReflectionReleaseVertexInfo",
+                    unsafe extern "C" fn(*mut VertexInfo) -> bool);
+                let mut info: VertexInfo = std::mem::zeroed();
+                if !copy(reflection.ptr, 1, &mut info) {
+                    return Err("converter could not copy vertex reflection version 1".into());
+                }
+                let attributes = (|| -> Result<Vec<VertexAttribute>, String> {
+                    if info.version != 1 || info.info.num_vertex_inputs > 31
+                        || (info.info.num_vertex_inputs != 0 && info.info.vertex_inputs.is_null())
+                    {
+                        return Err("invalid converter vertex reflection".into());
+                    }
+                    let inputs = if info.info.num_vertex_inputs == 0 {
+                        &[][..]
+                    } else {
+                        std::slice::from_raw_parts(info.info.vertex_inputs, info.info.num_vertex_inputs)
+                    };
+                    let mut attributes: Vec<VertexAttribute> = Vec::with_capacity(inputs.len());
+                    for input in inputs {
+                        if input.name.is_null() || input.attribute_index >= 31 {
+                            return Err("invalid reflected vertex attribute".into());
+                        }
+                        let name = CStr::from_ptr(input.name).to_str()
+                            .map_err(|_| "invalid reflected vertex semantic")?;
+                        if name.is_empty() || attributes.iter().any(|a| {
+                            a.index == input.attribute_index || a.name.eq_ignore_ascii_case(name)
+                        }) {
+                            return Err("duplicate or empty reflected vertex semantic".into());
+                        }
+                        attributes.push(VertexAttribute { name: name.into(), index: input.attribute_index });
+                    }
+                    Ok(attributes)
+                })();
+                if !release(&mut info) {
+                    return Err("converter could not release vertex reflection".into());
+                }
+                vertex_attributes = Some(attributes?);
             }
             let count = resource_count(reflection.ptr);
             if let Some(expected_b0) = expected_b0 {
@@ -292,6 +376,6 @@ fn convert_impl(
         if binary_copy(binary.ptr, data.as_mut_ptr()) != size {
             return Err("converter returned an incomplete Metal library".into());
         }
-        Ok((data, cbv_offset))
+        Ok((data, cbv_offset, vertex_attributes))
     }
 }
