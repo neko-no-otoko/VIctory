@@ -24,6 +24,21 @@ attaches if an initializer fails; `detach` runs in reverse order. The set
 owns its mappings until drop; callers must explicitly detach before dropping
 an attached set, and must not use its export pointers afterward.
 
+`Executable::load` also maps a PE executable with explicitly supplied DLLs,
+without executing code. Unsafe `Executable::start` attaches the DLLs, calls
+the executable's actual entry RVA, and detaches the DLLs if that call returns.
+It is limited to trusted, controlled entry points with the exact signature
+`extern "win64" fn() -> u32` that return normally; it can be called only once.
+The caller must ensure DLL and callback safety and that no threads or other
+users remain when the entry returns. A crash, process exit or nonreturning
+entry cannot be handled by this API.
+
+This is **not Windows process startup**. It does not construct the Windows
+process parameters, PEB/TEB, startup stack, CRT, TLS, exception handling or
+Windows APIs. An ordinary Windows or Xbox executable cannot be assumed to
+meet the controlled entry contract, and this is not title execution support.
+The same unsupported-image checks apply to executables and DLLs.
+
 The caller must ensure the DLL and all callbacks are trusted, ABI-correct,
 properly initialized and safely serialized, and that users are quiescent
 before detach. Windows loader-lock semantics, thread notifications, the TEB,
@@ -58,7 +73,9 @@ and executable code fault in child processes. It also checks missing imports,
 invalid entry points, attach failure, module and reserved arguments, and
 exactly-once detach. A two-DLL synthetic test checks cross-module imports,
 dependency initialization, reverse teardown, failure rollback, cycles and
-forwarded-export rejection. Passing these tests is not evidence of title
-execution, D3D12 translation, or Metal support. See
+forwarded-export rejection. A separate test maps and calls a self-authored PE
+executable entry after binding and attaching its synthetic DLL dependency.
+Passing these tests is not evidence of title execution, D3D12 translation, or
+Metal support. See
 [rosetta-avx-probe.md](rosetta-avx-probe.md) for the separate instruction
 experiment; CPUID reporting and execution can differ under Rosetta.

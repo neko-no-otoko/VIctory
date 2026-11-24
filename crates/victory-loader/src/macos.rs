@@ -13,7 +13,7 @@ use victory_pe::{ImageInfo, layout};
 
 use crate::{ImportResolver, Resolution};
 mod graph;
-pub use graph::ModuleSet;
+pub use graph::{Executable, ModuleSet};
 
 const READ: u32 = 0x4000_0000;
 const WRITE: u32 = 0x8000_0000;
@@ -41,8 +41,13 @@ impl Image {
     /// Windows exception handling, delay loads, TLS and load configuration
     /// are rejected rather than partly initialized. This does not call DllMain.
     pub fn load(bytes: &[u8], resolver: &dyn ImportResolver) -> Result<Self> {
+        Self::map(bytes, resolver, true)
+    }
+
+    fn map(bytes: &[u8], resolver: &dyn ImportResolver, dll: bool) -> Result<Self> {
         let info = ImageInfo::parse(bytes)?;
-        ensure!(info.is_dll(), "only DLL images are supported");
+        ensure!(info.is_dll() == dll, "expected {} image", if dll { "DLL" } else { "executable" });
+        ensure!(dll || info.entry_rva != 0, "executable has no entry point");
         ensure!(info.tls.is_none(), "TLS is not supported");
         ensure!(!info.has_exception_table, "Windows unwind tables are not supported");
         ensure!(!info.has_load_config, "load configuration is not supported");
@@ -89,7 +94,7 @@ impl Image {
                 let start = s.rva as usize;
                 let size = (s.virtual_size as usize).max(s.file_size as usize);
                 s.characteristics & EXECUTE != 0 && entry >= start && entry - start < size
-            }), "DLL entry point is not in an executable section");
+            }), "entry point is not in an executable section");
         }
         // SAFETY: anonymous private mapping; map_len is nonzero.
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };

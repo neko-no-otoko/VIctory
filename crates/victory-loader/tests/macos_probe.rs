@@ -219,3 +219,38 @@ fn rejects_cycles_and_forwarded_exports() {
     };
     assert!(error.to_string().contains("forwarded export"), "{error}");
 }
+
+#[test]
+fn maps_and_starts_synthetic_executable_with_dependency() {
+    use victory_loader::macos::Executable;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("provider.def"), "LIBRARY provider.dll\nEXPORTS\nfixture_is_live\nfixture_call\n").unwrap();
+    std::fs::write(dir.path().join("program.c"), r#"
+__declspec(dllimport) int fixture_is_live(void);
+__declspec(dllimport) int fixture_call(void);
+int value = 7;
+int *volatile relocated_pointer = &value;
+unsigned synthetic_entry(void) {
+    return fixture_is_live() && *relocated_pointer == 7 ? fixture_call() : 0;
+}
+"#).unwrap();
+    run("llvm-dlltool", &["-m", "i386:x86-64", "-d", "provider.def", "-l", "provider.lib"], dir.path());
+    run("x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "program.c", "-o", "program.obj"], dir.path());
+    run("lld-link", &["/entry:synthetic_entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:program.exe", "program.obj", "provider.lib"], dir.path());
+    let bytes = std::fs::read(dir.path().join("program.exe")).unwrap();
+    let info = victory_pe::ImageInfo::parse(&bytes).unwrap();
+    assert!(!info.is_dll() && info.entry_rva != 0 && info.has_relocations);
+    let provider = fixture();
+    assert!(Executable::load(&provider, &[], &Resolver).is_err());
+    let mut missing_entry = bytes.clone();
+    let opt = victory_pe::layout::optional_header_offset(&missing_entry).unwrap();
+    missing_entry[opt + 16..opt + 20].copy_from_slice(&0u32.to_le_bytes());
+    assert!(Executable::load(&missing_entry, &[("provider.dll", &provider)], &Resolver).is_err());
+    let mut exe = Executable::load(&bytes, &[("provider.dll", &provider)], &Resolver).unwrap();
+    // SAFETY: the self-authored EXE entry returns normally with this exact
+    // Windows ABI; its sole dependency and imports are trusted fixtures.
+    unsafe {
+        assert_eq!(exe.start().unwrap(), 42);
+        assert!(exe.start().is_err());
+    }
+}

@@ -128,3 +128,66 @@ impl Drop for ModuleSet {
         while self.modules.pop().is_some() {}
     }
 }
+
+/// A mapped executable and its owned, explicitly supplied DLL dependencies.
+///
+/// This does not create a Windows process, thread, TEB or startup environment.
+pub struct Executable {
+    image: Image,
+    dependencies: ModuleSet,
+    started: bool,
+}
+
+impl Executable {
+    /// Map a PE executable and bind its imports without executing any code.
+    pub fn load(bytes: &[u8], dlls: &[(&str, &[u8])], external: &dyn ImportResolver) -> Result<Self> {
+        let dependencies = if dlls.is_empty() {
+            ModuleSet { modules: Vec::new(), attached: 0 }
+        } else {
+            ModuleSet::load(dlls, external)?
+        };
+        let names: Vec<String> = dlls.iter().map(|(name, _)| (*name).to_owned()).collect();
+        let resolver = SetResolver {
+            modules: &dependencies.modules,
+            names: &names,
+            external,
+            error: RefCell::new(None),
+        };
+        let result = Image::map(bytes, &resolver, false);
+        if let Some(error) = resolver.error.into_inner() { bail!(error); }
+        let image = result.context("loading executable")?;
+        Ok(Self { image, dependencies, started: false })
+    }
+
+    /// Attach DLLs, call the executable entry point, then detach DLLs.
+    ///
+    /// This is only for controlled entry points known to use the signature
+    /// `extern "win64" fn() -> u32` and return normally. It is not Windows
+    /// process startup. An executable may be started at most once.
+    ///
+    /// # Safety
+    /// The caller must trust every image and callback, guarantee the stated
+    /// entry-point signature, and satisfy all `Image::attach` and `detach`
+    /// requirements. There is no Windows process environment, loader lock,
+    /// thread setup, TLS, exception handling, CRT startup, or exit handling.
+    pub unsafe fn start(&mut self) -> Result<u32> {
+        ensure!(!self.started, "executable has already started");
+        if !self.dependencies.modules.is_empty() {
+            // SAFETY: the caller guarantees DLL lifecycle requirements.
+            unsafe { self.dependencies.attach() }?;
+        }
+        self.started = true;
+        // SAFETY: load validated the entry is in executable image memory;
+        // the caller guarantees its signature and that it returns normally.
+        let entry: unsafe extern "win64" fn() -> u32 = unsafe {
+            std::mem::transmute(self.image.base.as_ptr().add(self.image.info.entry_rva as usize))
+        };
+        // SAFETY: the caller guarantees the entry point is safe to execute.
+        let result = unsafe { entry() };
+        if !self.dependencies.modules.is_empty() {
+            // SAFETY: the entry returned and the caller guarantees quiescence.
+            unsafe { self.dependencies.detach() }?;
+        }
+        Ok(result)
+    }
+}
