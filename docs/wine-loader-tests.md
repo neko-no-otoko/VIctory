@@ -400,13 +400,21 @@ The supported subset includes multiple full color/depth clears, buffer copies,
 full texture uploads and readbacks, resource transitions, and multiple
 nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
 and pipeline changes. Committed default-heap resources are limited to
-RGBA8_UNORM and typed BC1/BC3 linear or sRGB sampled textures (including
-multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT or
-D32_FLOAT_S8X24_UINT depth/stencil textures, and buffers.
+typed RGBA8 and BGRA8 UNORM or UNORM_SRGB, and typed BC1/BC3 linear or sRGB
+sampled textures (including multiple mips); single-mip RGBA8/BGRA8 UNORM or
+UNORM_SRGB color targets; single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT
+depth/stencil textures; and buffers.
 Graphics supports one color target and optional depth target per draw; the
 native depth comparison/write subset; restricted single-target D3D blending
 and color write masks; and a single sampled texture and point or linear clamp
 sampler.
+Color SRV and RTV views must match the resource's typed format exactly;
+typeless resources and typed reinterpretation are rejected. Copies preserve
+the resource's channel bytes. Metal samples sRGB RGB in linear space, blends
+in linear space, and encodes RGB on sRGB render targets; alpha remains
+linear. Presentation accepts these four typed formats and preserves their
+encoded bytes, within the existing presentation size limit. Tiled sampled
+textures remain limited to RGBA8_UNORM.
 Vertex input layouts support up to 16 elements and 16 slots, with converter
 reflection mapping semantic names and indices to Metal attributes. Supported
 formats are R32G32B32A32_FLOAT, R32G32_FLOAT, R16G16_FLOAT, and R16G16_UNORM.
@@ -428,8 +436,8 @@ Shader constants must be contiguous and use one root slot. Texture copy row pitc
 256-byte aligned and buffer offset is 512-byte aligned.
 
 This remains restricted: no partial clears, cross-process shared fences,
-other tiled layouts, BGRA or uncompressed sRGB formats through this proxy, BC2
-and other compressed formats, arbitrary sampler/address modes, or
+other tiled layouts, BC2 and other compressed formats, arbitrary
+sampler/address modes, or
 general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
 4 MiB per shader, 128 MiB per graphics resource, 256 MiB total resource

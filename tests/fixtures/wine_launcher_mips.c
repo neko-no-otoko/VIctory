@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     rd.Width=7; rd.Height=5; rd.MipLevels=3; rd.Flags=0;
     if (invalid==4 || invalid==7 || invalid==8) {
         say("D3D12X invalid mip case armed\r\n");
-        if (invalid==4) rd.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (invalid==4) rd.Format=DXGI_FORMAT_R8G8B8A8_TYPELESS;
         if (invalid==7) rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (invalid==8) rd.MipLevels=4;
     }

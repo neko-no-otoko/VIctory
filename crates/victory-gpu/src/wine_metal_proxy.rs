@@ -149,11 +149,11 @@ fn write_buffer_descriptor(heap: &ComputeHeap, index: usize, descriptor: BufferD
 // the guest, as with an ordinary persistently mapped D3D resource.
 unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
-struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
+struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Option<Srv>>>;
-struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
+struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
 type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 #[derive(Clone)]
 enum GraphicsResource { Buffer(Arc<Buffer>), Texture(Arc<Texture>) }
@@ -626,11 +626,11 @@ extern "system" fn copyable_footprints(
     } else if r.dimension == 3 {
         let tiled = matches!(r.layout, 0x105 | 0x10a);
         if r.width > u32::MAX as u64 || wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)).is_none_or(|n| n > MAX_BUFFER)
-            || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
+            || !matches!(r.format, 28 | 29 | 40 | 71 | 72 | 77 | 78 | 87 | 91) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
             || (tiled && (r.flags != 0 || r.format != 28))
             || (r.mips != 1 && (r.flags != 0 || (r.layout != 0 && !tiled)))
             || (matches!(r.format, 71 | 72 | 77 | 78) && (r.width % 4 != 0 || r.height % 4 != 0 || (r.layout != 0 && !tiled) || r.flags != 0))
-            || (r.format == 28 && !matches!(r.flags, 0 | 1))
+            || (matches!(r.format, 28 | 29 | 87 | 91) && !matches!(r.flags, 0 | 1))
             || (r.format == 40 && (r.mips != 1 || r.flags != 2)) { return; }
     } else { return; }
     let mut end = base;
@@ -676,11 +676,11 @@ extern "system" fn create_resource(
         let Some(size) = wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)) else { return E_INVALIDARG; };
         let bc = matches!(r.format, 71 | 72 | 77 | 78);
         let tiled = matches!(r.layout, 0x105 | 0x10a);
-        if size > MAX_BUFFER || !matches!(r.format, 20 | 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
+        if size > MAX_BUFFER || !matches!(r.format, 20 | 28 | 29 | 40 | 71 | 72 | 77 | 78 | 87 | 91) || !matches!(r.layout, 0 | 1 | 0x105 | 0x10a)
             || (tiled && (r.flags != 0 || r.format != 28 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
             || (r.mips != 1 && (r.flags != 0 || (r.layout != 0 && !tiled)))
             || (bc && (r.width % 4 != 0 || r.height % 4 != 0 || (r.layout != 0 && !tiled) || r.flags != 0 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
-            || (r.format == 28 && (!matches!(r.flags, 0 | 1) || !matches!(state, 0 | 4 | 0x400 | 0x800 | 0x80)))
+            || (matches!(r.format, 28 | 29 | 87 | 91) && (!matches!(r.flags, 0 | 1) || !matches!(state, 0 | 4 | 0x400 | 0x800 | 0x80)))
             || (r.format == 40 && (r.mips != 1 || r.flags != 2 || !matches!(state, 0 | 0x10 | 0x800)))
             || (r.format == 20 && (r.mips != 1 || r.flags != 2 || r.layout != 0 || !matches!(state, 0 | 0x10 | 0x400 | 0x800))) {
             return E_INVALIDARG;
@@ -695,7 +695,7 @@ extern "system" fn create_resource(
             Some((Buffer { id: 0, state: Mutex::new(state), allow_uav: false, bytes }, layout))
         } else { None };
         let bytes = if tiled.is_some() { Vec::new() } else { vec![0; size] };
-        return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), state: Mutex::new(state), bytes: Mutex::new(bytes), tiled })), &BUFFER_TABLE, iid, RESOURCE, out);
+        return new(Data::Texture(Arc::new(Texture { id: resource_id(), width: r.width as u32, height: r.height, format: r.format, mips: u32::from(r.mips), flags: r.flags, state: Mutex::new(state), bytes: Mutex::new(bytes), tiled })), &BUFFER_TABLE, iid, RESOURCE, out);
     }
     if r.dimension != 1 || r.mips != 1 || r.width > MAX_BUFFER as u64 || r.height != 1 || r.format != 0
         || r.layout != 1 || !matches!(r.flags, 0 | 4) || !matches!(state, 0 | 1 | 8 | 0x40 | 0x400 | 0x800) {
@@ -781,7 +781,7 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
         return;
     }
     let (Some(Data::Texture(t)), Some(Data::Heap(_, h))) = (data(res), data(handle as This)) else { trap("invalid SRV"); };
-    if device(this).is_none() || !matches!(t.format, 28 | 71 | 72 | 77 | 78) { trap("unsupported SRV"); }
+    if device(this).is_none() || !matches!(t.format, 28 | 29 | 71 | 72 | 77 | 78 | 87 | 91) { trap("unsupported SRV"); }
     let (first_mip, mip_count) = if desc.is_null() {
         (0, t.mips)
     } else {
@@ -1375,7 +1375,7 @@ extern "system" fn present(this: This, planes: u32, plane: *const crate::queue::
     if state.active { return crate::object::E_NOTIMPL; }
     let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Data::Texture(texture)) = data(unsafe { *plane.resources }) else { return E_INVALIDARG; };
-    if texture.format != 28 { return E_INVALIDARG; }
+    if !matches!(texture.format, 28 | 29 | 87 | 91) || texture.tiled.is_some() { return E_INVALIDARG; }
     let bytes = texture.bytes.lock().unwrap_or_else(|e| e.into_inner());
     match crate::wine_present::send(queue.config.addr, queue.config.token, texture.width, texture.height, texture.format, texture.width * 4, &bytes, false) {
         Ok(_) => S_OK,
@@ -1402,6 +1402,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let mut stencil_state = None;
     let mut front_counter_clockwise = false;
     let mut depth_format = 0;
+    let mut color_format = 0;
     let mut blend = Blend::new(false, 15, [0; 6]).unwrap();
     while at < b.len() {
         if b.len() - at < 8 { return E_INVALIDARG; }
@@ -1444,9 +1445,10 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
             }
             13 => if word(4) != 0 { return E_INVALIDARG; },
             14 => if word(4) != 3 { return E_INVALIDARG; },
-            15 => for offset in (4..40).step_by(4) {
-                let expected = match offset { 4 => 28, 36 => 1, _ => 0 };
-                if word(offset) != expected { return E_INVALIDARG; }
+            15 => {
+                color_format = word(4);
+                if !matches!(color_format, 28 | 29 | 87 | 91) || word(36) != 1
+                    || (8..36).step_by(4).any(|offset| word(offset) != 0) { return E_INVALIDARG; }
             },
             16 => { depth_format = word(4); if !matches!(depth_format, 0 | 20 | 40) { return E_INVALIDARG; } }
             17 => if word(4) != 1 || word(8) != 0 { return E_INVALIDARG; },
@@ -1487,7 +1489,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
         && (inputs.len()==1 || (inputs.len()==2 && inputs[1].semantic.eq_ignore_ascii_case("TEXCOORD")
             && inputs[1].semantic_index==0 && inputs[1].format==16 && inputs[1].slot==0
             && inputs[1].offset==16 && !inputs[1].per_instance));
-    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, inputs, legacy, depth, blend };
+    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, inputs, legacy, depth, blend };
     new(Data::GraphicsPipeline(Arc::new(p)), &PIPELINE_TABLE, iid, PIPELINE, out)
 }
 extern "system" fn gpu_address(this: This) -> u64 {
@@ -1495,7 +1497,14 @@ extern "system" fn gpu_address(this: This) -> u64 {
 }
 extern "system" fn create_rtv(this: This, resource: This, desc: *const c_void, handle: u64) {
     let (Some(Data::Texture(t)), Some(Data::Rtv(h))) = (data(resource), data(handle as This)) else { trap("invalid RTV"); };
-    if device(this).is_none() || !desc.is_null() || t.format != 28 || t.tiled.is_some() { trap("unsupported RTV"); }
+    if device(this).is_none() || !matches!(t.format, 28 | 29 | 87 | 91)
+        || t.tiled.is_some() || t.flags & 1 == 0 || t.mips != 1 { trap("unsupported RTV"); }
+    if !desc.is_null() {
+        // Only the defined Texture2D members are read; union padding is unspecified.
+        let p = desc.cast::<u32>();
+        let (format, dimension, mip, plane) = unsafe { (p.read(), p.add(1).read(), p.add(2).read(), p.add(3).read()) };
+        if format != t.format || dimension != 4 || mip != 0 || plane != 0 { trap("unsupported RTV"); }
+    }
     let mut d = h.lock().unwrap();
     d.0 = Some(t);
     d.1 = d.1.checked_add(1).unwrap_or_else(|| trap("RTV revision overflow"));
@@ -1630,7 +1639,7 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         if first.checked_add(count).and_then(|n| n.checked_mul(element)).is_none_or(|n| n > size) { l.invalid = true; return; }
         Some((b.clone(), Index { buffer: b.id, offset: offset as u64, size, format, first, base_vertex }))
     } else { None };
-    if !g.topology || count == 0 || instances == 0
+    if desc.1.format != pipeline.format || !g.topology || count == 0 || instances == 0
         || !viewport.iter().all(|v| v.is_finite()) || viewport[2] <= 0.0 || viewport[3] <= 0.0
         || scissor[0] < 0 || scissor[1] < 0 || scissor[2] <= scissor[0] || scissor[3] <= scissor[1] {
         l.invalid = true; return;
@@ -1774,7 +1783,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         }
         if let Some(p) = &j.pipeline {
             let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
-                format: 28, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new() });
+                format: p.format, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new() });
             if matches!(&j.command,Command::Draw(d) if !d.vertices.is_empty()) { entry.inputs=p.inputs.clone(); }
         }
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }

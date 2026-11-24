@@ -7,11 +7,16 @@
 #include "windows_d3d12x_ordered_shaders.h"
 __declspec(dllimport) HRESULT __stdcall D3D12XboxCreateDevice(const void *, const unsigned *, const IID *, void **);
 #define SLOT(o,n,T) ((T)((*(void ***)(o))[(n)/8]))
+#ifndef TARGET_FORMAT
 #ifdef NATIVE_PRESENT_SRGB
 #define TARGET_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 #else
 #define TARGET_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 #endif
+#endif
+/* TARGET_FORMAT can also be supplied as a numeric DXGI format at build time. */
+#define TARGET_BGRA (TARGET_FORMAT == DXGI_FORMAT_B8G8R8A8_UNORM || TARGET_FORMAT == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+#define TARGET_SRGB (TARGET_FORMAT == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || TARGET_FORMAT == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
 typedef unsigned long long U64;
 typedef HRESULT (__stdcall *CreateResource)(void *, const void *, unsigned, const void *, unsigned, const void *, const IID *, void **);
 typedef HRESULT (__stdcall *CreateObject)(void *, const void *, const IID *, void **);
@@ -73,8 +78,12 @@ static void copy_texture(void *list,void *buffer,void *texture,unsigned width,un
     tex.pResource=texture; tex.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     SLOT(list,0x80,Copy)(list,upload?&tex:&buf,0,0,0,upload?&buf:&tex,0);
 }
+#ifdef NORMAL_WINE_PRESENT
+int main(void) {
+#else
 unsigned mainCRTStartup(void *unused) {
     (void)unused;
+#endif
 #ifndef NATIVE_PRESENT
     HANDLE threads[2]; DWORD codes[2];
     if(tls_value!=17 || tls_bad) return 20;
@@ -185,14 +194,12 @@ unsigned mainCRTStartup(void *unused) {
         SLOT(after,0x10,Release)(after);
     }
     volatile unsigned char *a=mapped[0],*b=mapped[1]; unsigned left=32*256+10*4,mid=48*256+32*4,right=48*256+56*4;
-    if(a[left]!=255 || a[left+1]!=0 || a[left+2]!=0 || a[left+3]!=255) return 14;
+    if(a[left]!=(TARGET_BGRA?0:255) || a[left+1]!=0 || a[left+2]!=(TARGET_BGRA?255:0) || a[left+3]!=255) return 14;
     if(b[mid]!=0 || b[mid+1]!=255 || b[mid+2]!=0 || b[mid+3]!=255) return 17;
-#ifdef NATIVE_PRESENT_SRGB
-    /* RGB is encoded by the sRGB render target; alpha remains linear. */
-    if(b[right]!=137 || b[right+1]!=188 || b[right+2]!=255 || b[right+3]!=0) return 18;
-#else
-    if(b[right]!=64 || b[right+1]!=128 || b[right+2]!=255 || b[right+3]!=0) return 18;
-#endif
+    /* RGB is encoded by an sRGB render target; alpha remains linear. */
+    if(b[right]!=(TARGET_BGRA?255:(TARGET_SRGB?137:64)) ||
+       b[right+1]!=(TARGET_SRGB?188:128) ||
+       b[right+2]!=(TARGET_BGRA?(TARGET_SRGB?137:64):255) || b[right+3]!=0) return 18;
     for(unsigned i=0;i<2;i++) { SLOT(list[i],0x10,Release)(list[i]); SLOT(vb[i],0x10,Release)(vb[i]); SLOT(upload[i],0x10,Release)(upload[i]); SLOT(readback[i],0x10,Release)(readback[i]); SLOT(tex[i],0x10,Release)(tex[i]); SLOT(target[i],0x10,Release)(target[i]); }
     SLOT(readback[2],0x10,Release)(readback[2]);
     for(unsigned i=0;i<5;i++) SLOT(heap[i],0x10,Release)(heap[i]);

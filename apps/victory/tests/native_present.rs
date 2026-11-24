@@ -20,11 +20,9 @@ fn real_pe_presents_on_native_fixture_main_thread() {
     std::fs::write(root.join("windows_d3d12x_ordered_shaders.h"), include_str!("../../../tests/fixtures/windows_d3d12x_ordered_shaders.h")).unwrap();
     std::fs::write(root.join("d3d.def"), "LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n").unwrap();
     tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "d3d.def", "-l", "d3d.lib"]);
-    for (variant, srgb) in [("unorm", false), ("srgb", true)] {
-        let mut args = vec!["-O2", "-DNATIVE_PRESENT", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"];
-        if srgb {
-            args.push("-DNATIVE_PRESENT_SRGB");
-        }
+    for (variant, format) in [("rgba", "28"), ("rgba-srgb", "29"), ("bgra", "87"), ("bgra-srgb", "91")] {
+        let define = format!("-DTARGET_FORMAT={format}");
+        let mut args = vec!["-O2", "-DNATIVE_PRESENT", define.as_str(), "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"];
         args.extend(["-c", "present.c", "-o", "present.obj"]);
         tool(root, "x86_64-w64-mingw32-clang", &args);
         tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:present.exe", "present.obj", "d3d.lib"]);
