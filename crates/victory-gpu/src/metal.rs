@@ -461,7 +461,7 @@ impl State {
             && ((before == RENDER_TARGET || after == RENDER_TARGET)
                 && crate::resource::metal_texture(resource).is_none()
                 || (before == PIXEL_SHADER_RESOURCE || after == PIXEL_SHADER_RESOURCE)
-                    && crate::resource::metal_sampled_texture(resource).is_none()
+                    && crate::resource::metal_sampled_mip_count(resource).is_none()
                 || (before == DEPTH_WRITE || after == DEPTH_WRITE)
                     && crate::resource::metal_depth_texture(resource).is_none())
         {
@@ -1214,30 +1214,10 @@ impl State {
                             return Err("sampled descriptors changed after recording".into());
                         }
                         submission.access(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
-                        let (_, width, height, _) =
-                            crate::resource::metal_sampled_mip(sampled.texture.ptr(), sampled.first_mip)
-                                .ok_or("invalid sampled texture mip")?;
-                        self.texture_scratch.clear();
-                        for mip in sampled.first_mip..sampled.first_mip + sampled.mip_count {
-                            let (data, mip_width, mip_height, pitch) =
-                                crate::resource::metal_sampled_mip(sampled.texture.ptr(), mip)
-                                    .ok_or("invalid sampled texture mip")?;
-                            let row = (mip_width as usize).checked_mul(4).ok_or("sampled row overflow")?;
-                            let len = row.checked_mul(mip_height as usize).ok_or("sampled size overflow")?;
-                            let start = self.texture_scratch.len();
-                            let end = start.checked_add(len).ok_or("sampled chain overflow")?;
-                            self.texture_scratch.resize(end, 0);
-                            for y in 0..mip_height as usize {
-                                // SAFETY: each retained subresource has a checked, padded row layout.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        data.add(y * pitch),
-                                        self.texture_scratch.as_mut_ptr().add(start + y * row),
-                                        row,
-                                    )
-                                };
-                            }
-                        }
+                        let (width, height) = crate::resource::metal_sampled_copy_mips(
+                            sampled.texture.ptr(), sampled.first_mip, sampled.mip_count,
+                            &mut self.texture_scratch,
+                        ).ok_or("failed to stage sampled texture mips")?;
                         Some(crate::metal_graphics::Texture {
                             width,
                             height,

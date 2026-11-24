@@ -132,8 +132,13 @@ perspective-correct sampling, including independent UV input on indexed and
 nonindexed draws, and exercise layout, stride, and linkage rejection.
 The native color path supports committed, linear single-mip RGBA8_UNORM and
 BGRA8_UNORM 2D render targets, and sampled 2D textures with one or more valid
-mips. Sampled textures use one array slice and sample; each mapped subresource
-has a 256-byte-aligned row pitch and a 512-byte-aligned start in the allocation.
+mips. Sampled textures use one array slice and sample. Linear textures map each
+subresource with a 256-byte-aligned row pitch and a 512-byte-aligned start.
+Tiled textures support the console GFX10 `SW_4KB_S` layout, selected by layout
+0 (default) or `0x105` (explicit); map subresource 0 to access the complete
+tiled allocation, including its shared mip tail. Other tiled subresource maps
+are rejected. Each selected mip is detiled from the retained allocation before
+Metal upload, using the console texture layout.
 Formats must match their pipeline, copy footprint and explicit view; default
 views are also supported. Explicit 2D SRVs require identity component mapping,
 zero plane and resource LOD clamp, and a nonempty in-bounds contiguous mip range
@@ -148,6 +153,8 @@ explicit views, padded readback, clears, blending, masks, and retained resources
 The mip fixture samples different levels of RGBA8 and BGRA8 textures through
 default and ranged SRVs and sampler LOD clamps, checks mapped subresources and
 retained descriptors, and rejects invalid ranges.
+The tiled fixture checks known RGBA/BGRA tiled data, mip ranges and tail
+sampling, retained resources, and invalid layouts and subresources.
 With the same prerequisites, run:
 
 ```sh
@@ -160,6 +167,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_varying -- --ig
 cargo test -p victory --target x86_64-apple-darwin --test native_uv -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_bgra -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_mips -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_tiled -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

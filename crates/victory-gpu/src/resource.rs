@@ -927,10 +927,6 @@ pub(crate) fn metal_depth_texture(this: This) -> Option<(*mut u8, u32, u32, usiz
     metal_linear_texture(this, 40, 2)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn metal_sampled_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_sampled_mip(this, 0)
-}
 
 /// The mapped layout of one mip of a committed linear sampled texture.
 #[cfg(target_os = "macos")]
@@ -940,6 +936,9 @@ pub(crate) fn metal_sampled_mip(this: This, mip: u32) -> Option<(*mut u8, u32, u
         return None;
     }
     let r = resource(this);
+    if r.desc.layout != 1 {
+        return None;
+    }
     let (offset, width, height, pitch, _) = sampled_mip_layout(&r.desc, mip)?;
     let Backing::Committed(memory) = &r.backing else { return None };
     // The complete layout was checked against this allocation at creation.
@@ -956,15 +955,79 @@ pub(crate) fn metal_sampled_mip_count(this: This) -> Option<u32> {
         return None;
     }
     let count = u32::from(r.desc.mip_levels);
-    let (_, _, _, _, end) = sampled_mip_layout(&r.desc, count.checked_sub(1)?)?;
     let Backing::Committed(memory) = &r.backing else { return None };
-    (end <= memory.layout.size()).then_some(count)
+    if r.desc.layout == 1 {
+        let (_, _, _, _, end) = sampled_mip_layout(&r.desc, count.checked_sub(1)?)?;
+        (end <= memory.layout.size()).then_some(count)
+    } else {
+        sampled_dimensions(&r.desc, count.checked_sub(1)?)?;
+        let layout = texture_layout(&r.desc)?;
+        (usize::try_from(layout.size).ok()? <= memory.layout.size()).then_some(count)
+    }
+}
+
+/// Copy consecutive sampled mips into tightly packed, concatenated rows.
+/// Returns the dimensions of the first selected mip.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_sampled_copy_mips(
+    this: This, first: u32, count: u32, dst: &mut Vec<u8>,
+) -> Option<(u32, u32)> {
+    if this.is_null() || count == 0 {
+        return None;
+    }
+    let r = resource(this);
+    let Backing::Committed(memory) = &r.backing else { return None };
+    if r.heap.kind != 1 || !sampled_desc(&r.desc) {
+        return None;
+    }
+    let end_mip = first.checked_add(count)?;
+    let total_mips = u32::from(r.desc.mip_levels);
+    if end_mip > total_mips {
+        return None;
+    }
+    sampled_dimensions(&r.desc, total_mips.checked_sub(1)?)?;
+    let dimensions = sampled_dimensions(&r.desc, first)?;
+    let layout = if r.desc.layout == 1 {
+        let (_, _, _, _, end) = sampled_mip_layout(&r.desc, total_mips - 1)?;
+        if end > memory.layout.size() { return None; }
+        None
+    } else {
+        let layout = texture_layout(&r.desc)?;
+        if usize::try_from(layout.size).ok()? > memory.layout.size() { return None; }
+        Some(layout)
+    };
+    let mut total = 0usize;
+    for mip in first..end_mip {
+        let (width, height) = sampled_dimensions(&r.desc, mip)?;
+        total = total.checked_add(usize::try_from(width).ok()?.checked_mul(4)?
+            .checked_mul(usize::try_from(height).ok()?)?)?;
+    }
+    dst.clear();
+    dst.resize(total, 0);
+    let source = unsafe { std::slice::from_raw_parts(memory.ptr.as_ptr(), memory.layout.size()) };
+    let mut offset = 0usize;
+    for mip in first..end_mip {
+        let (width, height) = sampled_dimensions(&r.desc, mip)?;
+        let row = usize::try_from(width).ok()?.checked_mul(4)?;
+        let size = row.checked_mul(usize::try_from(height).ok()?)?;
+        let target = &mut dst[offset..offset + size];
+        if let Some(layout) = &layout {
+            layout.planes.first()?.layout.detile(source, mip, 0, target, row, size).ok()?;
+        } else {
+            let (start, _, _, pitch, end) = sampled_mip_layout(&r.desc, mip)?;
+            for (src, dest) in source[start..end].chunks(pitch).zip(target.chunks_exact_mut(row)) {
+                dest.copy_from_slice(&src[..row]);
+            }
+        }
+        offset += size;
+    }
+    Some(dimensions)
 }
 
 #[cfg(target_os = "macos")]
 fn sampled_desc(d: &ResourceDesc) -> bool {
     d.dimension == 3 && matches!(d.format, 28 | 87) && d.depth_or_array_size == 1
-        && d.sample_count == 1 && d.sample_quality == 0 && d.layout == 1 && d.flags == 0
+        && d.sample_count == 1 && d.sample_quality == 0 && matches!(d.layout, 0 | 1 | 0x105) && d.flags == 0
 }
 
 #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
@@ -972,9 +1035,8 @@ fn native_multimip_sampled(d: &ResourceDesc) -> bool {
     d.dimension != BUFFER && matches!(d.format, 28 | 87) && d.flags == 0 && d.mip_levels > 1
 }
 
-/// Returns the offset, dimensions, pitch and end of a mip, with checked arithmetic.
 #[cfg(target_os = "macos")]
-fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, usize, usize)> {
+fn sampled_dimensions(d: &ResourceDesc, mip: u32) -> Option<(u32, u32)> {
     let width = u32::try_from(d.width).ok()?;
     if width == 0 || d.height == 0 || d.mip_levels == 0
         || u32::from(d.mip_levels) > u32::BITS - width.max(d.height).leading_zeros()
@@ -982,6 +1044,14 @@ fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, us
     {
         return None;
     }
+    Some(((width >> mip).max(1), (d.height >> mip).max(1)))
+}
+
+/// Returns the offset, dimensions, pitch and end of a mip, with checked arithmetic.
+#[cfg(target_os = "macos")]
+fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, usize, usize)> {
+    sampled_dimensions(d, mip)?;
+    let width = u32::try_from(d.width).ok()?;
     let mut end = 0usize;
     for level in 0..=mip {
         let offset = end.checked_next_multiple_of(512)?;
@@ -1038,7 +1108,7 @@ pub(crate) fn metal_texture_state<T>(
     f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T,
 ) -> Option<T> {
     if metal_texture(this).is_none()
-        && metal_sampled_texture(this).is_none()
+        && metal_sampled_mip_count(this).is_none()
         && metal_depth_texture(this).is_none()
     {
         return None;
@@ -1211,7 +1281,11 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     }
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if native_multimip_sampled(&desc) && (heap.kind != 1 || !sampled_desc(&desc)) {
+    if (native_multimip_sampled(&desc)
+        || (desc.dimension != BUFFER && matches!(desc.format, 28 | 87)
+            && desc.flags == 0 && desc.layout != 1))
+        && (heap.kind != 1 || !sampled_desc(&desc))
+    {
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
         }
@@ -1219,16 +1293,21 @@ pub(crate) extern "system" fn create_committed(
     }
     #[cfg(target_os = "macos")]
     let sampled_size = if heap.kind == 1 && sampled_desc(&desc) {
-        let Some((_, _, _, _, end)) = u32::from(desc.mip_levels)
-            .checked_sub(1)
-            .and_then(|last| sampled_mip_layout(&desc, last))
-        else {
+        let size = if desc.layout == 1 {
+            u32::from(desc.mip_levels).checked_sub(1)
+                .and_then(|last| sampled_mip_layout(&desc, last).map(|v| v.4 as u64))
+        } else {
+            u32::from(desc.mip_levels).checked_sub(1)
+                .and_then(|last| sampled_dimensions(&desc, last))
+                .and_then(|_| texture_layout(&desc).map(|layout| layout.size))
+        };
+        let Some(size) = size else {
             if !out.is_null() {
                 unsafe { out.write(std::ptr::null_mut()) };
             }
             return E_INVALIDARG;
         };
-        Some(end as u64)
+        Some(size)
     } else {
         None
     };
@@ -1530,14 +1609,21 @@ pub(crate) extern "system" fn resource_release(this: This) -> u32 {
         object::release_boxed::<Resource>(this)
     }
 }
-/// Memory is always mapped; sampled Metal textures map each mip separately.
-/// A null `out` only asks for residency.
+/// Linear sampled mips map separately; tiled mip tails share the allocation,
+/// so only subresource zero maps the entire tiled allocation.
 extern "system" fn map(this: This, sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     #[cfg(target_os = "macos")]
     if !this.is_null() {
         let r = resource(this);
         if r.heap.kind == 1 && matches!(r.backing, Backing::Committed(_)) && sampled_desc(&r.desc) {
-            let Some((data, _, _, _)) = metal_sampled_mip(this, sub) else {
+            let data = if r.desc.layout == 1 {
+                metal_sampled_mip(this, sub).map(|v| v.0)
+            } else if sub == 0 && metal_sampled_mip_count(this).is_some() {
+                Some(r.data())
+            } else {
+                None
+            };
+            let Some(data) = data else {
                 if !out.is_null() {
                     unsafe { out.write(std::ptr::null_mut()) };
                 }
