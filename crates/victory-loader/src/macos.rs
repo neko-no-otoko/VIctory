@@ -1,9 +1,9 @@
 //! Minimal x86-64 macOS PE32+ mapping for synthetic modules.
 //!
-//! This is not a Windows process or an Xbox runtime. It does not initialize
-//! entry points, TLS, exception tables, load configuration or delay imports.
-//! Export calls and all resolver-provided functions must use the Windows x64
-//! ABI, and the caller must uphold their individual safety requirements.
+//! This is not a Windows process or an Xbox runtime. TLS, exception tables,
+//! load configuration and delay imports are unsupported. DLL entry points
+//! may be invoked only through the explicit unsafe lifecycle methods.
+//! Export calls and resolver-provided functions use the Windows x64 ABI.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -18,11 +18,12 @@ const WRITE: u32 = 0x8000_0000;
 const EXECUTE: u32 = 0x2000_0000;
 const RELOC_DIR64: u16 = 10;
 
-/// An owned, rebased image. Dropping it unmaps all exports and data.
+/// An owned, rebased image. Dropping it unmaps it without calling DLL detach.
 pub struct Image {
     base: NonNull<u8>,
     len: usize,
     info: ImageInfo,
+    attached: bool,
 }
 
 impl Drop for Image {
@@ -35,12 +36,11 @@ impl Drop for Image {
 impl Image {
     /// Maps an image without executing it, resolving its ordinary imports.
     ///
-    /// Images needing initialization, Windows exception handling, delay loads,
-    /// TLS or load configuration are rejected rather than partly initialized.
+    /// Windows exception handling, delay loads, TLS and load configuration
+    /// are rejected rather than partly initialized. This does not call DllMain.
     pub fn load(bytes: &[u8], resolver: &dyn ImportResolver) -> Result<Self> {
         let info = ImageInfo::parse(bytes)?;
         ensure!(info.is_dll(), "only DLL images are supported");
-        ensure!(info.entry_rva == 0, "entry points are not supported");
         ensure!(info.tls.is_none(), "TLS is not supported");
         ensure!(!info.has_exception_table, "Windows unwind tables are not supported");
         ensure!(!info.has_load_config, "load configuration is not supported");
@@ -81,11 +81,19 @@ impl Image {
                 ensure!(*slot & (libc::PROT_WRITE | libc::PROT_EXEC) != (libc::PROT_WRITE | libc::PROT_EXEC), "writable executable page is unsupported");
             }
         }
+        if info.entry_rva != 0 {
+            let entry = info.entry_rva as usize;
+            ensure!(info.sections.iter().any(|s| {
+                let start = s.rva as usize;
+                let size = (s.virtual_size as usize).max(s.file_size as usize);
+                s.characteristics & EXECUTE != 0 && entry >= start && entry - start < size
+            }), "DLL entry point is not in an executable section");
+        }
         // SAFETY: anonymous private mapping; map_len is nonzero.
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
         ensure!(raw != libc::MAP_FAILED, "mmap failed: {}", std::io::Error::last_os_error());
         let base = NonNull::new(raw.cast::<u8>()).context("mmap returned null")?;
-        let image = Self { base, len: map_len, info };
+        let image = Self { base, len: map_len, info, attached: false };
         // SAFETY: the newly allocated mapping is writable and map_len bytes long.
         let mapped = unsafe { std::slice::from_raw_parts_mut(image.base.as_ptr(), len) };
         mapped[..header_size].copy_from_slice(&bytes[..header_size]);
@@ -122,6 +130,47 @@ impl Image {
                 "mprotect failed: {}", std::io::Error::last_os_error());
         }
         Ok(image)
+    }
+
+    /// Calls DLL_PROCESS_ATTACH once, or marks an entrypoint-free DLL attached.
+    /// An entry point returning FALSE leaves the image unattached.
+    ///
+    /// # Safety
+    /// The caller must trust the DLL and ensure its imports, ABI, dependencies,
+    /// thread environment and any required serialization are valid. Windows
+    /// loader-lock and thread notifications are not provided.
+    pub unsafe fn attach(&mut self) -> Result<()> {
+        ensure!(!self.attached, "image is already attached");
+        if self.info.entry_rva != 0 {
+            // SAFETY: load validated the entry lies in executable image memory;
+            // the caller is responsible for the DLL's ABI and requirements.
+            let entry: unsafe extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32 =
+                unsafe { std::mem::transmute(self.base.as_ptr().add(self.info.entry_rva as usize)) };
+            // SAFETY: the caller guarantees the entry point can run here.
+            ensure!(unsafe { entry(self.base.as_ptr().cast(), crate::DLL_PROCESS_ATTACH, std::ptr::null_mut()) } != 0,
+                "DLL_PROCESS_ATTACH returned FALSE");
+        }
+        self.attached = true;
+        Ok(())
+    }
+
+    /// Calls DLL_PROCESS_DETACH once for a successfully attached image.
+    ///
+    /// # Safety
+    /// The requirements of `attach` still apply. All users of the image must
+    /// be quiescent. Call this before dropping an attached image; Drop cannot
+    /// safely invoke arbitrary DLL code and only unmaps the image.
+    pub unsafe fn detach(&mut self) -> Result<()> {
+        ensure!(self.attached, "image is not attached");
+        if self.info.entry_rva != 0 {
+            // SAFETY: the entry point was validated when the image was mapped.
+            let entry: unsafe extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32 =
+                unsafe { std::mem::transmute(self.base.as_ptr().add(self.info.entry_rva as usize)) };
+            // SAFETY: the caller guarantees the entry point can run here.
+            unsafe { entry(self.base.as_ptr().cast(), crate::DLL_PROCESS_DETACH, std::ptr::null_mut()) };
+        }
+        self.attached = false;
+        Ok(())
     }
 
     /// Address of a named, non-forwarded export. Valid only while `self` lives.

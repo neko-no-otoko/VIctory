@@ -8,13 +8,22 @@ loader. It does not run GTA VI or implement an Xbox or Windows environment.
 The mapper copies headers and sections, applies `DIR64` base relocations,
 resolves ordinary imports through an `ImportResolver`, and sets page
 permissions from section flags. It rejects writable/executable pages,
-unresolved imports, unsupported relocations, DLL entry points, TLS, Windows
-unwind tables, load configuration and delay imports. It does not run
-initializers or manage Windows threads, exceptions, the TEB, GS-based TLS,
-other DLL loading or Windows APIs. Export addresses remain valid only while
-the image is alive; callers and imported callbacks must use the correct
-Windows x64 ABI and satisfy their own safety and lifetime requirements.
-Only load trusted code: calling an export executes arbitrary machine code.
+unresolved imports, unsupported relocations, TLS, Windows unwind tables,
+load configuration and delay imports. Loading does not invoke code. An
+explicit unsafe `Image::attach` calls the DLL entry point with
+`DLL_PROCESS_ATTACH`; after successful attachment, unsafe `Image::detach`
+calls `DLL_PROCESS_DETACH` with a null reserved pointer. A failed attach is
+not followed by detach. Duplicate attach or detach is rejected. An image
+without an entry point still has explicit attach/detach state.
+
+The caller must ensure the DLL and all callbacks are trusted, ABI-correct,
+properly initialized and safely serialized, and that users are quiescent
+before detach. Windows loader-lock semantics, thread notifications, the TEB,
+GS-based TLS, exception handling, other DLL loading and Windows APIs are not
+provided. The caller must detach before dropping an attached image: `Drop`
+only unmaps memory and never invokes arbitrary code. Export addresses remain
+valid only while the image is alive. Calling an export executes arbitrary
+machine code.
 
 ## Synthetic test under Rosetta
 
@@ -38,7 +47,8 @@ The integration test creates an actual PE with an import and a `DIR64`
 relocation, maps it, calls its export using the Windows x64 ABI, checks the
 host callback and rebased pointer, and checks that writes to read-only data
 and executable code fault in child processes. It also checks missing imports,
-invalid images and rejected entry points. Passing these tests is not evidence
-of title execution, D3D12 translation, or Metal support. See
+invalid entry points, attach failure, module and reserved arguments, and
+exactly-once detach. Passing these tests is not evidence of title execution,
+D3D12 translation, or Metal support. See
 [rosetta-avx-probe.md](rosetta-avx-probe.md) for the separate instruction
 experiment; CPUID reporting and execution can differ under Rosetta.

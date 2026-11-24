@@ -45,7 +45,7 @@ fn fixture() -> Vec<u8> {
     std::fs::write(dir.path().join("host.def"), "LIBRARY victory-synthetic.dll\nEXPORTS\nhost_adjust\n").unwrap();
     run("llvm-dlltool", &["-m", "i386:x86-64", "-d", "host.def", "-l", "host.lib"], dir.path());
     run("x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", source.to_str().unwrap(), "-o", "fixture.obj"], dir.path());
-    run("lld-link", &["/dll", "/noentry", "/nodefaultlib", "/dynamicbase", "/out:fixture.dll", "fixture.obj", "host.lib"], dir.path());
+    run("lld-link", &["/dll", "/entry:DllMain", "/nodefaultlib", "/dynamicbase", "/out:fixture.dll", "fixture.obj", "host.lib"], dir.path());
     std::fs::read(dir.path().join("fixture.dll")).unwrap()
 }
 
@@ -97,6 +97,57 @@ fn rejects_unresolved_imports_and_bad_images() {
     let mut with_entry = bytes;
     let opt = victory_pe::layout::optional_header_offset(&with_entry).unwrap();
     with_entry[opt + 16..opt + 20].copy_from_slice(&1u32.to_le_bytes());
-    let error = match Image::load(&with_entry, &Resolver) { Ok(_) => panic!("entry point accepted"), Err(e) => e };
-    assert!(error.to_string().contains("entry points"), "{error}");
+    let error = match Image::load(&with_entry, &Resolver) { Ok(_) => panic!("invalid entry point accepted"), Err(e) => e };
+    assert!(error.to_string().contains("entry point"), "{error}");
+}
+
+#[test]
+fn invokes_attach_and_detach_and_handles_failure() {
+    let bytes = fixture();
+    let parsed = victory_pe::ImageInfo::parse(&bytes).unwrap();
+    let value_rva = parsed.exports.iter().find(|e| e.name.as_deref() == Some("fixture_value")).unwrap().rva.unwrap() as usize;
+    let mut image = Image::load(&bytes, &Resolver).unwrap();
+    let exported = |name| image.export(name).unwrap().as_ptr();
+    let attaches = exported("fixture_attaches").cast::<i32>();
+    let detaches = exported("fixture_detaches").cast::<i32>();
+    let fail = exported("fixture_fail_attach").cast::<i32>();
+    let module = exported("fixture_module").cast::<*mut std::ffi::c_void>();
+    let reserved = exported("fixture_reserved").cast::<*mut std::ffi::c_void>();
+    let expected_base = (exported("fixture_value") as usize - value_rva) as *mut std::ffi::c_void;
+    // SAFETY: the self-authored fixture exports these typed, writable globals.
+    unsafe {
+        assert_eq!(*attaches, 0);
+        assert!(image.detach().is_err());
+        *fail = 1;
+        assert!(image.attach().is_err());
+        assert_eq!(*attaches, 1);
+        assert_eq!(*detaches, 0);
+        assert!(image.detach().is_err());
+        *fail = 0;
+        image.attach().unwrap();
+        assert_eq!(*attaches, 2);
+        assert_eq!(*module, expected_base);
+        assert!((*reserved).is_null());
+        assert!(image.attach().is_err());
+        image.detach().unwrap();
+        assert_eq!(*detaches, 1);
+        assert_eq!(*module, expected_base);
+        assert!((*reserved).is_null());
+        assert!(image.detach().is_err());
+    }
+}
+
+#[test]
+fn entrypoint_free_image_has_explicit_lifecycle() {
+    let mut bytes = fixture();
+    let opt = victory_pe::layout::optional_header_offset(&bytes).unwrap();
+    bytes[opt + 16..opt + 20].copy_from_slice(&0u32.to_le_bytes());
+    let mut image = Image::load(&bytes, &Resolver).unwrap();
+    // SAFETY: this fixture has no entry point, and no code runs.
+    unsafe {
+        image.attach().unwrap();
+        assert!(image.attach().is_err());
+        image.detach().unwrap();
+        assert!(image.detach().is_err());
+    }
 }
