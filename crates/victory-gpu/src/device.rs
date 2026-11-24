@@ -15,6 +15,9 @@ use crate::object::{
 use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
+#[cfg(windows)]
+#[path = "wine_metal_proxy.rs"]
+mod wine_metal_proxy;
 
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
@@ -151,6 +154,10 @@ pub extern "system" fn create(
     }
     if out.is_null() {
         return S_FALSE;
+    }
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_WINE_METAL_ADDR").is_some() {
+        return wine_metal_proxy::create(iid, out);
     }
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -62,6 +62,9 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub use metal::WineMetalCompute;
+
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

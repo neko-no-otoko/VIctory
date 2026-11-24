@@ -142,6 +142,52 @@ impl Prepared {
         })
     }
 }
+/// A reusable restricted console compute pipeline.
+#[cfg(target_arch = "x86_64")]
+pub struct WineMetalCompute {
+    prepared: Prepared,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl WineMetalCompute {
+    /// Prepare a shader with root constants at slot 0 and a UAV table at slot 1.
+    pub fn new(shader: &[u8]) -> Result<Self, String> {
+        if shader.is_empty() || shader.len() > 4 * 1024 * 1024 {
+            return Err("invalid compute request dimensions or lengths".into());
+        }
+        let prepared = Prepared::new(shader)?;
+        if prepared.table_slot != 1 || prepared.root_cbv.is_some() {
+            return Err("expected UAV table at root slot 1 without a root CBV".into());
+        }
+        if prepared.user_data.iter().any(|u| !matches!(
+            (u.root, u.slot), (RootType::Constants, 0) | (RootType::Table, 1)
+        )) {
+            return Err("unsupported root argument".into());
+        }
+        Ok(Self { prepared })
+    }
+
+    /// Dispatch synchronously and replace the UAV contents with the result.
+    pub fn dispatch(&mut self, buffer: &mut [u8], root_constants: &[u32], groups: [u32; 3]) -> Result<(), String> {
+        if buffer.is_empty() || buffer.len() > 16 * 1024 * 1024
+            || root_constants.len() > 64 || groups.contains(&0)
+        {
+            return Err("invalid compute request dimensions or lengths".into());
+        }
+        let p = &mut self.prepared;
+        let mut constants = vec![0; p.dwords];
+        for u in &p.user_data {
+            constants[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => *root_constants.get(u.dword as usize)
+                    .ok_or("missing root constant")?,
+                (RootType::Table, 1) => 0,
+                _ => return Err("unsupported root argument".into()),
+            };
+        }
+        p.compute.dispatch(buffer, &constants, groups, p.threads)
+    }
+}
+
 
 struct ResourceRef(usize);
 impl ResourceRef {
