@@ -23,18 +23,28 @@ const MAGIC: u32 = 0x31474d56;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
 const MAX_BUFFER: usize = 16 * 1024 * 1024;
 const UNKNOWN: Iid = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+const DEVICE11: Iid = guid(0x5405c344, 0xd457, 0x444e, [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39]);
 const HEAP: Iid = guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
 const RESOURCE: Iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
 const PIPELINE: Iid = guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]);
 const ALLOCATOR: Iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
 const LIST: Iid = guid(0x7116d91c, 0xe7e4, 0x47ce, [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5]);
 const GRAPHICS_LIST: Iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+const NEWER_LIST_IIDS: [Iid; 6] = [
+    guid(0x553103fb, 0x1fe7, 0x4557, [0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7]),
+    guid(0x38c3e585, 0xff17, 0x412c, [0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28]),
+    guid(0x6fda83a7, 0xb84c, 0x4e38, [0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d]),
+    guid(0x8754318e, 0xd3a9, 0x4541, [0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74]),
+    guid(0x55050859, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
+    guid(0xc3827890, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
+];
 const QUEUE: Iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
 
 #[derive(Clone)]
 struct Config {
     addr: SocketAddr,
     token: [u8; 16],
+    newer: bool,
 }
 fn config() -> Result<Config, String> {
     let addr: SocketAddr = std::env::var("VICTORY_WINE_METAL_ADDR")
@@ -52,7 +62,7 @@ fn config() -> Result<Config, String> {
     for (i, b) in token.iter_mut().enumerate() {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| "invalid token")?;
     }
-    Ok(Config { addr, token })
+    Ok(Config { addr, token, newer: false })
 }
 
 // These objects keep their COM identity in a registry; recorded jobs retain
@@ -74,7 +84,7 @@ enum Data {
     Buffer(Arc<Buffer>),
     Pipeline(Arc<Vec<u8>>),
     Allocator(u32),
-    List(Arc<Mutex<ListState>>),
+    List(Arc<Mutex<ListState>>, bool),
     Queue(Arc<Config>, u32),
     Texture(Arc<Texture>),
     Rtv(Arc<Mutex<(Option<Arc<Texture>>, u64)>>),
@@ -167,19 +177,27 @@ fn trap(message: &str) -> ! {
     eprintln!("Wine Metal proxy: {message}");
     std::process::abort()
 }
+fn supports(data: &Data, expected: Iid, iid: &Iid) -> bool {
+    *iid == expected || *iid == UNKNOWN || (expected == LIST && *iid == GRAPHICS_LIST)
+        || (matches!(data, Data::Device(c) if c.newer) && *iid == DEVICE11)
+        || (matches!(data, Data::List(_, true)) && NEWER_LIST_IIDS.contains(iid))
+}
 fn new(data: Data, table: &'static Table<160>, iid: *const Iid, expected: Iid, out: *mut This) -> HRESULT {
     if iid.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     unsafe {
         *out = std::ptr::null();
-        if *iid != expected && *iid != UNKNOWN && !(expected == LIST && *iid == GRAPHICS_LIST) {
+        if !supports(&data, expected, &*iid) {
             return E_NOINTERFACE;
         }
     }
     let mut header = Box::new(Header { object: Object::new(table), inline: [0; 180] });
-    if matches!(data, Data::Device(_)) {
-        header.inline[1] = 1;
+    match &data {
+        Data::Device(_) => header.inline[1] = 1,
+        Data::Queue(_, kind) => header.inline[0] = u64::from(*kind),
+        Data::List(state, _) => header.inline[0] = u64::from(state.lock().unwrap().kind),
+        _ => {}
     }
     let ptr = Box::into_raw(header) as This;
     objects().lock().unwrap().insert(ptr as usize, Entry { refs: 1, data });
@@ -201,13 +219,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         Data::Buffer(_) => RESOURCE,
         Data::Pipeline(_) => PIPELINE,
         Data::Allocator(_) => ALLOCATOR,
-        Data::List(_) => LIST,
+        Data::List(..) => LIST,
         Data::Queue(_, _) => QUEUE,
         Data::Texture(_) => RESOURCE,
         Data::Rtv(_) | Data::Dsv(_) => HEAP,
         Data::GraphicsPipeline(_) => PIPELINE,
     };
-    if unsafe { *iid != expected && *iid != UNKNOWN && !(expected == LIST && *iid == GRAPHICS_LIST) } {
+    if unsafe { !supports(&entry.data, expected, &*iid) } {
         return E_NOINTERFACE;
     }
     entry.refs = entry.refs.checked_add(1).unwrap_or_else(|| trap("reference overflow"));
@@ -254,6 +272,8 @@ static DEVICE_TABLE: Table<160> = {
     t[22] = create_sampler as *const ();
     t[86] = create_graphics_pipeline as *const ();
     t[19] = create_uav as *const ();
+    t[48] = create_queue_x as *const ();
+    t[73] = create_list_x as *const ();
     t[27] = create_resource as *const ();
     Table(t)
 };
@@ -303,13 +323,22 @@ static QUEUE_TABLE: Table<160> = {
     let mut t = base();
     t[10] = execute as *const ();
     t[30] = present as *const ();
+    t[33] = execute_x as *const ();
+    Table(t)
+};
+static NEWER_QUEUE_TABLE: Table<160> = {
+    let mut t = base();
+    t[10] = execute as *const ();
+    t[32] = present as *const ();
+    t[35] = execute_x as *const ();
     Table(t)
 };
 
 pub(super) fn create(iid: &Iid, out: *mut This) -> HRESULT {
     unsafe { *out = std::ptr::null(); }
     match config() {
-        Ok(c) if *iid == crate::device::IID => {
+        Ok(mut c) if *iid == crate::device::IID || *iid == DEVICE11 => {
+            c.newer = *iid == DEVICE11;
             new(Data::Device(Arc::new(c)), &DEVICE_TABLE, iid, crate::device::IID, out)
         }
         Ok(_) => E_NOINTERFACE,
@@ -514,7 +543,8 @@ extern "system" fn create_list(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    if device(this).is_none() || nodes != 0 || (kind != 0 && kind != 2) || !matches!(data(alloc), Some(Data::Allocator(k)) if k == kind) {
+    let Some(c) = device(this) else { return E_INVALIDARG; };
+    if nodes != 0 || (kind != 0 && kind != 2) || !matches!(data(alloc), Some(Data::Allocator(k)) if k == kind) {
         return E_INVALIDARG;
     }
     let mut state = ListState { kind, ..Default::default() };
@@ -525,7 +555,7 @@ extern "system" fn create_list(
             _ => return E_INVALIDARG,
         }
     }
-    new(Data::List(Arc::new(Mutex::new(state))), &LIST_TABLE, iid, LIST, out,
+    new(Data::List(Arc::new(Mutex::new(state)), c.newer), &LIST_TABLE, iid, LIST, out,
     )
 }
 #[repr(C)]
@@ -542,10 +572,48 @@ extern "system" fn create_queue(this: This, d: *const QueueDesc, iid: *const Iid
     if (d.kind != 0 && d.kind != 2) || d.priority != 0 || d.flags != 0 || d.nodes != 0 {
         return E_INVALIDARG;
     }
-    new(Data::Queue(c, d.kind), &QUEUE_TABLE, iid, QUEUE, out)
+    let table = if c.newer { &NEWER_QUEUE_TABLE } else { &QUEUE_TABLE };
+    new(Data::Queue(c, d.kind), table, iid, QUEUE, out)
+}
+
+#[repr(C)]
+struct QueueDescX {
+    kind: u32,
+    flags: u32,
+    engine_or_pipe: u32,
+    queue: u32,
+}
+extern "system" fn create_queue_x(this: This, d: *const QueueDescX, iid: *const Iid, out: *mut This) -> HRESULT {
+    if !out.is_null() { unsafe { *out = std::ptr::null(); } }
+    let (Some(c), Some(d)) = (device(this), unsafe { d.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if d.flags != 0 || !matches!((d.kind, d.engine_or_pipe, d.queue), (0, 0, 0) | (2, 1, 0)) {
+        return E_INVALIDARG;
+    }
+    let table = if c.newer { &NEWER_QUEUE_TABLE } else { &QUEUE_TABLE };
+    new(Data::Queue(c, d.kind), table, iid, QUEUE, out)
+}
+
+#[repr(C)]
+struct ListDescX {
+    kind: u32,
+    flags: u32,
+    nodes: u32,
+    barrier_batch: u32,
+}
+extern "system" fn create_list_x(
+    this: This, d: *const ListDescX, alloc: This, pso: This, iid: *const Iid, out: *mut This,
+) -> HRESULT {
+    if !out.is_null() { unsafe { *out = std::ptr::null(); } }
+    let Some(d) = (unsafe { d.as_ref() }) else { return E_INVALIDARG; };
+    if d.flags != 0 || d.nodes != 0 || d.barrier_batch != 0 {
+        return E_INVALIDARG;
+    }
+    create_list(this, d.nodes, d.kind, alloc, pso, iid, out)
 }
 fn list(this: This) -> Arc<Mutex<ListState>> {
-    if let Some(Data::List(l)) = data(this) {
+    if let Some(Data::List(l, _)) = data(this) {
         l
     } else {
         trap("invalid list")
@@ -750,6 +818,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if kind == 0 && !graphics_jobs.is_empty() {
         if let Err(e) = run_graphics(&c, &graphics_jobs) { trap(&e); }
     }
+}
+
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, flags: u32) {
+    if flags != 0 { trap("unsupported command submission flags"); }
+    // Frame tokens are pacing metadata; submissions here complete in order.
+    execute(this, count, lists);
 }
 
 extern "system" fn present(this: This, planes: u32, plane: *const crate::queue::Plane, parameters: *const u8) -> HRESULT {

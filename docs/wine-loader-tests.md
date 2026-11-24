@@ -497,6 +497,41 @@ Linker-assigned export ordinals are not a supported console ordinal mapping;
 use named imports only. Wine may resolve an ordinal by coincidence, so ordinal
 imports must not be relied upon.
 
+The manual VIctory loader first looks up an HLE export by DLL and name, or
+`#n` for an ordinal, then consults its host allowlist, and reports an unresolved
+import if neither resolves it. For example, its GameInput registry maps
+ordinal 1 to `GameInputCreate`. Normal Wine instead resolves the PE import
+table through the DLLs actually supplied to Wine; it does not invoke this
+manual resolver or inherit its API-set overrides. VIctory does not currently
+supply a Wine GameInput DLL implementing that ordinal. No guessed console
+ordinal mappings are provided by the D3D12.X DLL.
+
+When the Wine Metal proxy is enabled, `D3D12XboxCreateDevice` supports the base
+device IID and the newer Device11 IID documented in the upstream device
+implementation. The newer device creates the corresponding queue layout:
+`CreateCommandQueueX` at `0x180`, `CreateCommandListX` at `0x248`,
+`PresentX` at `0x100`, and `ExecuteCommandListsX` at `0x118`. Supported X
+queue descriptions are direct engine 0 or compute pipe 1, queue 0, with zero
+flags; list flags, node mask and barrier-batch size must be zero. Submission
+flags must be zero; the frame token is accepted as pacing metadata but does
+not pace execution. The supported newer list IIDs retain the same COM identity
+as the base list; unimplemented methods still trap. Resource creation and
+presentation remain limited to the proxy subsets described above; placed or
+aliased resources and advanced queue semantics are not added by these IIDs.
+This is not complete Device11, console queue, or title compatibility.
+
+With the presentation-enabled Metal helper running and the DLL environment
+below configured, the following test launches its compiled TLS-bearing PE
+directly under Wine. It checks the actual loaded DLL path, Device11 and
+console List6 identity, descriptor rejection, a translated graphics draw,
+pixel readback and token-bearing submit/present. A separate guest verifies
+that unsupported submission flags terminate rather than being ignored:
+
+```sh
+CARGO_TARGET_DIR=/tmp/victory-newer-host-target cargo test -p victory \
+  --target x86_64-apple-darwin --test wine_newer_graphics -- --ignored --nocapture
+```
+
 For an explicitly supplied, trusted PE and isolated Wine prefix, build and
 select the DLL as follows. LLVM-MinGW, Rust's Windows GNU-LLVM target, Wine,
 and the runner setup at the start of this document are required:
