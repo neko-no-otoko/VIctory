@@ -134,14 +134,17 @@ other depth formats, and DEPTH_READ are rejected. Depth-only clears accept
 finite values in [0, 1], including clipped rectangles. The synthetic depth
 fixture checks all comparisons, write masking, overlapping indexed and
 nonindexed draws, clears, retained resources, and color and mapped-depth values.
-For RGBA8_UNORM and BGRA8_UNORM, pipeline blend state supports disabled blending or ADD with
-SRC_ALPHA and INV_SRC_ALPHA for RGB, and ONE or SRC_ALPHA with INV_SRC_ALPHA
-for alpha. Each RGBA write-mask bit is supported, including a zero mask.
-Alpha-to-coverage, independent blending, logic operations, other factors and
-other blend operations are rejected. When blending is disabled, inactive
-factors are ignored; with independent blending disabled, RT1–RT7 are ignored.
-The synthetic blend fixture verifies translucent draw ordering, alpha and
-channel masks, retained pipeline state, and unsupported-state rejection.
+For RGBA8_UNORM and BGRA8_UNORM, single-target blend state supports
+independent RGB and alpha ADD, SUBTRACT, REV_SUBTRACT, MIN and MAX. RGB
+factors include zero, one, source/destination color or alpha and inverses,
+and source-alpha-saturate in the source position. Alpha accepts zero, one,
+source/destination alpha and inverses. MIN/MAX compare unweighted values.
+RGBA write masks are supported, including zero. Alpha-to-coverage, independent
+blending, logic operations, dual-source factors and dynamic blend constants
+are rejected. Disabled blending ignores factors and operations; RT1–RT7 are
+ignored when independent blending is disabled.
+The existing synthetic blend fixture covers translucent draw ordering, alpha
+and channel masks, retained pipeline state, and unsupported-state rejection.
 Translated vertex and pixel stages can also share one matched 32-bit
 `TEXCOORD0.xy` varying with perspective-center interpolation, from vertex
 output register 1 to pixel input register 0. Input layouts support either one

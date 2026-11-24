@@ -207,17 +207,55 @@ static id<MTLLibrary> loadLibrary(id<MTLDevice> device, const uint8_t *bytes,
                                                 dispatch_get_main_queue(), ^{ (void)owned; });
     return [device newLibraryWithData:data error:error];
 }
+static MTLBlendFactor blendFactor(uint32_t factor) {
+    switch (factor) {
+        case 1: return MTLBlendFactorZero;
+        case 2: return MTLBlendFactorOne;
+        case 3: return MTLBlendFactorSourceColor;
+        case 4: return MTLBlendFactorOneMinusSourceColor;
+        case 5: return MTLBlendFactorSourceAlpha;
+        case 6: return MTLBlendFactorOneMinusSourceAlpha;
+        case 7: return MTLBlendFactorDestinationAlpha;
+        case 8: return MTLBlendFactorOneMinusDestinationAlpha;
+        case 9: return MTLBlendFactorDestinationColor;
+        case 10: return MTLBlendFactorOneMinusDestinationColor;
+        case 11: return MTLBlendFactorSourceAlphaSaturated;
+        default: return (MTLBlendFactor)NSUIntegerMax;
+    }
+}
+
+static MTLBlendOperation blendOperation(uint32_t op) {
+    switch (op) {
+        case 1: return MTLBlendOperationAdd;
+        case 2: return MTLBlendOperationSubtract;
+        case 3: return MTLBlendOperationReverseSubtract;
+        case 4: return MTLBlendOperationMin;
+        case 5: return MTLBlendOperationMax;
+        default: return (MTLBlendOperation)NSUIntegerMax;
+    }
+}
+
+static bool alphaBlendFactor(uint32_t factor) {
+    return factor == 1 || factor == 2 || (factor >= 5 && factor <= 8);
+}
+
 
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
-                           bool blend_enabled, uint8_t write_mask, bool alpha_source, bool additive,
+                           bool blend_enabled, uint8_t write_mask, const uint32_t *blend_factors,
                            bool vertex_uv, uint32_t format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
         if (write_mask & ~0x0f) FAIL(@"invalid color write mask");
+        if (!blend_factors || blendFactor(blend_factors[0]) == (MTLBlendFactor)NSUIntegerMax
+            || blend_factors[1] > 10 || blendFactor(blend_factors[1]) == (MTLBlendFactor)NSUIntegerMax
+            || !alphaBlendFactor(blend_factors[3]) || !alphaBlendFactor(blend_factors[4])
+            || blendOperation(blend_factors[2]) == (MTLBlendOperation)NSUIntegerMax
+            || blendOperation(blend_factors[5]) == (MTLBlendOperation)NSUIntegerMax)
+            FAIL(@"unsupported blend state");
         VictoryMetalRenderer *r = [VictoryMetalRenderer new];
         r.device = MTLCreateSystemDefaultDevice();
         if (!r.device) FAIL(@"no Metal device");
@@ -256,12 +294,14 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                         | ((write_mask & 4) ? MTLColorWriteMaskBlue : 0)
                         | ((write_mask & 8) ? MTLColorWriteMaskAlpha : 0);
         color.blendingEnabled = blend_enabled;
-        color.rgbBlendOperation = MTLBlendOperationAdd;
-        color.alphaBlendOperation = MTLBlendOperationAdd;
-        color.sourceRGBBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
-        color.destinationRGBBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
-        color.sourceAlphaBlendFactor = alpha_source ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
-        color.destinationAlphaBlendFactor = additive ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
+        color.rgbBlendOperation = blendOperation(blend_factors[2]);
+        color.alphaBlendOperation = blendOperation(blend_factors[5]);
+        // D3D MIN/MAX compare the unweighted inputs.
+        bool rgb_minmax = blend_factors[2] >= 4, alpha_minmax = blend_factors[5] >= 4;
+        color.sourceRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[0]);
+        color.destinationRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[1]);
+        color.sourceAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[3]);
+        color.destinationAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[4]);
         if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");

@@ -1365,7 +1365,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let mut input_count = 0;
     let mut depth = None;
     let mut depth_format = 0;
-    let mut blend = Blend { enabled: false, write_mask: 15, alpha_source: false, additive: false };
+    let mut blend = Blend::new(false, 15, [0; 6]).unwrap();
     while at < b.len() {
         if b.len() - at < 8 { return E_INVALIDARG; }
         let kind = u32::from_ne_bytes(b[at..at+4].try_into().unwrap());
@@ -1380,12 +1380,12 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
             8 => {
                 let enabled = word(12);
                 let mask = b[at+48];
-                let additive = word(20) == 2 && word(24) == 2 && word(28) == 1
-                    && word(32) == 2 && word(36) == 2 && word(40) == 1;
-                if word(4) != 0 || word(8) != 0 || enabled > 1 || word(16) != 0 || mask > 15
-                    || (enabled == 1 && !additive && (word(20) != 5 || word(24) != 6 || word(28) != 1
-                        || !matches!(word(32), 2 | 5) || word(36) != 6 || word(40) != 1)) { return E_INVALIDARG; }
-                blend = Blend { enabled: enabled == 1, write_mask: mask, alpha_source: enabled == 1 && word(32) == 5, additive: enabled == 1 && additive };
+                if word(4) != 0 || word(8) != 0 || enabled > 1 || word(16) != 0 || mask > 15 {
+                    return E_INVALIDARG;
+                }
+                let factors = [word(20),word(24),word(28),word(32),word(36),word(40)];
+                let Some(state) = Blend::new(enabled == 1, mask, factors) else { return E_INVALIDARG; };
+                blend = state;
             }
             9 => if word(4) != u32::MAX { return E_INVALIDARG; },
             12 => { ep = stream_ptr(b,at+8); input_count = word(16); if !matches!(input_count, 1 | 2) { return E_INVALIDARG; } }

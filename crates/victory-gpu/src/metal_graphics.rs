@@ -153,7 +153,7 @@ impl WineMetalGraphics {
         }
         let prepared = Prepared::new(vertex, pixel, GraphicsState {
             depth: None,
-            blend: victory_metal::BlendState { enabled: false, write_mask: 15, alpha_source: false, additive: false },
+            blend: victory_metal::BlendState { enabled: false, write_mask: 15, factors: [2,1,1,2,1,1] },
             input_uv: false,
             color_format: victory_metal::ColorFormat::Rgba8,
         })?;
@@ -643,17 +643,10 @@ impl StreamState {
             8 => {
                 let (enabled, logic, mask) = (get(12), get(16), data[48]);
                 let basic = get(4) == 0 && get(8) == 0 && enabled <= 1 && logic == 0 && mask <= 15;
-                let additive = get(20) == 2 && get(24) == 2 && get(28) == 1
-                    && get(32) == 2 && get(36) == 2 && get(40) == 1;
-                let factors = enabled == 0 || additive || (
-                    get(20) == 5 && get(24) == 6 && get(28) == 1
-                    && matches!(get(32), 2 | 5) && get(36) == 6 && get(40) == 1
-                );
-                if basic && factors {
+                let factors = [get(20),get(24),get(28),get(32),get(36),get(40)];
+                if let Some(blend) = basic.then(|| crate::wine_transport::Blend::new(enabled == 1, mask, factors)).flatten() {
                     self.blend = Some(victory_metal::BlendState {
-                        enabled: enabled == 1, write_mask: mask,
-                        alpha_source: enabled == 1 && get(32) == 5,
-                        additive: enabled == 1 && additive,
+                        enabled: blend.enabled, write_mask: blend.write_mask, factors: blend.factors,
                     });
                     true
                 } else {
@@ -729,7 +722,7 @@ impl StreamState {
             input_uv: self.input_uv,
             color_format: self.color_format.ok_or("missing color format")?,
             blend: self.blend.unwrap_or(victory_metal::BlendState {
-                enabled: false, write_mask: 15, alpha_source: false, additive: false,
+                enabled: false, write_mask: 15, factors: [2,1,1,2,1,1],
             }),
         })
     }

@@ -43,7 +43,7 @@ static DWORD WINAPI tls_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    int invalid=0, additive=0;
+    int invalid=0, additive=0, blend_case=0;
     if (argc==2) {
         if (!strcmp(argv[1],"--invalid-srv-first")) invalid=1;
         else if (!strcmp(argv[1],"--invalid-srv-count")) invalid=2;
@@ -55,6 +55,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1],"--invalid-mip-count")) invalid=8;
         else if (!strcmp(argv[1],"--additive")) additive=1;
         else if (!strcmp(argv[1],"--invalid-blend")) { additive=1; invalid=9; }
+        else if (!strcmp(argv[1],"--blend-factors")) blend_case=1;
+        else if (!strcmp(argv[1],"--blend-subtract")) blend_case=2;
+        else if (!strcmp(argv[1],"--blend-minmax")) blend_case=3;
+        else if (!strcmp(argv[1],"--blend-disabled-mask")) blend_case=4;
+        else if (!strcmp(argv[1],"--blend-maxmin")) blend_case=5;
+        else if (!strcmp(argv[1],"--blend-reverse")) blend_case=6;
+        else if (!strcmp(argv[1],"--blend-enabled-mask")) blend_case=7;
+        else if (!strcmp(argv[1],"--blend-saturate")) blend_case=8;
+        else if (!strcmp(argv[1],"--invalid-blend-alpha")) { additive=1; invalid=10; }
+        else if (!strcmp(argv[1],"--invalid-blend-constant")) { additive=1; invalid=11; }
+        else if (!strcmp(argv[1],"--invalid-blend-logic")) { additive=1; invalid=12; }
+        else if (!strcmp(argv[1],"--invalid-blend-operation")) { additive=1; invalid=13; }
         else return 90;
     } else if (argc!=1) return 90;
     if (tls_value!=17) return 91;
@@ -92,7 +104,7 @@ int main(int argc, char **argv) {
     memcpy(v,tri,sizeof(tri)); memset(p,0x77,4096); memset(t,0xa5,4096);
     const unsigned widths[3]={7,3,1}, heights[3]={5,2,1};
     const unsigned offsets[3]={512,2048,3072}, pitches[3]={256,512,256};
-    const unsigned char colors[3][4]={{231,37,81,255},{19,197,63,255},{47,89,219,255}};
+    const unsigned char colors[3][4]={{231,37,81,100},{19,197,63,150},{47,89,219,200}};
     for (unsigned m=0;m<3;m++) for (unsigned y=0;y<heights[m];y++) for (unsigned x=0;x<widths[m];x++)
         memcpy((unsigned char *)t+offsets[m]+y*pitches[m]+4*x,colors[m],4);
     void *heaps[5]={0}; U64 cpu[5],gpu[5];
@@ -125,16 +137,26 @@ int main(int argc, char **argv) {
     *(unsigned *)(stream.b+48)=10; *(unsigned *)(stream.b+52)=3; *(unsigned *)(stream.b+56)=1; *(unsigned *)(stream.b+76)=1;
     *(unsigned *)(stream.b+96)=11; *(unsigned *)(stream.b+152)=12; *(void **)(stream.b+160)=elements; *(unsigned *)(stream.b+168)=2;
     *(unsigned *)(stream.b+176)=14; *(unsigned *)(stream.b+180)=3; *(unsigned *)(stream.b+184)=15; *(unsigned *)(stream.b+188)=28; *(unsigned *)(stream.b+220)=1;
-    if (additive) {
+    if (additive || blend_case) {
+        static const unsigned states[8][6]={
+            {3,10,1,5,8,1}, {2,2,2,2,2,3}, {1,1,4,1,1,5},
+            {0,0,0,0,0,0}, {1,1,5,1,1,4}, {2,2,3,2,2,2},
+            {2,1,1,2,1,1}, {11,1,1,2,1,1}
+        };
+        const unsigned *state=blend_case ? states[blend_case-1] : (const unsigned[]){2,2,1,2,2,1};
         *(unsigned *)(stream.b+224)=8;
-        *(unsigned *)(stream.b+236)=1;
-        *(unsigned *)(stream.b+244)=2; *(unsigned *)(stream.b+248)=invalid==9?3:2; *(unsigned *)(stream.b+252)=1;
-        *(unsigned *)(stream.b+256)=2; *(unsigned *)(stream.b+260)=2; *(unsigned *)(stream.b+264)=1;
-        stream.b[272]=15;
+        *(unsigned *)(stream.b+236)=blend_case!=4;
+        for (unsigned i=0;i<6;i++) *(unsigned *)(stream.b+244+4*i)=state[i];
+        if (invalid==9) *(unsigned *)(stream.b+248)=16; /* dual source */
+        if (invalid==10) *(unsigned *)(stream.b+256)=3; /* color factor for alpha */
+        if (invalid==11) *(unsigned *)(stream.b+244)=14; /* dynamic blend constant */
+        if (invalid==12) *(unsigned *)(stream.b+240)=1; /* logic operation */
+        if (invalid==13) *(unsigned *)(stream.b+252)=6;
+        stream.b[272]=blend_case==4?5:blend_case==7?10:15;
     }
-    StreamDesc sd={additive?sizeof(stream.b):224,stream.b};
+    StreamDesc sd={(additive||blend_case)?sizeof(stream.b):224,stream.b};
     hr=SLOT(dev,0x2b0,CreateObject)(dev,&sd,&IID_ID3D12PipelineState,&pipeline);
-    if (invalid==9) {
+    if (invalid>=9) {
         say("D3D12X invalid blend case armed\r\n");
         if (FAILED(hr) && !pipeline) { say("D3D12X invalid blend case rejected\r\n"); return 43; }
         return 95;
@@ -162,8 +184,8 @@ int main(int argc, char **argv) {
     float viewport[6]={0,0,8,8,0,1};
     SLOT(list,0xa0,Topology)(list,4); SLOT(list,0xa8,SetArray)(list,1,viewport);
     SLOT(list,0x180,Vertices)(list,0,1,&view); SLOT(list,0x190,Targets)(list,1,&cpu[0],0,0);
-    if (additive) {
-        const float clear[4]={0.125f,0.125f,0.125f,0.125f};
+    if (additive || blend_case) {
+        const float clear[4]={0.125f,blend_case?0.25f:0.125f,blend_case?0.5f:0.125f,blend_case?0.75f:0.125f};
         SLOT(list,0x1a0,Clear)(list,cpu[0],clear,0,0);
     }
     for (unsigned m=0;m<3;m++) {
@@ -200,13 +222,27 @@ int main(int argc, char **argv) {
     ID3D12CommandList *lists[]={(ID3D12CommandList *)list}; ID3D12CommandQueue_ExecuteCommandLists(queue,1,lists);
     volatile unsigned char *pixels=p;
     for (unsigned m=0;m<3;m++) for (unsigned c=0;c<4;c++) {
-        int want=additive ? 32+2*colors[m][c] : colors[m][c];
+        int s=colors[m][c], d=(int[]){32,64,128,191}[c];
+        int want=s;
+        if (additive) want=32+2*s;
+        else if (blend_case==1) want=(s*s+d*(255-d)+127)/255;
+        else if (blend_case==2) want=c==3?d-s:s-d;
+        else if (blend_case==3) want=c==3?(s>d?s:d):(s<d?s:d);
+        else if (blend_case==4) want=(c==0 || c==2)?s:d;
+        else if (blend_case==5) want=c==3?(s<d?s:d):(s>d?s:d);
+        else if (blend_case==6) want=c==3?s-d:d-s;
+        else if (blend_case==7) want=(c==1 || c==3)?s:d;
+        else if (blend_case==8) {
+            int sat=colors[m][3] < 255-191 ? colors[m][3] : 255-191;
+            want=c==3?s:(s*sat+127)/255;
+        }
         if (want>255) want=255;
+        if (want<0) want=0;
         int delta=(int)pixels[3*256+(m*2+1)*4+c]-want;
         if (delta < -2 || delta > 2) return 20+m;
     }
-    if (additive) for (unsigned c=0;c<4;c++) {
-        int delta=(int)pixels[3*256+7*4+c]-32;
+    if (additive || blend_case) for (unsigned c=0;c<4;c++) {
+        int delta=(int)pixels[3*256+7*4+c]-(blend_case?(int[]){32,64,128,191}[c]:32);
         if (delta < -1 || delta > 1) return 27;
     }
     for (unsigned y=0;y<2;y++) {
@@ -216,5 +252,5 @@ int main(int argc, char **argv) {
     }
     for (unsigned y=0;y<8;y++) for (unsigned x=32;x<256;x++) if (pixels[y*256+x]!=0x77) return 24;
     SLOT(queue,0x10,Release)(queue); SLOT(list,0x10,Release)(list); SLOT(allocator,0x10,Release)(allocator); SLOT(dev,0x10,Release)(dev);
-    say(additive ? "D3D12X additive blending passed\r\n" : "D3D12X mip sampling passed\r\n"); return 42;
+    say(additive ? "D3D12X additive blending passed\r\n" : blend_case ? "D3D12X blend mapping passed\r\n" : "D3D12X mip sampling passed\r\n"); return 42;
 }

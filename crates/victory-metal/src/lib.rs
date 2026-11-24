@@ -104,8 +104,7 @@ unsafe extern "C" {
         depth_write: bool,
         blend_enabled: bool,
         write_mask: u8,
-        alpha_source: bool,
-        additive: bool,
+        blend_factors: *const u32,
         vertex_uv: bool,
         format: u32,
         error: *mut c_char,
@@ -281,13 +280,13 @@ pub struct DepthState {
     pub compare: u32,
 }
 
-/// Restricted source-alpha or additive blending and D3D RGBA channel write mask.
+/// D3D12 blend factors and operations in RGB source, destination, operation,
+/// alpha source, destination, operation order, plus the RGBA write mask.
 #[derive(Clone, Copy, Debug)]
 pub struct BlendState {
     pub enabled: bool,
     pub write_mask: u8,
-    pub alpha_source: bool,
-    pub additive: bool,
+    pub factors: [u32; 6],
 }
 
 
@@ -341,7 +340,7 @@ impl Renderer {
     ) -> Result<Self, RenderError> {
         Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                              width, height, fragment_constant_dwords, fragment_texture, None,
-                             BlendState { enabled: false, write_mask: 15, alpha_source: false, additive: false })
+                             BlendState { enabled: false, write_mask: 15, factors: [2,1,1,2,1,1] })
     }
 
     pub fn new_depth(
@@ -351,7 +350,7 @@ impl Renderer {
     ) -> Result<Self, RenderError> {
         Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                              width, height, fragment_constant_dwords, fragment_texture, Some(state),
-                             BlendState { enabled: false, write_mask: 15, alpha_source: false, additive: false })
+                             BlendState { enabled: false, write_mask: 15, factors: [2,1,1,2,1,1] })
     }
 
     pub fn new_configured(
@@ -446,8 +445,7 @@ impl Renderer {
                 depth.is_some_and(|s| s.write),
                 blend.enabled,
                 blend.write_mask,
-                blend.alpha_source,
-                blend.additive,
+                blend.factors.as_ptr(),
                 vertex_uv,
                 format.native_value(),
                 error.as_mut_ptr(),

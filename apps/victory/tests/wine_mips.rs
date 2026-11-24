@@ -186,12 +186,25 @@ fn launcher_runs_real_mip_sampling_and_rejects_invalid_cases() {
     assert!(out.stdout.contains("D3D12X additive blending passed"), "{}\n{}", out.stdout, out.stderr);
     f.assert_host_gone();
 
-    let mut invalid_blend = f.command(&exe, &host);
-    invalid_blend.arg("--").arg("--invalid-blend");
-    let out = run(&mut invalid_blend, f.temp.path());
-    assert_eq!(out.status.code(), Some(43), "{}\n{}", out.stdout, out.stderr);
-    assert!(out.stdout.contains("D3D12X invalid blend case rejected"), "{}\n{}", out.stdout, out.stderr);
-    f.assert_host_gone();
+    for variant in ["--blend-factors", "--blend-subtract", "--blend-minmax",
+                    "--blend-disabled-mask", "--blend-maxmin", "--blend-reverse",
+                    "--blend-enabled-mask", "--blend-saturate"] {
+        let mut cmd = f.command(&exe, &host);
+        cmd.arg("--").arg(variant);
+        let out = run(&mut cmd, f.temp.path());
+        assert_eq!(out.status.code(), Some(42), "{variant}: {}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("D3D12X blend mapping passed"), "{variant}: {}\n{}", out.stdout, out.stderr);
+        f.assert_host_gone();
+    }
+    for variant in ["--invalid-blend", "--invalid-blend-alpha", "--invalid-blend-constant",
+                    "--invalid-blend-logic", "--invalid-blend-operation"] {
+        let mut cmd = f.command(&exe, &host);
+        cmd.arg("--").arg(variant);
+        let out = run(&mut cmd, f.temp.path());
+        assert_eq!(out.status.code(), Some(43), "{variant}: {}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("D3D12X invalid blend case rejected"), "{variant}: {}\n{}", out.stdout, out.stderr);
+        f.assert_host_gone();
+    }
 
     for variant in ["--invalid-srv-first", "--invalid-srv-count", "--invalid-subresource", "--invalid-format", "--invalid-pitch", "--invalid-offset", "--invalid-layout", "--invalid-mip-count"] {
         let mut cmd = f.command(&exe, &host);
