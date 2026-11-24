@@ -28,6 +28,18 @@ impl Stage {
 type Pointer = *mut c_void;
 type Destroy = unsafe extern "C" fn(Pointer);
 
+// IRShaderReflectionResourceLocation from metal_irconverter.h.
+#[repr(C)]
+#[derive(Default)]
+struct ResourceLocation {
+    kind: u32,
+    space: u32,
+    slot: u32,
+    offset: u32,
+    size: u64,
+    name: *const c_char,
+}
+
 struct Handle {
     ptr: Pointer,
     destroy: Destroy,
@@ -55,6 +67,30 @@ impl Drop for Handle {
 /// Loading the supplied dynamic library executes its initializers; callers must
 /// supply a trusted Apple Metal Shader Converter library.
 pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
+    convert_impl(library, dxil, stage, None)
+}
+
+/// Convert a fragment shader after verifying its automatic resource layout.
+///
+/// When `expected_b0` is true, the only supported resource is the converter's
+/// space 0, slot 0 constant buffer at offset 0 with a 24-byte location.
+/// Otherwise, the shader must have no fragment resources.
+///
+/// As with [`convert`], `library` must be a trusted converter library.
+pub fn convert_fragment_with_b0(
+    library: &Path,
+    dxil: &[u8],
+    expected_b0: bool,
+) -> Result<Vec<u8>, String> {
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0))
+}
+
+fn convert_impl(
+    library: &Path,
+    dxil: &[u8],
+    stage: Stage,
+    expected_b0: Option<bool>,
+) -> Result<Vec<u8>, String> {
     // SAFETY: the caller supplies the path to a trusted converter library.
     let lib = unsafe { libloading::Library::new(library) }
         .map_err(|error| format!("loading converter {}: {error}", library.display()))?;
@@ -122,6 +158,58 @@ pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, Str
         let result = result.ok_or_else(|| {
             "Metal Shader Converter could not create converted object".to_string()
         })?;
+        if let Some(expected_b0) = expected_b0 {
+            let reflection_create = api!(
+                "IRShaderReflectionCreate",
+                unsafe extern "C" fn() -> Pointer
+            );
+            let reflection_destroy = api!("IRShaderReflectionDestroy", Destroy);
+            let reflect = api!(
+                "IRObjectGetReflection",
+                unsafe extern "C" fn(Pointer, c_int, Pointer) -> bool
+            );
+            let resource_count = api!(
+                "IRShaderReflectionGetResourceCount",
+                unsafe extern "C" fn(Pointer) -> usize
+            );
+            let resource_locations = api!(
+                "IRShaderReflectionGetResourceLocations",
+                unsafe extern "C" fn(Pointer, *mut ResourceLocation)
+            );
+            let reflection =
+                Handle::new(reflection_create(), reflection_destroy, "shader reflection")?;
+            if !reflect(result.ptr, Stage::Fragment.raw(), reflection.ptr) {
+                return Err("converter could not reflect fragment shader".into());
+            }
+            let count = resource_count(reflection.ptr);
+            if count != usize::from(expected_b0) {
+                return Err(format!(
+                    "unsupported fragment resource layout: expected {} resources, found {count}",
+                    usize::from(expected_b0)
+                ));
+            }
+            if expected_b0 {
+                let mut location = ResourceLocation::default();
+                resource_locations(reflection.ptr, &mut location);
+                if (
+                    location.kind,
+                    location.space,
+                    location.slot,
+                    location.offset,
+                    location.size,
+                ) != (2, 0, 0, 0, 24)
+                {
+                    return Err(format!(
+                        "unsupported fragment resource layout: kind {}, space {}, slot {}, offset {}, size {}",
+                        location.kind,
+                        location.space,
+                        location.slot,
+                        location.offset,
+                        location.size
+                    ));
+                }
+            }
+        }
         let binary = Handle::new(binary_create(), binary_destroy, "Metal library")?;
         if !get_binary(result.ptr, stage.raw(), binary.ptr) {
             return Err("converter produced no Metal library for the requested stage".into());

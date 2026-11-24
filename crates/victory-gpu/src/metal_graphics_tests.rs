@@ -109,8 +109,7 @@ fn shader(vertex: bool) -> Vec<u8> {
         &[0xf800_18cf, 0x0706_0504, 0xbf81_0000]
     } else {
         &[
-            0x7e00_02ff,
-            0x3f80_0000,
+            0x7e00_0202, // v_mov_b32 v0, s2
             0x7e02_0280,
             0x7e04_0280,
             0x7e06_02ff,
@@ -147,8 +146,23 @@ fn shader(vertex: bool) -> Vec<u8> {
             u32_at(&mut payload, stage + 0x14c + mrt * 404, u32::MAX);
         }
     }
+    if !vertex {
+        // One root-constants parameter at slot 3, with s2 holding dword 2.
+        u64_at(
+            &mut payload,
+            record + 0x28,
+            (code_at + words.len() * 4) as u64,
+        );
+        u32_at(&mut payload, record + 0x38, 1);
+    }
     for word in words {
         payload.extend_from_slice(&word.to_le_bytes());
+    }
+    if !vertex {
+        let root = payload.len();
+        payload.resize(root + 20, 0);
+        u32_at(&mut payload, root + 8, 3); // three SGPRs
+        payload[root + 17] = 3; // root parameter slot
     }
     let mut fssm = b"FSSM".to_vec();
     fssm.extend_from_slice(&0x101u32.to_le_bytes());
@@ -268,7 +282,7 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         layout: 1,
         flags: 0,
     };
-    let vb = make(&buffer(48), 0);
+    let vb = make(&buffer(96), 0);
     let readback = make(&buffer(1024), 0);
     let texture = make(
         &ResourceDesc {
@@ -298,16 +312,19 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         ptr
     };
     let vertices = [
-        [-0.8f32, -0.8, 0.0, 1.0],
-        [0.8, -0.8, 0.0, 1.0],
-        [0.0, 0.8, 0.0, 1.0],
+        [-1.0f32, -1.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0, 1.0],
+        [-0.5, 1.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [0.5, 1.0, 0.0, 1.0],
     ];
     let vertex_data = map(vb);
     let output = map(readback);
     let target = map(texture);
     // The mapped target is initialized before recording, and readback is a sentinel.
     unsafe {
-        std::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), vertex_data, 48);
+        std::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), vertex_data, 96);
         std::ptr::write_bytes(output, 0x77, 1024);
         for y in 0..4 {
             std::ptr::write_bytes(target.add(y * 256), 0x30 + y as u8, 20);
@@ -344,6 +361,16 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
 
     let vs = shader(true);
     let ps = shader(false);
+    let host = victory_shader::emit::translate(&ps).unwrap();
+    let library = std::env::var_os("VICTORY_METAL_CONVERTER").unwrap();
+    assert!(
+        victory_metal::converter::convert_fragment_with_b0(
+            std::path::Path::new(&library),
+            &host.dxil,
+            false
+        )
+        .is_err()
+    );
     let element = InputElement {
         name: b"POSITION\0".as_ptr(),
         semantic_index: 0,
@@ -428,27 +455,61 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         )(dev, 0, 0, allocator, pipeline, &list_iid, &mut list),
         S_OK
     );
-    slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4);
-    slot::<extern "system" fn(This, u32, *const f32)>(list, 0xa8)(
-        list,
-        1,
-        [0.0, 0.0, 5.0, 4.0, 0.0, 1.0].as_ptr(),
-    );
-    slot::<extern "system" fn(This, u32, *const i32)>(list, 0xb0)(list, 1, [0, 0, 5, 4].as_ptr());
     let view = VertexView {
         address: vertex_address,
-        size: 48,
+        size: 96,
         stride: 16,
     };
-    slot::<extern "system" fn(This, u32, u32, *const VertexView)>(list, 0x180)(list, 0, 1, &view);
-    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
-        list,
-        1,
-        &handle,
-        0,
-        std::ptr::null(),
-    );
+    let bind = || {
+        slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4);
+        slot::<extern "system" fn(This, u32, *const f32)>(list, 0xa8)(
+            list,
+            1,
+            [0.0, 0.0, 5.0, 4.0, 0.0, 1.0].as_ptr(),
+        );
+        slot::<extern "system" fn(This, u32, *const i32)>(list, 0xb0)(
+            list,
+            1,
+            [0, 0, 5, 4].as_ptr(),
+        );
+        slot::<extern "system" fn(This, u32, u32, *const VertexView)>(list, 0x180)(
+            list, 0, 1, &view,
+        );
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+            list,
+            1,
+            &handle,
+            0,
+            null.cast(),
+        );
+    };
+    let draw = slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
+    let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+    let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+    bind();
+    draw(list, 3, 1, 0, 0); // Missing required root dword.
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    bind();
+    slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x130)(list, 2, 1, 0);
+    draw(list, 3, 1, 0, 0); // Unsupported root slot.
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    bind();
+    let set_constants = slot::<extern "system" fn(This, u32, u32, *const c_void, u32)>(list, 0x140);
+    let mut red = 0.25f32;
+    set_constants(list, 3, 1, (&raw const red).cast(), 2);
     slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 1, 0, 0);
+    // Compute root state is separate from the graphics root state.
+    slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x128)(list, 3, 0xdeadbeef, 2);
+    red = 0.75;
+    slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x130)(list, 3, red.to_bits(), 2);
+    slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 1, 3, 0);
+    // Neither the source memory nor subsequent root state may alter recorded draws.
+    red = 0.5;
+    set_constants(list, 3, 1, (&raw const red).cast(), 2);
+    red = 1.0;
+    assert_eq!(red, 1.0);
     let transition = Barrier {
         kind: 0,
         flags: 0,
@@ -544,16 +605,17 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     // The list retains the readback buffer through inspection.
     let pixel =
         |x: usize, y: usize| unsafe { std::slice::from_raw_parts(output.add(y * 256 + x * 4), 4) };
-    assert_eq!(pixel(2, 2), &[255, 0, 0, 255]);
+    assert_eq!(pixel(1, 2), &[64, 0, 0, 255]);
+    assert_eq!(pixel(3, 2), &[191, 0, 0, 255]);
     assert_eq!(pixel(0, 0), &[0x30; 4]);
-    assert_eq!(pixel(0, 3), &[0x33; 4]);
+    assert_eq!(pixel(2, 0), &[0x30; 4]);
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(target.add(2 * 256 + 2 * 4), 4) },
-        &[255, 0, 0, 255]
+        unsafe { std::slice::from_raw_parts(target.add(2 * 256 + 4), 4) },
+        &[64, 0, 0, 255]
     );
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(target.add(3 * 256), 4) },
-        &[0x33; 4]
+        unsafe { std::slice::from_raw_parts(target.add(2 * 4), 4) },
+        &[0x30; 4]
     );
     for y in 0..4 {
         assert_eq!(

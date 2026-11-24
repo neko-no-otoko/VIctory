@@ -139,22 +139,28 @@ pre-submit data, the post-submit value 42, surrounding bytes, resource lifetimes
 batch-wide state tracking and decay, invalid transitions and queue failure.
 
 The same queue can execute a narrowly constrained offscreen draw: a validated
-graphics pipeline stream with resource-free translated vertex/pixel stages,
-one float4 vertex buffer, triangle-list topology, full-target viewport and
-scissor, and one committed linear single-sample RGBA8 render target. It supports
-whole-target readback to a buffer with a 256-byte row-pitched footprint after
-an explicit `RENDER_TARGET` to `COPY_SOURCE` transition. Drawing preserves
-pixels outside the triangle; GPU work and the host-memory copies complete in
-command order. Other graphics states, formats, textured or constant-bound
-shaders, depth, blending, instancing and presentation are rejected.
+graphics pipeline stream with a resource-free translated vertex shader and a
+translated pixel shader using at most one graphics root-constants parameter.
+The used dwords are snapshotted per draw and uploaded as a real fragment
+constant buffer at `b0, space0`; Apple's converter reflection must confirm
+the expected automatic layout. This is not support for arbitrary console root
+CBVs or constant-buffer descriptors. Draws use one float4 vertex buffer,
+triangle-list topology, full-target viewport and scissor, and one committed
+linear single-sample RGBA8 render target. Whole-target readback to a buffer
+uses a 256-byte row-pitched footprint after an explicit `RENDER_TARGET` to
+`COPY_SOURCE` transition. Drawing preserves pixels outside the triangles; GPU
+work and host-memory copies complete in command order. Other graphics states,
+formats, textured shaders, depth, blending, instancing and presentation are
+rejected.
 
 ```sh
 VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
   cargo test -p victory-gpu console_triangle_draw_preserves_target_and_copies_to_padded_buffer -- --ignored
 ```
 
-The test uses a synthetic 5×4 target to check mapped row pitch, rendered and
-preserved pixels, readback padding, resource lifetime and texture state.
+The test uses a synthetic 5×4 target and two draws with different root values
+to check converter reflection, per-draw snapshots, mapped row pitch, rendered
+and preserved pixels, readback padding, resource lifetime and texture state.
 
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle

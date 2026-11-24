@@ -272,6 +272,7 @@ enum Command {
         vertex_offset: u64,
         vertices: u32,
         target: ResourceRef,
+        constants: Vec<u32>,
     },
     ReadTexture {
         target: ResourceRef,
@@ -316,6 +317,7 @@ pub(crate) struct State {
     scratch: Vec<u8>,
     heap: Option<Arc<HeapRef>>,
     roots: Vec<Root>,
+    graphics_roots: Vec<Root>,
     local_states: HashMap<usize, u32>,
     commands: Vec<Command>,
     error: Option<String>,
@@ -534,6 +536,28 @@ impl State {
         {
             return Err("viewport and scissor must cover the entire render target".into());
         }
+        let prepared = pipeline.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = prepared.user_data.first().map(|u| usize::from(u.slot));
+        if self
+            .graphics_roots
+            .iter()
+            .enumerate()
+            .any(|(index, root)| !matches!(root, Root::None) && Some(index) != slot)
+        {
+            return Err("unsupported graphics root parameter".into());
+        }
+        let mut constants = vec![0; prepared.dwords];
+        for u in &prepared.user_data {
+            let Some(Root::Constants(words)) = self.graphics_roots.get(u.slot as usize) else {
+                return Err("missing graphics root constants".into());
+            };
+            constants[u.index as usize] = words
+                .get(u.dword as usize)
+                .copied()
+                .flatten()
+                .ok_or("missing graphics root constant dword")?;
+        }
+        drop(prepared);
         self.use_state(vertex.ptr(), VERTEX_BUFFER)?;
         self.use_state(target.ptr(), RENDER_TARGET)?;
         self.commands.push(Command::Draw {
@@ -541,6 +565,7 @@ impl State {
             vertex,
             vertex_offset,
             vertices: count,
+            constants,
             target,
         });
         Ok(())
@@ -621,26 +646,16 @@ impl State {
         if !self.open() {
             return;
         }
-        let Some(end) = (offset as usize).checked_add(values.len()) else {
-            self.reject("constant range overflow");
+        if let Err(error) = write_constants(&mut self.roots, slot, values, offset) {
+            self.reject(error);
+        }
+    }
+    pub(crate) fn set_graphics_constants(&mut self, slot: u32, values: &[u32], offset: u32) {
+        if !self.open() {
             return;
-        };
-        if slot >= 64 || end > 64 {
-            self.reject("constant range out of bounds");
-            return;
         }
-        if self.roots.len() <= slot as usize {
-            self.roots.resize_with(slot as usize + 1, Root::default);
-        }
-        if !matches!(self.roots[slot as usize], Root::Constants(_)) {
-            self.roots[slot as usize] = Root::Constants(Vec::new());
-        }
-        let Root::Constants(words) = &mut self.roots[slot as usize] else {
-            unreachable!()
-        };
-        words.resize(words.len().max(end), None);
-        for (word, value) in words[offset as usize..end].iter_mut().zip(values) {
-            *word = Some(*value);
+        if let Err(error) = write_constants(&mut self.graphics_roots, slot, values, offset) {
+            self.reject(error);
         }
     }
     pub(crate) fn copy_buffer(
@@ -767,6 +782,7 @@ impl State {
                     vertex,
                     vertex_offset,
                     vertices,
+                    constants,
                     target,
                 } => {
                     submission.access(vertex.ptr(), VERTEX_BUFFER)?;
@@ -810,6 +826,7 @@ impl State {
                         width,
                         height,
                         verts,
+                        constants,
                         &mut self.scratch,
                     )?;
                     for y in 0..height as usize {
@@ -938,4 +955,32 @@ fn copy_ranges(
         return Err("overlapping buffer copies are unsupported".into());
     }
     Ok((to, from.cast_const(), len as usize))
+}
+
+fn write_constants(
+    roots: &mut Vec<Root>,
+    slot: u32,
+    values: &[u32],
+    offset: u32,
+) -> Result<(), &'static str> {
+    let end = (offset as usize)
+        .checked_add(values.len())
+        .ok_or("constant range overflow")?;
+    if slot >= 64 || end > 64 {
+        return Err("constant range out of bounds");
+    }
+    if roots.len() <= slot as usize {
+        roots.resize_with(slot as usize + 1, Root::default);
+    }
+    if !matches!(roots[slot as usize], Root::Constants(_)) {
+        roots[slot as usize] = Root::Constants(Vec::new());
+    }
+    let Root::Constants(words) = &mut roots[slot as usize] else {
+        unreachable!()
+    };
+    words.resize(words.len().max(end), None);
+    for (word, value) in words[offset as usize..end].iter_mut().zip(values) {
+        *word = Some(*value);
+    }
+    Ok(())
 }

@@ -1324,6 +1324,32 @@ mod state {
         };
         with_metal(this, |s| s.set_constants(slot, values, offset));
     }
+    pub(super) extern "system" fn graphics_constant(
+        this: This,
+        slot: u32,
+        value: u32,
+        offset: u32,
+    ) {
+        with_metal(this, |s| s.set_graphics_constants(slot, &[value], offset));
+    }
+    pub(super) extern "system" fn graphics_constants(
+        this: This,
+        slot: u32,
+        count: u32,
+        values: *const u32,
+        offset: u32,
+    ) {
+        if values.is_null() && count != 0 {
+            return with_metal(this, |s| s.reject("null graphics root constants"));
+        }
+        let values = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller supplies count constants.
+            unsafe { std::slice::from_raw_parts(values, count as usize) }
+        };
+        with_metal(this, |s| s.set_graphics_constants(slot, values, offset));
+    }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_metal(this, |s| s.dispatch([x, y, z]));
@@ -1390,8 +1416,6 @@ mod state {
     }
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_view;
-    pub(super) use super::ignored_state as graphics_constant;
-    pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
     pub(super) use super::ignored_state as graphics_view;
     pub(super) use super::ignored_state as index_buffer;

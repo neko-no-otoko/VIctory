@@ -1,10 +1,12 @@
-//! Strict, resource-free vertex/pixel pipelines for the offscreen Metal renderer.
+//! Restricted vertex/pixel pipelines for the offscreen Metal renderer.
 use std::ffi::CStr;
 use victory_shader::{Container, FourCC, HwStage, emit, io, ir, native, resource};
 
 pub(crate) struct Prepared {
     vertex: Vec<u8>,
     pixel: Vec<u8>,
+    pub(crate) user_data: Vec<emit::UserData>,
+    pub(crate) dwords: usize,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
 }
 
@@ -14,11 +16,13 @@ unsafe impl Send for Prepared {}
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8]) -> Result<Self, String> {
-        let vertex = convert(vertex, HwStage::Vs)?;
-        let pixel = convert(pixel, HwStage::Ps)?;
+        let (vertex, _, _) = convert(vertex, HwStage::Vs)?;
+        let (pixel, user_data, dwords) = convert(pixel, HwStage::Ps)?;
         Ok(Self {
             vertex,
             pixel,
+            user_data,
+            dwords,
             renderer: None,
         })
     }
@@ -28,6 +32,7 @@ impl Prepared {
         width: u32,
         height: u32,
         vertices: &[[f32; 4]],
+        constants: &[u32],
         pixels: &mut [u8],
     ) -> Result<(), String> {
         if !matches!(&self.renderer, Some((w, h, _)) if *w == width && *h == height) {
@@ -38,7 +43,7 @@ impl Prepared {
                 "main",
                 width,
                 height,
-                0,
+                self.dwords as u32,
                 false,
             )
             .map_err(|e| e.to_string())?;
@@ -48,7 +53,7 @@ impl Prepared {
             .as_mut()
             .unwrap()
             .2
-            .draw_preserving(vertices, &[], pixels)
+            .draw_preserving(vertices, constants, pixels)
             .map_err(|e| e.to_string())
     }
 }
@@ -103,7 +108,7 @@ fn signature(
     Ok(())
 }
 
-fn convert(bytes: &[u8], stage: HwStage) -> Result<Vec<u8>, String> {
+fn convert(bytes: &[u8], stage: HwStage) -> Result<(Vec<u8>, Vec<emit::UserData>, usize), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
     let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
@@ -111,8 +116,16 @@ fn convert(bytes: &[u8], stage: HwStage) -> Result<Vec<u8>, String> {
         return Err("expected exactly one native program of the requested stage".into());
     }
     let p = &programs[0];
-    if !p.used.is_empty() || !p.layout.is_empty() {
-        return Err("shader resources and root parameters are unsupported".into());
+    if !p.used.is_empty()
+        || (stage == HwStage::Vs && !p.layout.is_empty())
+        || p.layout
+            .iter()
+            .any(|r| r.root != native::RootType::Constants || r.slot >= 64)
+        || p.layout
+            .first()
+            .is_some_and(|first| p.layout.iter().any(|r| r.slot != first.slot))
+    {
+        return Err("only one pixel root-constants parameter is supported".into());
     }
     match (&p.io, stage) {
         (native::StageIo::Vs { inputs, outputs }, HwStage::Vs)
@@ -169,7 +182,15 @@ fn convert(bytes: &[u8], stage: HwStage) -> Result<Vec<u8>, String> {
     }
     let host = emit::translate(bytes).map_err(|e| e.to_string())?;
     if host.stage != stage
-        || !host.user_data.is_empty()
+        || (stage == HwStage::Vs && !host.user_data.is_empty())
+        || host
+            .user_data
+            .iter()
+            .any(|u| u.root != native::RootType::Constants || u.slot >= 64 || u.dword >= 64)
+        || host
+            .user_data
+            .first()
+            .is_some_and(|first| host.user_data.iter().any(|u| u.slot != first.slot))
         || !host.samplers.is_empty()
         || !host.static_samplers.is_empty()
         || !host.root_cbvs.is_empty()
@@ -178,12 +199,24 @@ fn convert(bytes: &[u8], stage: HwStage) -> Result<Vec<u8>, String> {
         return Err("translated shader has unsupported bindings".into());
     }
     let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
-    let stage = if stage == HwStage::Vs {
-        victory_metal::converter::Stage::Vertex
+    let dwords = host.user_data_dwords() as usize;
+    if dwords > 64 {
+        return Err("fragment user-data buffer is too large".into());
+    }
+    let metallib = if stage == HwStage::Vs {
+        victory_metal::converter::convert(
+            std::path::Path::new(&path),
+            &host.dxil,
+            victory_metal::converter::Stage::Vertex,
+        )?
     } else {
-        victory_metal::converter::Stage::Fragment
+        victory_metal::converter::convert_fragment_with_b0(
+            std::path::Path::new(&path),
+            &host.dxil,
+            dwords != 0,
+        )?
     };
-    victory_metal::converter::convert(std::path::Path::new(&path), &host.dxil, stage)
+    Ok((metallib, host.user_data, dwords))
 }
 
 #[derive(Default)]
