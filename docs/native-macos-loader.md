@@ -289,6 +289,32 @@ correct transition handling. The probe did not implement or test PE template
 allocation, module indices, TLS callbacks, or loader lifecycle; it is not
 native TLS support.
 
+A later synthetic child-process experiment used a hand-written x86-64 signal
+trampoline, informed by the Wine transition design but not copied from Wine.
+Two pthreads installed distinct fake guest GS blocks. A third thread sent
+`SIGUSR1` to each while it was in guest state. Before calling any C handler,
+the trampoline read a probe-only context pointer from `gs:[0x60]` and called
+the private `_thread_set_tsd_base` to restore the host base saved from Mach.
+The C handler exercised `pthread_self`, `getpid`, `malloc` and `free`, then
+performed a nested guest-to-host-to-guest callback transition. The trampoline
+restored guest GS before returning from the signal.
+
+On macOS 27.3 build 26C5047e under Rosetta, both threads observed their own
+guest tags (`0x1111` and `0x2222`) in the nested call and after signal return.
+Their handlers observed the saved host `gs:[0]`; after returning to host,
+`gs:[0]`, `gs:[0x58]`, and a preserved `errno` matched the pre-guest values.
+Both threads reported success and the isolated child exited 0. This was one
+controlled delivery per thread, not a full register, signal-mask, reentrancy,
+or lifecycle proof.
+
+The fake block's `gs:[0x60]` was repurposed for probe context and is not a
+real Windows TEB (that offset normally has Windows meaning). Calling `malloc`
+in a signal handler is not async-signal-safe and was done only inside the
+disposable experiment; a successful run does not make it safe. The probe
+depends on private macOS behavior, does not cover signals arriving during a
+transition, nested signals, arbitrary guest threads, PE static TLS or loader
+callbacks, and is not suitable as production code or evidence of game TLS.
+
 A viable design needs either a supported host interface for that slot, or a
 controlled execution engine that correctly translates all guest GS accesses
 without scanning arbitrary instruction bytes. It must also copy the PE TLS
