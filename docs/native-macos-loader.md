@@ -49,6 +49,14 @@ are shared with the Windows implementation; this is not the full runtime.
 Run its synthetic PE test with
 `cargo test -p victory-runtime --target x86_64-apple-darwin --test native_guest`.
 
+`victory_native::NativeResolver` combines these two limited providers for use
+with the native loader. It returns an existing provider's resolution unchanged
+and leaves imports missing when neither supports them. The providers and their
+restrictions above are unchanged; this is not the Windows HLE registry.
+The synthetic executable integration test imports and calls both providers,
+checks that an unimplemented import fails to load, and runs without game data:
+`cargo test -p victory-native --target x86_64-apple-darwin --test native_executable`.
+
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls
 the executable's actual entry RVA, and detaches the DLLs if that call returns.

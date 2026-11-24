@@ -758,6 +758,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-native"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "victory-loader",
+ "victory-pe",
+ "victory-runtime",
+ "victory-xg",
+]
+
+[[package]]
 name = "victory-pe"
 version = "0.1.0"
 dependencies = [

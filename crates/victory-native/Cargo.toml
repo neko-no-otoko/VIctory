@@ -1,0 +1,19 @@
+[package]
+name = "victory-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+victory-loader.workspace = true
+victory-pe.workspace = true
+victory-runtime = { path = "../victory-runtime" }
+victory-xg = { path = "../victory-xg" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
