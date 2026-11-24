@@ -131,3 +131,65 @@ fn windows_validation_and_pipelines_are_rejected() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("require Windows"));
     }
 }
+
+/// Set VICTORY_TEST_METAL_CONVERTER to Apple's dylib to exercise the real API.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_converter_translates_emitted_compute_dxil() {
+    let Some(library) = std::env::var_os("VICTORY_TEST_METAL_CONVERTER") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("shader.bin");
+    let metal = dir.path().join("shader.metallib");
+    std::fs::write(&input, shader()).unwrap();
+    let emitted = Command::new(env!("CARGO_BIN_EXE_victory"))
+        .env_remove("VICTORY_PAIRS")
+        .env("VICTORY_EMIT_DUMP", dir.path())
+        .args(["translate", "--list", "--jobs", "1"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        emitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let dxil = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "dxil"))
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
+        .arg("convert-metal")
+        .arg(&dxil)
+        .arg("--library")
+        .arg(&library)
+        .arg("--stage")
+        .arg("compute")
+        .arg("--output")
+        .arg(&metal)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(std::fs::read(&metal).unwrap().starts_with(b"MTLB"));
+
+    let wrong_stage = dir.path().join("wrong.metallib");
+    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
+        .arg("convert-metal")
+        .arg(&dxil)
+        .arg("--library")
+        .arg(&library)
+        .arg("--stage")
+        .arg("vertex")
+        .arg("--output")
+        .arg(&wrong_stage)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!wrong_stage.exists());
+}

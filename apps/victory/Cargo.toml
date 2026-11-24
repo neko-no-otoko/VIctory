@@ -18,6 +18,9 @@ clap.workspace = true
 memchr.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libloading = "0.8.9"
+
 [target.'cfg(windows)'.dependencies]
 victory-loader.workspace = true
 victory-hle.workspace = true

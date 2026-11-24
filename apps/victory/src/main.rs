@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod census;
 mod inspect;
+#[cfg(target_os = "macos")]
+mod metal;
 #[cfg(windows)]
 mod run;
 mod shader;
@@ -95,6 +97,21 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Convert a DXIL file to a Metal library using Apple's converter.
+    #[cfg(target_os = "macos")]
+    ConvertMetal {
+        /// Input DXIL container.
+        input: PathBuf,
+        /// Output Metal library (outside the source tree).
+        #[arg(long)]
+        output: PathBuf,
+        /// Path to Apple's libmetalirconverter.dylib.
+        #[arg(long)]
+        library: PathBuf,
+        /// Shader stage of the input.
+        #[arg(long, value_enum)]
+        stage: metal::Stage,
+    },
     #[cfg(windows)]
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -169,6 +186,13 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        #[cfg(target_os = "macos")]
+        Command::ConvertMetal {
+            input,
+            output,
+            library,
+            stage,
+        } => metal::convert(&input, &output, &library, stage),
         #[cfg(windows)]
         Command::Run {
             exe,

@@ -67,6 +67,24 @@ and `VICTORY_PAIRS` require Windows. Shader inputs may be raw DXBC containers
 or SGD5 packed records, including those found inside otherwise uncompressed
 files. Compressed or encrypted archives are not generally unpacked.
 
+On macOS, an independently obtained Apple Metal Shader Converter dynamic
+library can convert an emitted DXIL file to a `.metallib`:
+
+```sh
+VICTORY_EMIT_DUMP=/path/outside/repo target/debug/victory translate /path/to/shader --list
+target/debug/victory convert-metal /path/outside/repo/emitted.dxil \
+  --library /path/to/libmetalirconverter.dylib --stage compute \
+  --output /path/outside/repo/shader.metallib
+```
+
+Use the input's actual stage (`vertex`, `fragment`, `mesh`, or `compute`).
+The converter is proprietary and not bundled; obtain it and comply with
+[Apple's terms](https://developer.apple.com/metal/shader-converter/).
+Conversion alone is not validation of shader behavior or resource bindings,
+and this command does not create a Metal renderer. To exercise the converter
+integration test, set `VICTORY_TEST_METAL_CONVERTER` to the dylib path and run
+`cargo test -p victory --test shader_offline`.
+
 Input files are supplied by the user; see [the asset policy](docs/asset-policy.md).
 
 ## Getting started
