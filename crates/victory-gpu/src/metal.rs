@@ -282,6 +282,11 @@ enum Root {
     Table(u64),
 }
 enum Command {
+    ClearTarget {
+        target: ResourceRef,
+        color: [u8; 4],
+        rects: Vec<[u32; 4]>,
+    },
     Draw {
         pipeline: Arc<Mutex<crate::metal_graphics::Prepared>>,
         vertex: ResourceRef,
@@ -512,6 +517,53 @@ impl State {
             return;
         }
         self.target = Some(ResourceRef::new(rtv.resource));
+    }
+    pub(crate) fn clear_target(&mut self, handle: u64, color: [f32; 4], rects: &[Scissor]) {
+        if !self.open() {
+            return;
+        }
+        if let Err(error) = self.record_clear_target(handle, color, rects) {
+            self.reject(&error);
+        }
+    }
+    fn record_clear_target(
+        &mut self,
+        handle: u64,
+        color: [f32; 4],
+        rects: &[Scissor],
+    ) -> Result<(), String> {
+        let rtv = descriptor::rtv_record(handle).ok_or("invalid render-target descriptor")?;
+        let (_, width, height, _) = crate::resource::metal_texture(rtv.resource)
+            .filter(|_| rtv.metal_rgba8())
+            .ok_or("expected a linear RGBA8 render target")?;
+        if rects.iter().any(|r| r.left > r.right || r.top > r.bottom) {
+            return Err("invalid render-target clear rectangle".into());
+        }
+        let clip = |v: i32, limit: u32| (v.max(0) as u32).min(limit);
+        let rects = rects
+            .iter()
+            .map(|r| {
+                [
+                    clip(r.left, width),
+                    clip(r.top, height),
+                    clip(r.right, width),
+                    clip(r.bottom, height),
+                ]
+            })
+            .collect();
+        // FLOAT to UNORM: NaN becomes zero; finite and infinite values clamp,
+        // then round to nearest, with halfway values rounded up.
+        let color = color.map(|c| {
+            let c = if c.is_nan() { 0.0 } else { c.clamp(0.0, 1.0) };
+            (c * 255.0 + 0.5) as u8
+        });
+        self.use_state(rtv.resource, RENDER_TARGET)?;
+        self.commands.push(Command::ClearTarget {
+            target: ResourceRef::new(rtv.resource),
+            color,
+            rects,
+        });
+        Ok(())
     }
     pub(crate) fn draw(&mut self, count: u32, instances: u32, first: u32, first_instance: u32) {
         if !self.open() {
@@ -897,6 +949,33 @@ impl State {
         }
         for command in &mut self.commands {
             match command {
+                Command::ClearTarget {
+                    target,
+                    color,
+                    rects,
+                } => {
+                    submission.access(target.ptr(), RENDER_TARGET)?;
+                    let (texture, width, height, pitch) =
+                        crate::resource::metal_texture(target.ptr())
+                            .ok_or("invalid render target")?;
+                    let full = [[0, 0, width, height]];
+                    let rects = if rects.is_empty() { &full[..] } else { rects };
+                    for &[left, top, right, bottom] in rects.iter() {
+                        let len = (right - left) as usize * 4;
+                        for y in top..bottom {
+                            // SAFETY: rectangles were clipped to the retained linear texture.
+                            let row = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    texture.add(y as usize * pitch + left as usize * 4),
+                                    len,
+                                )
+                            };
+                            for pixel in row.chunks_exact_mut(4) {
+                                pixel.copy_from_slice(color);
+                            }
+                        }
+                    }
+                }
                 Command::Draw {
                     pipeline,
                     vertex,

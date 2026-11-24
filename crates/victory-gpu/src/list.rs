@@ -842,7 +842,23 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
-    reject_metal!(this, "render-target clear is unsupported on Metal");
+    #[cfg(target_os = "macos")]
+    {
+        if color.is_null() || (count != 0 && rects.is_null()) {
+            return with_metal(this, |s| s.reject("null render-target clear arguments"));
+        }
+        // SAFETY: the caller supplies four floats and, when count is nonzero,
+        // that many RECTs. Scissor has the same C layout as RECT.
+        let color = unsafe { *color };
+        let rects = if count == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(rects.cast::<crate::metal::Scissor>(), count as usize)
+            }
+        };
+        with_metal(this, |s| s.clear_target(handle, color, rects));
+    }
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))

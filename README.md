@@ -136,10 +136,6 @@ silently ignoring fields. It also needs an unlocked graphical session to verify
 that a submitted frame actually reaches a visible surface; offscreen readback
 alone does not establish that.
 
-A safer independently testable graphics increment is ordered
-`ClearRenderTargetView` support for the existing linear RGBA8 target subset,
-with resource-state and pixel readback checks.
-
 To run the synthetic device/list/queue test on a Metal GPU (no title assets):
 
 ```sh
@@ -166,14 +162,22 @@ uses a 256-byte row-pitched footprint after an explicit `RENDER_TARGET` to
 work and host-memory copies complete in command order. Other graphics states,
 formats, depth, blending, instancing and presentation are rejected.
 
+`ClearRenderTargetView` records ordered full-target or clipped rectangle clears
+for the same RGBA8 targets, independent of the bound draw target. It snapshots
+the color and rectangles, retains the target, requires `RENDER_TARGET` state,
+and clears the linear host backing synchronously between GPU draws and copies.
+FLOAT channels convert to UNORM by clamping to [0, 1] and rounding to nearest
+with halfway values up; NaN becomes zero. Null rectangle arrays with a nonzero
+count and inverted rectangles are rejected.
+
 ```sh
 VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
   cargo test -p victory-gpu console_triangle_draw_preserves_target_and_copies_to_padded_buffer -- --ignored
 ```
 
 The test uses a synthetic 5×4 target and two draws with different root values
-to check converter reflection, per-draw snapshots, mapped row pitch, rendered
-and preserved pixels, readback padding, resource lifetime and texture state.
+to check clear/draw/clear ordering, clipping, color conversion, rejected states,
+converter reflection, mapped row pitch, readback padding and resource lifetime.
 
 For texturing, the SRV must be a default view of a committed default-heap,
 linear, single-mip, single-sample RGBA8 2D texture. The shader's statically

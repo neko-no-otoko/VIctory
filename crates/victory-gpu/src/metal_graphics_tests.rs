@@ -283,23 +283,22 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         flags: 0,
     };
     let vb = make(&buffer(96), 0);
-    let readback = make(&buffer(1024), 0);
-    let texture = make(
-        &ResourceDesc {
-            dimension: 3,
-            alignment: 0,
-            width: 5,
-            height: 4,
-            depth: 1,
-            mips: 1,
-            format: 28,
-            samples: 1,
-            quality: 0,
-            layout: 1,
-            flags: 1,
-        },
-        4,
-    );
+    let readback = make(&buffer(2048), 0);
+    let texture_desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 5,
+        height: 4,
+        depth: 1,
+        mips: 1,
+        format: 28,
+        samples: 1,
+        quality: 0,
+        layout: 1,
+        flags: 1,
+    };
+    let texture = make(&texture_desc, 4);
+    let clear_only = make(&texture_desc, 4);
     let map = |resource| {
         let mut ptr = std::ptr::null_mut();
         assert_eq!(
@@ -322,12 +321,14 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     let vertex_data = map(vb);
     let output = map(readback);
     let target = map(texture);
+    let clear_only_target = map(clear_only);
     // The mapped target is initialized before recording, and readback is a sentinel.
     unsafe {
         std::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), vertex_data, 96);
-        std::ptr::write_bytes(output, 0x77, 1024);
+        std::ptr::write_bytes(output, 0x77, 2048);
         for y in 0..4 {
             std::ptr::write_bytes(target.add(y * 256), 0x30 + y as u8, 20);
+            std::ptr::write_bytes(clear_only_target.add(y * 256), 0x66, 20);
         }
     }
     let vertex_address = slot::<extern "system" fn(This) -> u64>(vb, 0x58)(vb);
@@ -339,7 +340,7 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     );
     let heap_desc = HeapDesc {
         kind: 2,
-        count: 1,
+        count: 2,
         flags: 0,
         nodes: 0,
         placement: [0; 2],
@@ -357,6 +358,12 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         texture,
         null.cast(),
         handle,
+    );
+    slot::<extern "system" fn(This, This, *const c_void, u64)>(dev, 0xa0)(
+        dev,
+        clear_only,
+        null.cast(),
+        handle + 128,
     );
 
     let vs = shader(true);
@@ -495,6 +502,33 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     draw(list, 3, 1, 0, 0); // Unsupported root slot.
     assert_eq!(close(list), object::E_NOTIMPL);
     assert_eq!(reset(list, allocator, pipeline), S_OK);
+    let clear =
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const [i32; 4])>(list, 0x1a0);
+    clear(list, handle, null.cast(), 0, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    let color = [0.0, 0.0, 0.0, 1.0];
+    clear(list, handle, &color, 1, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    clear(list, handle, &color, 1, [[2, 0, 1, 1]].as_ptr());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    let wrong_state = Barrier {
+        kind: 0,
+        flags: 0,
+        resource: texture,
+        reserved: [u64::from(u32::MAX) | (4u64 << 32), 0x800],
+    };
+    slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &wrong_state);
+    clear(list, handle, &color, 0, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, pipeline), S_OK);
+    let mut background = [0.25, 0.5, 2.0, -1.0];
+    clear(list, handle, &background, 0, null.cast());
+    clear(list, handle + 128, &background, 0, null.cast());
+    background = [1.0; 4];
+    assert_eq!(background, [1.0; 4]);
     bind();
     let set_constants = slot::<extern "system" fn(This, u32, u32, *const c_void, u32)>(list, 0x140);
     let mut red = 0.25f32;
@@ -517,8 +551,8 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
         reserved: [u64::from(u32::MAX) | (4u64 << 32), 0x800],
     };
     slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &transition);
-    let footprint = || Footprint {
-        offset: 0,
+    let footprint = |offset| Footprint {
+        offset,
         format: 28,
         width: 5,
         height: 4,
@@ -528,7 +562,12 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     let dst = CopyLocation {
         resource: readback,
         kind: 1,
-        footprint: footprint(),
+        footprint: footprint(0),
+    };
+    let before_clear = CopyLocation {
+        resource: readback,
+        kind: 1,
+        footprint: footprint(1024),
     };
     let src = CopyLocation {
         resource: texture,
@@ -542,7 +581,7 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
             pitch: 0,
         },
     };
-    slot::<
+    let copy = slot::<
         extern "system" fn(
             This,
             *const CopyLocation,
@@ -552,7 +591,26 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
             *const CopyLocation,
             *const c_void,
         ),
-    >(list, 0x80)(list, &dst, 0, 0, 0, &src, null.cast());
+    >(list, 0x80);
+    copy(list, &before_clear, 0, 0, 0, &src, null.cast());
+    let to_target = Barrier {
+        kind: 0,
+        flags: 0,
+        resource: texture,
+        reserved: [u64::from(u32::MAX) | (0x800u64 << 32), 4],
+    };
+    slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &to_target);
+    let mut rectangles = [[3, 2, 4, 3], [-2, -2, 1, 1], [9, 9, 12, 12]];
+    let mut clear_color = [0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+    clear(list, handle, &clear_color, 3, rectangles.as_ptr());
+    // An entirely clipped rectangle must not be mistaken for a full clear.
+    clear(list, handle, &color, 1, [[9, 9, 12, 12]].as_ptr());
+    rectangles[0] = [0, 0, 5, 4];
+    clear_color = [1.0; 4];
+    assert_eq!(rectangles[0], [0, 0, 5, 4]);
+    assert_eq!(clear_color, [1.0; 4]);
+    slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &transition);
+    copy(list, &dst, 0, 0, 0, &src, null.cast());
     assert_eq!(
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
         S_OK
@@ -560,10 +618,13 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     for y in 0..4 {
         assert_eq!(unsafe { *output.add(y * 256) }, 0x77);
         assert_eq!(unsafe { *target.add(y * 256) }, 0x30 + y as u8);
+        assert_eq!(unsafe { *clear_only_target.add(y * 256) }, 0x66);
+        assert_eq!(unsafe { *output.add(1024 + y * 256) }, 0x77);
     }
     // The recorded commands own every resource after the caller releases it.
     release(vb);
     release(texture);
+    assert_eq!(release(clear_only), 1, "only the recorded clear retains it");
     release(readback);
     release(heap);
     release(pipeline);
@@ -606,16 +667,27 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     let pixel =
         |x: usize, y: usize| unsafe { std::slice::from_raw_parts(output.add(y * 256 + x * 4), 4) };
     assert_eq!(pixel(1, 2), &[64, 0, 0, 255]);
-    assert_eq!(pixel(3, 2), &[191, 0, 0, 255]);
-    assert_eq!(pixel(0, 0), &[0x30; 4]);
-    assert_eq!(pixel(2, 0), &[0x30; 4]);
+    assert_eq!(pixel(3, 2), &[128, 0, 255, 0]);
+    assert_eq!(pixel(0, 0), &[128, 0, 255, 0]);
+    assert_eq!(pixel(2, 0), &[64, 128, 255, 0]);
     assert_eq!(
         unsafe { std::slice::from_raw_parts(target.add(2 * 256 + 4), 4) },
         &[64, 0, 0, 255]
     );
     assert_eq!(
         unsafe { std::slice::from_raw_parts(target.add(2 * 4), 4) },
-        &[0x30; 4]
+        &[64, 128, 255, 0]
+    );
+    let before = |x: usize, y: usize| unsafe {
+        std::slice::from_raw_parts(output.add(1024 + y * 256 + x * 4), 4)
+    };
+    assert_eq!(before(1, 2), &[64, 0, 0, 255]);
+    assert_eq!(before(3, 2), &[191, 0, 0, 255]);
+    assert_eq!(before(0, 0), &[64, 128, 255, 0]);
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(clear_only_target.add(3 * 256 + 4 * 4), 4) },
+        &[64, 128, 255, 0],
+        "clear-only texture must survive until submission"
     );
     for y in 0..4 {
         assert_eq!(
@@ -623,14 +695,56 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
             0x77,
             "row padding must not be overwritten"
         );
+        assert_eq!(unsafe { *output.add(1024 + y * 256 + 20) }, 0x77);
     }
     // Textures explicitly transitioned to COPY_SOURCE do not decay like buffers.
     slot::<extern "system" fn(This) -> u32>(texture, 0x08)(texture);
+    let mut state_heap = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x70
+        )(
+            dev,
+            (&raw const heap_desc).cast(),
+            &heap_iid,
+            &mut state_heap
+        ),
+        S_OK
+    );
+    let state_handle = slot::<extern "system" fn(This) -> u64>(state_heap, 0x48)(state_heap);
+    slot::<extern "system" fn(This, This, *const c_void, u64)>(dev, 0xa0)(
+        dev,
+        texture,
+        null.cast(),
+        state_handle,
+    );
     let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
     let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
     let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
     let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(queue, 0x70);
     let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    // Recording cannot know the queue's current state; submission must reject
+    // clearing while the target is still COPY_SOURCE.
+    let mut rejected_queue = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x40
+        )(
+            dev,
+            (&raw const queue_desc).cast(),
+            &queue_iid,
+            &mut rejected_queue,
+        ),
+        S_OK
+    );
+    clear(list, state_handle, &color, 0, null.cast());
+    assert_eq!(close(list), S_OK);
+    release(state_heap);
+    execute(rejected_queue, 1, &list);
+    assert_eq!(signal(rejected_queue, fence, 2), object::E_NOTIMPL);
+    assert_eq!(completed(fence), 1);
+    release(rejected_queue);
     assert_eq!(reset(list, allocator, null), S_OK);
     let back = Barrier {
         kind: 0,
