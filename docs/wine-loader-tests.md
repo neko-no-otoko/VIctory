@@ -233,7 +233,7 @@ details, not a stable macOS GS API. This proof does **not** use VIctory's
 Xbox HLE, the VIctory Windows loader, game shaders or presentation, and it
 does not establish game compatibility or ARM-native PE execution.
 
-## Experimental Wine D3D12.X-to-Metal compute proxy
+## Experimental Wine D3D12.X-to-Metal proxy
 
 The opt-in proxy keeps the Windows D3D12.X HLE objects and vtables inside the
 Wine PE process. It copies bounded shader, buffer, constant and dispatch data
@@ -243,13 +243,14 @@ guest pointers or COM objects cross the process boundary. Wine and the native
 host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
 execution. This is a trusted-workload experiment, not a process sandbox.
 
-Only the restricted compute path is supported: one committed default raw UAV
-buffer, a one-entry shader-visible heap, root constants in slot 0, descriptor
-table in slot 1, and synchronous dispatch/readback. Limits are 4 MiB shader,
-16 MiB buffer and 64 constant dwords. Graphics, presentation, root CBVs,
-general resource states and arbitrary D3D12.X methods are unsupported; some
-unsupported void methods abort rather than pretend to succeed. The loopback
-bearer token is not a boundary against other processes with access to it.
+The restricted compute path supports one committed default raw UAV buffer, a
+one-entry shader-visible heap, root constants in slot 0, descriptor table in
+slot 1, and synchronous dispatch/readback. Limits are 4 MiB per shader,
+16 MiB per buffer and 64 constant dwords. A separate restricted offscreen
+graphics path is described below. Presentation, root CBVs, general resource
+states and arbitrary D3D12.X methods remain unsupported; some unsupported void
+methods abort rather than pretend to succeed. The loopback bearer token is not
+a boundary against other processes with access to it.
 
 The fixture below uses compiler-generated static TLS, two Windows threads and
 TLS callbacks before dispatching the existing synthetic D3D12.X shader and
@@ -300,3 +301,47 @@ CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
 
 Stop the service after the test. No compatible game files were used or
 configured; these results are not evidence of game compatibility.
+
+### Restricted offscreen graphics
+
+The same opt-in service supports one full clear, one nonindexed triangle,
+one render-target-to-copy-source transition, and one full texture-to-buffer
+copy to a mapped readback buffer. The pipeline stream must have the exact
+224-byte POSITION-float4/RGBA8_UNORM layout used by the fixture; it uses a
+single RTV, full-target viewport and scissor, triangle-list topology, and
+contiguous initialized pixel shader root constants at slot 3. The translated
+console vertex and pixel shaders are converted by Apple Metal Shader Converter
+and the actual Metal pixels return through the guest buffer; row pitch must be
+256-byte aligned and copy offset 512-byte aligned. Texture sampling, depth,
+blending, indexed and instanced draws, multiple draws or render targets,
+presentation, and other pipeline or resource states are unsupported.
+
+On the M3 Max with Wine 11 and the Apple converter, the TLS-bearing fixture
+passed its thread/callback checks and read back a red triangle pixel
+`(191,0,0,255)`, the clear pixel `(64,128,255,0)`, and unchanged row padding.
+An invalid-topology variant was rejected at command-list close. The Wine
+compute bridge (including wrong-token rejection) and the native graphics
+fixture also passed their focused regressions. These synthetic results do not
+establish arbitrary TLS instruction support or game compatibility.
+
+Using the import libraries built above, build both the valid and invalid-state
+TLS fixtures:
+
+```sh
+for variant in valid invalid; do
+  flags=
+  [ "$variant" = invalid ] && flags=-DINVALID_GRAPHICS_TOPOLOGY
+  x86_64-w64-mingw32-clang -O2 -fno-emulated-tls $flags \
+    -c tests/fixtures/windows_d3d12x_tls_graphics.c \
+    -o "/tmp/victory-wine-hle-tls/graphics-$variant.obj"
+  lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /include:_tls_used \
+    "/out:/tmp/victory-wine-hle-tls/graphics-$variant.exe" \
+    "/tmp/victory-wine-hle-tls/graphics-$variant.obj" \
+    /tmp/victory-wine-hle-tls/kernel32.lib /tmp/victory-wine-hle-tls/d3d12_xs.lib \
+    "$LLVM_MINGW/x86_64-w64-mingw32/lib/libmingw32.a"
+done
+export VICTORY_TEST_D3D12X_TLS_GRAPHICS_PE="$(winepath -w /tmp/victory-wine-hle-tls/graphics-valid.exe)"
+export VICTORY_TEST_D3D12X_TLS_GRAPHICS_INVALID_PE="$(winepath -w /tmp/victory-wine-hle-tls/graphics-invalid.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test wine_graphics --target x86_64-pc-windows-gnullvm -- --ignored --nocapture
+```
