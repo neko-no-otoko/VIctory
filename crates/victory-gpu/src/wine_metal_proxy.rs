@@ -21,7 +21,7 @@ fn resource_id() -> u64 {
 const FAIL: HRESULT = 0x80004005u32 as i32;
 const MAGIC: u32 = 0x31474d56;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
-const MAX_BUFFER: usize = 16 * 1024 * 1024;
+const MAX_BUFFER: usize = wine_transport::MAX_STREAM_RESOURCE;
 const MAX_COMPUTE_PAYLOAD: usize = 64 * 1024 * 1024;
 const UNKNOWN: Iid = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
 const DEVICE11: Iid = guid(0x5405c344, 0xd457, 0x444e, [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39]);
@@ -158,6 +158,13 @@ type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 #[derive(Clone)]
 enum GraphicsResource { Buffer(Arc<Buffer>), Texture(Arc<Texture>) }
 impl GraphicsResource {
+    fn byte_len(&self) -> Result<usize, String> {
+        match self {
+            Self::Buffer(b) => Ok(b.len()),
+            Self::Texture(t) => wine_transport::texture_size(t.format, t.width, t.height, t.mips)
+                .ok_or_else(|| "invalid texture size".into()),
+        }
+    }
     fn id(&self) -> u64 { match self { Self::Buffer(b) => b.id, Self::Texture(t) => t.id } }
     fn snapshot(&self) -> Result<Resource, String> {
         Ok(match self {
@@ -1773,22 +1780,43 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }
         commands.push(j.command.clone());
     }
+    // One snapshot per resource per ordered batch, never one per command.
+    // Bound the aggregate before taking any potentially large snapshots.
+    let total = resources.values().try_fold(0usize, |total, resource| {
+        let len = resource.byte_len()?;
+        if len > wine_transport::MAX_STREAM_RESOURCE { return Err("resource exceeds stream limit".to_string()); }
+        total.checked_add(len).filter(|&n| n <= wine_transport::MAX_STREAM_BATCH)
+            .ok_or_else(|| "batch resources exceed stream limit".to_string())
+    })?;
     let batch = Batch { resources: resources.values().map(GraphicsResource::snapshot).collect::<Result<Vec<_>, _>>()?, pipelines: pipelines.into_values().collect(), commands };
-    let payload = wine_transport::encode_batch(&batch)?;
-    let payload_len = u32::try_from(payload.len()).map_err(|_| "batch too large")?;
+    // Keep the established v5 wire for small batches and older hosts. A v9
+    // stream sends each large resource without constructing a giant payload.
+    let payload = if total <= wine_transport::MAX_PAYLOAD / 2
+        && batch.resources.iter().all(|r| r.bytes.len() <= 16 * 1024 * 1024)
+    { wine_transport::encode_batch(&batch).ok() } else { None };
     let mut s = TcpStream::connect_timeout(&c.addr, Duration::from_secs(10)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
-    for v in [MAGIC,5,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
-    s.write_all(&c.token).and_then(|_| s.write_all(&payload)).map_err(|e| e.to_string())?;
+    let version = if payload.is_some() {5} else {9};
+    let payload_len = payload.as_ref().map_or(0, |p| p.len() as u32);
+    for v in [MAGIC,version,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
+    s.write_all(&c.token).map_err(|e| e.to_string())?;
+    if let Some(payload) = payload { s.write_all(&payload).map_err(|e| e.to_string())?; }
+    else { wine_transport::write_stream_batch(&mut s, &batch)?; }
     let mut header = [0u8;16]; s.read_exact(&mut header).map_err(|e| e.to_string())?;
     let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
     let (magic,status,len,msg) = (word(0),word(4),word(8) as usize,word(12) as usize);
-    if magic != MAGIC || len > 128 * 1024 * 1024 || msg > 4096 || (status == 0 && msg != 0) || (status != 0 && len != 0) { return Err("invalid proxy response".into()); }
-    let mut bytes = vec![0;len]; let mut message = vec![0;msg];
-    s.read_exact(&mut bytes).and_then(|_| s.read_exact(&mut message)).map_err(|e| e.to_string())?;
-    if status != 0 { return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message))); }
-    let results = wine_transport::decode_results(&bytes)?;
+    if magic != MAGIC || len > wine_transport::MAX_PAYLOAD || msg > 4096 || (status == 0 && msg != 0)
+        || (status != 0 && len != 0) || (version == 9 && len != 0)
+    { return Err("invalid proxy response".into()); }
+    if status != 0 {
+        let mut message = vec![0;msg]; s.read_exact(&mut message).map_err(|e| e.to_string())?;
+        return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
+    }
+    let results = if version == 9 { wine_transport::read_stream_results(&mut s)? } else {
+        let mut bytes = vec![0;len]; s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        wine_transport::decode_results(&bytes)?
+    };
     if results.len() != resources.len() { return Err("incomplete resource results".into()); }
     let mut seen = std::collections::HashSet::new();
     for r in &results {

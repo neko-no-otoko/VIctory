@@ -23,6 +23,9 @@ pub(crate) struct Prepared {
     pub(crate) blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
     input_renderer: Option<(u32, u32, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
+    pending_texture_identity: Option<SampledTextureIdentity>,
+    renderer_texture: Option<SampledTextureKey>,
+    input_renderer_texture: Option<SampledTextureKey>,
 }
 
 /// A supplied input-layout element and the Metal attribute assigned to it.
@@ -65,6 +68,107 @@ pub(crate) struct Texture<'a> {
     pub max_lod: f32,
 }
 
+/// Identity is valid only for the lifetime of a Wine batch. Callers without
+/// an explicit identity must upload on every draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SampledTextureIdentity {
+    pub resource: u64,
+    pub generation: usize,
+    pub first_mip: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SampledTextureKey {
+    identity: SampledTextureIdentity,
+    width: u32,
+    height: u32,
+    levels: u32,
+    format: victory_metal::TextureFormat,
+    linear: bool,
+    min_lod: u32,
+    max_lod: u32,
+}
+
+impl SampledTextureKey {
+    fn new(identity: SampledTextureIdentity, texture: &Texture<'_>) -> Self {
+        Self {
+            identity, width: texture.width, height: texture.height, levels: texture.levels,
+            format: texture.format, linear: matches!(texture.filter, victory_metal::TextureFilter::Linear),
+            min_lod: texture.min_lod.to_bits(), max_lod: texture.max_lod.to_bits(),
+        }
+    }
+}
+
+fn sampled_texture_cached(cached: Option<SampledTextureKey>, key: Option<SampledTextureKey>) -> bool {
+    key.is_some() && cached == key
+}
+
+fn upload_sampled_texture(
+    renderer: &mut victory_metal::Renderer, texture: Texture<'_>,
+    identity: Option<SampledTextureIdentity>, cached: &mut Option<SampledTextureKey>,
+) -> Result<(), String> {
+    let key = identity.map(|identity| SampledTextureKey::new(identity, &texture));
+    if sampled_texture_cached(*cached, key) {
+        return Ok(());
+    }
+    // A failed upload must never leave a stale identity attached to a renderer.
+    *cached = None;
+    renderer.set_fragment_texture_mips(
+        texture.width, texture.height, texture.levels, texture.pixels, texture.filter,
+        texture.format, texture.min_lod, texture.max_lod,
+    ).map_err(|e| e.to_string())?;
+    *cached = key;
+    Ok(())
+}
+
+#[cfg(test)]
+mod sampled_texture_cache_tests {
+    use super::*;
+    use victory_metal::{TextureFilter, TextureFormat};
+
+    #[test]
+    fn only_matching_explicit_identity_and_view_can_reuse_upload() {
+        let identity = SampledTextureIdentity { resource: 1, generation: 0, first_mip: 0 };
+        let mut texture = Texture {
+            width: 8, height: 8, levels: 2, pixels: &[], filter: TextureFilter::Nearest,
+            format: TextureFormat::Rgba8, min_lod: 0.0, max_lod: 0.0,
+        };
+        let original = SampledTextureKey::new(identity, &texture);
+        let cached = Some(original);
+        assert!(sampled_texture_cached(cached, Some(original)));
+        assert!(!sampled_texture_cached(cached, None));
+        assert!(!sampled_texture_cached(None, None));
+        assert!(!sampled_texture_cached(None, Some(original))); // recreated renderer
+        for changed in [
+            SampledTextureIdentity { resource: 2, ..identity },
+            SampledTextureIdentity { generation: 1, ..identity },
+            SampledTextureIdentity { first_mip: 1, ..identity },
+        ] {
+            assert!(!sampled_texture_cached(cached, Some(SampledTextureKey::new(changed, &texture))));
+        }
+        texture.width = 4;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.width = 8;
+        texture.height = 4;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.height = 8;
+        texture.levels = 1;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.levels = 2;
+        texture.filter = TextureFilter::Linear;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.filter = TextureFilter::Nearest;
+        texture.format = TextureFormat::Bgra8;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.format = TextureFormat::Rgba8;
+        texture.min_lod = 1.0;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.min_lod = 0.0;
+        texture.max_lod = 1.0;
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+    }
+}
+
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
@@ -89,6 +193,9 @@ impl Prepared {
             color_format: graphics.color_format,
             renderer: None,
             input_renderer: None,
+            pending_texture_identity: None,
+            renderer_texture: None,
+            input_renderer_texture: None,
         })
     }
 
@@ -127,7 +234,13 @@ impl Prepared {
             vertex, pixel, user_data: pixel_host.user_data, dwords, texture_slot, sampler_slot,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
             color_format: graphics.color_format, renderer: None, input_renderer: None,
+            pending_texture_identity: None, renderer_texture: None, input_renderer_texture: None,
         }, resolved))
+    }
+
+    /// Apply an identity to the next draw only; Wine owns its batch lifetime.
+    pub(crate) fn set_sampled_texture_identity(&mut self, identity: Option<SampledTextureIdentity>) {
+        self.pending_texture_identity = identity;
     }
 
     pub(crate) fn draw(
@@ -145,6 +258,7 @@ impl Prepared {
         texture: Option<Texture<'_>>,
         pixels: &mut [u8],
     ) -> Result<(), String> {
+        let identity = self.pending_texture_identity.take();
         if self.vertex_stride == 0 {
             return Err("generic input pipeline requires layout-aware rendering".into());
         }
@@ -164,6 +278,7 @@ impl Prepared {
                 &self.vertex, "main", &self.pixel, "main", width, height,
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend, self.color_format,
             ).map_err(|e| e.to_string())?;
+            self.renderer_texture = None;
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
@@ -176,10 +291,7 @@ impl Prepared {
             renderer.set_stencil_reference(stencil_reference);
         }
         if let Some(texture) = texture {
-            renderer
-                .set_fragment_texture_mips(texture.width, texture.height, texture.levels, texture.pixels,
-                    texture.filter, texture.format, texture.min_lod, texture.max_lod)
-                .map_err(|e| e.to_string())?;
+            upload_sampled_texture(renderer, texture, identity, &mut self.renderer_texture)?;
         }
         match (vertices, indices) {
             (Vertices::Position(v), Some((indices, base))) => renderer.draw_indexed_preserving(v, indices, base, constants, pixels),
@@ -217,6 +329,7 @@ impl Prepared {
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
+        let identity = self.pending_texture_identity.take();
         if self.vertex_stride != 0 {
             return Err("layout-aware rendering requires a generic input pipeline".into());
         }
@@ -241,6 +354,7 @@ impl Prepared {
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
                 self.color_format, attributes,
             ).map_err(|e| e.to_string())?;
+            self.input_renderer_texture = None;
             self.input_renderer = Some((width, height, attributes.to_vec(), renderer));
         }
         let renderer = &mut self.input_renderer.as_mut().unwrap().3;
@@ -253,10 +367,7 @@ impl Prepared {
             renderer.set_stencil_reference(stencil_reference);
         }
         if let Some(texture) = texture {
-            renderer.set_fragment_texture_mips(
-                texture.width, texture.height, texture.levels, texture.pixels, texture.filter,
-                texture.format, texture.min_lod, texture.max_lod,
-            ).map_err(|e| e.to_string())?;
+            upload_sampled_texture(renderer, texture, identity, &mut self.input_renderer_texture)?;
         }
         renderer.draw_buffers(
             buffers, indices, first_vertex, vertex_count, instance_count, start_instance,

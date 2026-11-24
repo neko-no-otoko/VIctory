@@ -432,9 +432,17 @@ other tiled layouts, BGRA or uncompressed sRGB formats through this proxy, BC2
 and other compressed formats, arbitrary sampler/address modes, or
 general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
-4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
-and 64 MiB per request. Shader translation and drawing use the existing
-native Metal path, not MetalVulkan.
+4 MiB per shader, 128 MiB per graphics resource, 256 MiB total resource
+bytes per graphics batch, 64 constant dwords and 4096 batch items. Smaller
+batches retain the version-5 copied protocol; large batches use version-9
+bounded streaming, with metadata capped at 64 MiB separately from resource
+bytes. Resource snapshots are transferred once per
+batch in each direction, not once per command; unchanged sampled views also
+reuse a renderer's Metal upload within a batch, with writes invalidating it.
+This is not persistent zero-copy sharing, and peak memory still scales with
+batch size. Guest mapping and submission must be synchronized by the guest.
+Compute retains its separate 16 MiB buffer and 64 MiB payload limits. Shader translation and
+drawing use the existing native Metal path, not MetalVulkan.
 
 The Wine depth/stencil path uses D32_FLOAT_S8X24_UINT with Metal
 Depth32Float_Stencil8, not D24_UNORM_S8_UINT. The latter is rejected:

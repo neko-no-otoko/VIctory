@@ -249,16 +249,22 @@ mod host {
         Ok(response)
     }
 
+    #[derive(Debug)]
+    enum Response {
+        Bytes(Vec<u8>),
+        Stream(Vec<victory_gpu::wine_transport::Resource>),
+    }
+
     fn request(
         stream: &mut TcpStream,
         expected_token: &[u8; 16],
         cache: &mut Option<(Vec<u8>, bool, victory_gpu::WineMetalCompute)>,
         presentation_enabled: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Response, String> {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9) {
             return Err("invalid protocol header".into());
         }
         if matches!(fields[1], 1 | 6 | 7) {
@@ -275,6 +281,9 @@ mod host {
         {
             return Err("invalid batch request length or reserved fields".into());
         }
+        if fields[1] == 9 && fields[2..].iter().any(|&v| v != 0) {
+            return Err("invalid stream request reserved fields".into());
+        }
         if fields[1] == 8 && (fields[2] < 32 || fields[2] as usize > 64 * 1024 * 1024
             || fields[3..].iter().any(|&v| v != 0))
         {
@@ -286,24 +295,38 @@ mod host {
             return Err("authentication failed".into());
         }
         match fields[1] {
-            1 | 6 | 7 => compute_request(stream, fields, cache),
-            8 => raw_heap_request(stream, fields[2] as usize, cache),
-            2 => graphics_request(stream, fields),
+            1 | 6 | 7 => compute_request(stream, fields, cache).map(Response::Bytes),
+            8 => raw_heap_request(stream, fields[2] as usize, cache).map(Response::Bytes),
+            2 => graphics_request(stream, fields).map(Response::Bytes),
             5 => {
                 let mut payload = vec![0; fields[2] as usize];
                 stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
                 let batch = victory_gpu::wine_transport::decode_batch(&payload)?;
                 let results = victory_gpu::execute_wine_batch(batch)?;
-                victory_gpu::wine_transport::encode_results(&results)
+                victory_gpu::wine_transport::encode_results(&results).map(Response::Bytes)
             }
-            4 => present_request(stream, fields, presentation_enabled),
+            9 => {
+                let batch = victory_gpu::wine_transport::read_stream_batch(stream)?;
+                let results = victory_gpu::execute_wine_batch(batch)?;
+                victory_gpu::wine_transport::validate_stream_results(&results)?;
+                Ok(Response::Stream(results))
+            }
+            4 => present_request(stream, fields, presentation_enabled).map(Response::Bytes),
             _ => unreachable!(),
         }
     }
 
-    fn respond(stream: &mut TcpStream, result: Result<Vec<u8>, String>) -> io::Result<()> {
+    fn respond(stream: &mut TcpStream, result: Result<Response, String>) -> io::Result<()> {
+        if let Ok(Response::Stream(results)) = &result {
+            for value in [MAGIC, 0, 0, 0] {
+                stream.write_all(&value.to_le_bytes())?;
+            }
+            return victory_gpu::wine_transport::write_stream_results(stream, results)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        }
         let (status, data, message) = match result {
-            Ok(data) => (0u32, data, String::new()),
+            Ok(Response::Bytes(data)) => (0u32, data, String::new()),
+            Ok(Response::Stream(_)) => unreachable!(),
             Err(mut message) => {
                 if message.len() > MAX_MESSAGE {
                     let mut end = MAX_MESSAGE;
@@ -397,6 +420,33 @@ mod host {
             let client = TcpStream::connect(endpoint).unwrap();
             let (server, _) = listener.accept().unwrap();
             drop((client, server));
+        }
+
+        #[test]
+        fn stream_authentication_reserved_fields_and_reply() {
+            for (reserved, token, expected) in [
+                (1, [0;16], "reserved"),
+                (0, [1;16], "authentication"),
+            ] {
+                let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                for value in [MAGIC,9,reserved,0,0,0,0,0] {
+                    client.write_all(&value.to_le_bytes()).unwrap();
+                }
+                client.write_all(&token).unwrap();
+                let (mut server,_)=listener.accept().unwrap();
+                let result=request(&mut server,&[0;16],&mut None,false);
+                assert!(result.unwrap_err().contains(expected));
+            }
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut server,_)=listener.accept().unwrap();
+            respond(&mut server,Ok(Response::Stream(vec![]))).unwrap();
+            let mut header=[0;16];
+            client.read_exact(&mut header).unwrap();
+            assert_eq!(&header[..4],&MAGIC.to_le_bytes());
+            assert_eq!(&header[4..],&[0;12]);
+            assert!(victory_gpu::wine_transport::read_stream_results(&mut client).unwrap().is_empty());
         }
 
         #[test]

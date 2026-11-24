@@ -1,6 +1,6 @@
 //! Synchronous execution of copied Wine graphics batches on the Metal renderer.
 use std::collections::HashMap;
-use crate::metal_graphics::{GraphicsState, Prepared, ResolvedVertexInput, Texture, Vertices};
+use crate::metal_graphics::{GraphicsState, Prepared, ResolvedVertexInput, SampledTextureIdentity, Texture, Vertices};
 use crate::wine_transport::{block_geometry, mip_layout, texture_size, Batch, Command, CopyTexture, Draw, Pipeline, Resource, ResourceKind};
 use victory_metal::{BlendState, ColorFormat, DepthState, IndexData, TextureFilter, TextureFormat};
 use victory_shader::native::RootType;
@@ -60,7 +60,7 @@ fn depth_image(r:&Resource)->Result<(u32,u32),String> {
     let size=texture_size(fmt,width,height,1).ok_or("invalid depth texture dimensions")?;
     if r.bytes.len()!=size {return Err("invalid depth texture size".into())} Ok((width,height))
 }
-fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,(Prepared,Vec<ResolvedVertexInput>)>,d:Draw,stencil_reference:u32)->Result<(),String> {
+fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,(Prepared,Vec<ResolvedVertexInput>)>,generations:&HashMap<u64,usize>,d:Draw,stencil_reference:u32)->Result<(),String> {
     let p=pipelines.get(&d.pipeline).ok_or("unknown pipeline")?;
     let generic=!p.inputs.is_empty();
     if d.instance_count==0 || d.topology!=4 || d.vertex_count==0 || d.vertex_count%3!=0
@@ -117,6 +117,9 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
         Some(Texture {width:view_width,height:view_height,levels:d.mip_count,pixels:&r.bytes[start..end_offset],filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:f,min_lod:0.,max_lod:0.})
     } else {if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())} None};
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
+    prepared.set_sampled_texture_identity(d.texture.map(|resource| SampledTextureIdentity {
+        resource, generation:generations.get(&resource).copied().unwrap_or(0), first_mip:d.first_mip,
+    }));
     let result=if generic {
         let legacy_view=crate::wine_transport::VertexView {slot:0,buffer:d.vertex_buffer,offset:d.vertex_offset,size:d.vertex_size,stride:d.vertex_stride};
         let views=if d.vertices.is_empty() {std::slice::from_ref(&legacy_view)} else {d.vertices.as_slice()};
@@ -138,6 +141,19 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;let size=depth.len()*4;for (bytes,value) in r.bytes[..size].chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}if let Some(stencil)=stencil {r.bytes[size..].copy_from_slice(&stencil);}}
     Ok(())
 }
+
+// Mark all possible writers before execution. A failing command aborts the
+// batch, so its speculative generation can never be observed by a later draw.
+fn mark_writes(generations:&mut HashMap<u64,usize>,command:&Command,generation:usize) {
+    let (first,second)=match command {
+        Command::Clear {target,..} | Command::ClearDepth {target,..} | Command::ClearStencil {target,..} => (Some(*target),None),
+        Command::Draw(d) => (Some(d.target),d.depth),
+        Command::CopyTexture(c) => (Some(c.dst),None),
+        Command::CopyBuffer {dst,..} | Command::CopyDepthStencil {dst,..} => (Some(*dst),None),
+        Command::Barrier {..} | Command::SetStencilRef(_) => (None,None),
+    };
+    for id in [first,second].into_iter().flatten() {generations.insert(id,generation);}
+}
 /// Execute a complete batch in order. Returned snapshots are the only committed state.
 pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
     let mut rs=HashMap::new(); for r in batch.resources {
@@ -145,8 +161,10 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
         if r.id==0 || rs.insert(r.id,r).is_some() {return Err("duplicate resource id".into())}
     }
     let mut pipelines=HashMap::new();for p in batch.pipelines {if p.id==0 || pipelines.insert(p.id,p).is_some() {return Err("duplicate pipeline id".into())}}
-    let mut prepared=HashMap::new();let mut touched=HashMap::new();let mut stencil_reference=0;
-    for c in batch.commands {match c {
+    let mut prepared=HashMap::new();let mut touched=HashMap::new();let mut generations=HashMap::new();let mut stencil_reference=0;
+    for (index,c) in batch.commands.into_iter().enumerate() {
+        mark_writes(&mut generations,&c,index+1);
+        match c {
         Command::Barrier {id,before,after}=>{
             let r=rs.get_mut(&id).ok_or("unknown barrier resource")?;let texture=matches!(r.kind,ResourceKind::Texture {..});
             if !supports_state(texture,before) || !supports_state(texture,after) || (r.state!=before && !(r.state==0 && promotable(texture,before))) {return Err("resource barrier state mismatch or unsupported state".into())}
@@ -160,7 +178,7 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}
             if let Some(id)=d.texture {access(&mut rs,&mut touched,id,0x80)?;}
             if let Some(id)=d.depth {access(&mut rs,&mut touched,id,0x10)?;}
-            draw(&mut rs,&pipelines,&mut prepared,d,stencil_reference)?;
+            draw(&mut rs,&pipelines,&mut prepared,&generations,d,stencil_reference)?;
         },
         Command::CopyTexture(c)=>{access(&mut rs,&mut touched,c.src,0x800)?;access(&mut rs,&mut touched,c.dst,0x400)?;copy_texture(&mut rs,c)?;},
         Command::ClearDepth {target,depth}=>{access(&mut rs,&mut touched,target,0x10)?;if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {return Err("invalid depth clear".into())} let r=rs.get_mut(&target).ok_or("unknown depth target")?;depth_image(r)?;if !matches!(r.kind,ResourceKind::Texture {format:40,..}) {return Err("expected D32_FLOAT target".into())}for bytes in r.bytes.chunks_exact_mut(4) {bytes.copy_from_slice(&depth.to_bits().to_le_bytes());}},
@@ -193,4 +211,44 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
     }}
     for (id,decay) in touched {if decay {rs.get_mut(&id).unwrap().state=0;}}
     let mut out:Vec<_>=rs.into_values().collect();out.sort_unstable_by_key(|r|r.id);Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_generations_follow_command_order_and_resource_identity() {
+        let mut generations = HashMap::new();
+        let draw = Draw {
+            target: 1, pipeline: 1, vertex_buffer: 2, vertex_offset: 0, vertex_size: 0,
+            vertex_stride: 16, vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+            viewport: [0.0; 6], scissor: [0; 4], topology: 4, constants: vec![],
+            texture: Some(3), first_mip: 0, mip_count: 1, index: None, depth: Some(4),
+            linear_filter: false, constant_slot: None, texture_slot: None, sampler_slot: None,
+            vertices: vec![],
+        };
+        mark_writes(&mut generations, &Command::Draw(draw), 1);
+        assert_eq!(generations.get(&1), Some(&1));
+        assert_eq!(generations.get(&4), Some(&1));
+        assert!(!generations.contains_key(&2));
+        assert!(!generations.contains_key(&3));
+
+        let commands = [
+            Command::Clear { target: 3, color: [0.0; 4] },
+            Command::CopyTexture(CopyTexture { src: 1, dst: 3, offset: 0, pitch: 256, width: 1, height: 1, format: 28, mip: 0, buffer_to_texture: true }),
+            Command::ClearDepth { target: 3, depth: 1.0 },
+            Command::ClearStencil { target: 3, flags: 2, depth: 1.0, stencil: 0 },
+            Command::CopyDepthStencil { src: 1, dst: 3, offset: 0, pitch: 256, width: 1, height: 1, plane: 0, upload: true },
+            Command::CopyBuffer { src: 1, dst: 3, src_offset: 0, dst_offset: 0, size: 1 },
+        ];
+        for (index, command) in commands.iter().enumerate() {
+            mark_writes(&mut generations, command, index + 2);
+            assert_eq!(generations.get(&3), Some(&(index + 2)));
+            assert_eq!(generations.get(&1), Some(&1));
+        }
+        mark_writes(&mut generations, &Command::Barrier { id: 3, before: 0, after: 0 }, 8);
+        mark_writes(&mut generations, &Command::SetStencilRef(2), 9);
+        assert_eq!(generations.get(&3), Some(&7));
+    }
 }

@@ -4,6 +4,8 @@ use std::collections::HashSet;
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 4096;
 const MAX_RESOURCE: usize = 16 * 1024 * 1024;
+pub const MAX_STREAM_RESOURCE: usize = 128 * 1024 * 1024;
+pub const MAX_STREAM_BATCH: usize = 256 * 1024 * 1024;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
 
 /// Returns the packed row byte length and row count for a supported texture format.
@@ -226,8 +228,13 @@ fn finish(w:Writer)->Result<Vec<u8>,String> { if w.0.len()>MAX_PAYLOAD { Err("wi
 pub fn encode_results(rs:&[Resource])->Result<Vec<u8>,String> { let mut w=Writer(Vec::new()); resources(&mut w,rs)?; finish(w) }
 pub fn decode_results(data:&[u8])->Result<Vec<Resource>,String> { if data.len()>MAX_PAYLOAD { return Err("wire payload exceeds limit".into()); } let mut r=Reader {data,pos:0}; let out=read_resources(&mut r)?; r.done()?; Ok(out) }
 pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
+    let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?;
+    encode_metadata(&mut w,batch)?;
+    finish(w)
+}
+fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
     validate_commands(&batch.resources,&batch.commands)?;
-    let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?; count(&mut w,batch.pipelines.len())?;
+    count(w,batch.pipelines.len())?;
     let mut ids=HashSet::new();
     for p in &batch.pipelines {
         if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())}
@@ -253,7 +260,7 @@ pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
             }
         }
     }
-    count(&mut w,batch.commands.len())?;
+    count(w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
         Command::Draw(d) => {w.u32(if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
@@ -278,10 +285,13 @@ pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
         Command::SetStencilRef(value)=>{w.u32(6);w.u32(*value);},
         Command::ClearStencil {target,flags,depth,stencil}=>{w.u32(7);w.u64(*target);w.u32(*flags);w.u32(depth.to_bits());w.u32(u32::from(*stencil));},
         Command::CopyDepthStencil {src,dst,offset,pitch,width,height,plane,upload}=>{w.u32(8);w.u64(*src);w.u64(*dst);w.u64(*offset);for v in [*pitch,*width,*height,*plane,*upload as u32] {w.u32(v);}},
-    }} finish(w)
+    }} Ok(())
 }
 pub fn decode_batch(data:&[u8])->Result<Batch,String> {
     if data.len()>MAX_PAYLOAD {return Err("wire payload exceeds limit".into());} let mut r=Reader {data,pos:0}; let resources=read_resources(&mut r)?;
+    let batch=decode_metadata(&mut r,resources)?; r.done()?; Ok(batch)
+}
+fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,String> {
     let n=r.count()?;let mut pipelines=Vec::with_capacity(n);let mut ids=HashSet::new();
     for _ in 0..n {
         let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())}
@@ -339,12 +349,236 @@ pub fn decode_batch(data:&[u8])->Result<Batch,String> {
         7=>Command::ClearStencil {target:r.u64()?,flags:r.u32()?,depth:f32::from_bits(r.u32()?),stencil:u8::try_from(r.u32()?).map_err(|_|"invalid stencil clear")?},
         8=>Command::CopyDepthStencil {src:r.u64()?,dst:r.u64()?,offset:r.u64()?,pitch:r.u32()?,width:r.u32()?,height:r.u32()?,plane:r.u32()?,upload:r.boolean()?},
         _=>return Err("unknown wire command".into()),
-    }); } r.done()?;validate_commands(&resources,&commands)?;Ok(Batch {resources,pipelines,commands})
+    }); } validate_commands(&resources,&commands)?;Ok(Batch {resources,pipelines,commands})
+}
+
+// Version 9 consists of a resource table followed, for batches, by a
+// length-prefixed version-5 pipeline/command section. Resource contents occur
+// only once; the batch limit applies to their combined byte lengths.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+fn stream_add(total:&mut usize,n:usize)->Result<(),String> {
+    *total=total.checked_add(n).filter(|&v|v<=MAX_STREAM_BATCH)
+        .ok_or("stream batch exceeds limit")?;
+    Ok(())
+}
+
+fn stream_resource_size(rs:&[Resource])->Result<usize,String> {
+    if rs.len()>MAX_ITEMS {return Err("too many wire items".into())}
+    let mut total=0;
+    let mut ids=HashSet::new();
+    for r in rs {
+        if r.id==0 || !ids.insert(r.id) {return Err("duplicate or zero resource id".into())}
+        if r.bytes.len()>MAX_STREAM_RESOURCE {return Err("stream resource exceeds limit".into())}
+        validate_resource(r)?;
+        stream_add(&mut total,r.bytes.len())?;
+    }
+    Ok(total)
+}
+
+fn stream_write_resources<W:std::io::Write>(w:&mut W,rs:&[Resource])->Result<(),String> {
+    fn word<W:std::io::Write>(w:&mut W,n:u32)->Result<(),String> {
+        w.write_all(&n.to_le_bytes()).map_err(|e|e.to_string())
+    }
+    word(w,rs.len() as u32)?;
+    for r in rs {
+        w.write_all(&r.id.to_le_bytes()).map_err(|e|e.to_string())?;
+        word(w,r.state)?;
+        match r.kind {
+            ResourceKind::Buffer=>word(w,0)?,
+            ResourceKind::Texture {width,height,format,mips}=>{
+                word(w,1)?;
+                for v in [width,height,format,mips] {word(w,v)?;}
+            }
+        }
+        word(w,r.bytes.len() as u32)?;
+        for chunk in r.bytes.chunks(STREAM_CHUNK) {
+            w.write_all(chunk).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+struct StreamReader<'a,R> { input:&'a mut R, total:usize }
+impl<R:std::io::Read> StreamReader<'_,R> {
+    fn read(&mut self,bytes:&mut [u8])->Result<(),String> {
+        self.input.read_exact(bytes).map_err(|e|format!("stream read failed: {e}"))
+    }
+    fn u32(&mut self)->Result<u32,String> {
+        let mut b=[0;4]; self.read(&mut b)?; Ok(u32::from_le_bytes(b))
+    }
+    fn u64(&mut self)->Result<u64,String> {
+        let mut b=[0;8]; self.read(&mut b)?; Ok(u64::from_le_bytes(b))
+    }
+    fn resources(&mut self)->Result<Vec<Resource>,String> {
+        let n=self.u32()? as usize;
+        if n>MAX_ITEMS {return Err("too many wire items".into())}
+        let mut rs=Vec::with_capacity(n);
+        let mut ids=HashSet::new();
+        for _ in 0..n {
+            let id=self.u64()?;
+            if id==0 || !ids.insert(id) {return Err("duplicate or zero resource id".into())}
+            let state=self.u32()?;
+            let kind=match self.u32()? {
+                0=>ResourceKind::Buffer,
+                1=>ResourceKind::Texture {width:self.u32()?,height:self.u32()?,format:self.u32()?,mips:self.u32()?},
+                _=>return Err("unknown resource kind".into()),
+            };
+            let len=self.u32()? as usize;
+            if len>MAX_STREAM_RESOURCE {return Err("stream resource exceeds limit".into())}
+            if let ResourceKind::Texture {width,height,format,mips}=kind {
+                if texture_size(format,width,height,mips)!=Some(len) {
+                    return Err("invalid texture format, dimensions, mip count or byte length".into());
+                }
+            }
+            // Check the whole allocation against the remaining budget before allocating.
+            stream_add(&mut self.total,len)?;
+            let mut bytes=vec![0;len];
+            for chunk in bytes.chunks_mut(STREAM_CHUNK) {self.read(chunk)?;}
+            rs.push(Resource {id,state,kind,bytes});
+        }
+        Ok(rs)
+    }
+}
+
+/// Validates a streamed result before committing a response header.
+pub fn validate_stream_results(rs:&[Resource])->Result<(),String> {
+    stream_resource_size(rs).map(|_| ())
+}
+
+pub fn write_stream_results<W:std::io::Write>(w:&mut W,rs:&[Resource])->Result<(),String> {
+    validate_stream_results(rs)?;
+    stream_write_resources(w,rs)
+}
+
+pub fn read_stream_results<R:std::io::Read>(r:&mut R)->Result<Vec<Resource>,String> {
+    StreamReader {input:r,total:0}.resources()
+}
+
+pub fn write_stream_batch<W:std::io::Write>(w:&mut W,batch:&Batch)->Result<(),String> {
+    stream_resource_size(&batch.resources)?;
+    let mut metadata=Writer(Vec::new());
+    encode_metadata(&mut metadata,batch)?;
+    let metadata=finish(metadata)?;
+    stream_write_resources(w,&batch.resources)?;
+    w.write_all(&(metadata.len() as u32).to_le_bytes()).map_err(|e|e.to_string())?;
+    for chunk in metadata.chunks(STREAM_CHUNK) {w.write_all(chunk).map_err(|e|e.to_string())?;}
+    Ok(())
+}
+
+pub fn read_stream_batch<R:std::io::Read>(r:&mut R)->Result<Batch,String> {
+    let mut stream=StreamReader {input:r,total:0};
+    let resources=stream.resources()?;
+    let len=stream.u32()? as usize;
+    if len>MAX_PAYLOAD {
+        return Err("stream metadata exceeds limit".into());
+    }
+    let mut metadata=vec![0;len];
+    for chunk in metadata.chunks_mut(STREAM_CHUNK) {stream.read(chunk)?;}
+    let mut reader=Reader {data:&metadata,pos:0};
+    let batch=decode_metadata(&mut reader,resources)?;
+    reader.done()?;
+    Ok(batch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_large_batch_and_results() {
+        use std::os::unix::net::UnixStream;
+        let mut b=Batch {resources:Vec::new(),pipelines:vec![],commands:vec![]};
+        for id in 1..=4 {
+            b.resources.push(Resource {id,state:id as u32,kind:ResourceKind::Buffer,
+                bytes:vec![id as u8;17*1024*1024]});
+        }
+        b.commands.push(Command::CopyBuffer {src:1,dst:2,src_offset:0,dst_offset:0,size:8});
+        let (mut tx,mut rx)=UnixStream::pair().unwrap();
+        let decoded=std::thread::scope(|s| {
+            let writer=s.spawn(||write_stream_batch(&mut tx,&b).unwrap());
+            let decoded=read_stream_batch(&mut rx).unwrap();
+            writer.join().unwrap();
+            decoded
+        });
+        assert_eq!(decoded.resources.len(),4);
+        assert_eq!(decoded.resources[3].bytes.len(),17*1024*1024);
+        assert_eq!(decoded.resources[3].bytes[17*1024*1024-1],4);
+        assert!(matches!(decoded.commands[0],Command::CopyBuffer {src:1,dst:2,..}));
+        drop(b);
+        let (mut tx,mut rx)=UnixStream::pair().unwrap();
+        std::thread::scope(|s| {
+            let writer=s.spawn(||write_stream_results(&mut tx,&decoded.resources).unwrap());
+            let results=read_stream_results(&mut rx).unwrap();
+            writer.join().unwrap();
+            assert_eq!(results[0].bytes.len(),17*1024*1024);
+            assert_eq!(results[2].bytes[0],3);
+        });
+    }
+
+    #[test]
+    fn stream_rejects_malformed_and_truncated() {
+        let b=batch();
+        let mut wire=Vec::new();
+        write_stream_batch(&mut wire,&b).unwrap();
+        for end in 0..wire.len() {
+            assert!(read_stream_batch(&mut &wire[..end]).is_err(),"truncation at {end}");
+        }
+        let decoded=read_stream_batch(&mut &wire[..]).unwrap();
+        assert_eq!(decoded.resources[1].bytes,b.resources[1].bytes);
+        let mut invalid_metadata=wire.clone();
+        let metadata_start=4+20+4+36+4+4;
+        invalid_metadata[metadata_start+8..metadata_start+12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(read_stream_batch(&mut &invalid_metadata[..]).is_err());
+        let mut result=Vec::new();
+        write_stream_results(&mut result,&b.resources).unwrap();
+        for end in 0..result.len() {
+            assert!(read_stream_results(&mut &result[..end]).is_err(),"truncation at {end}");
+        }
+        let mut duplicate=result.clone();
+        duplicate[28..36].copy_from_slice(&1u64.to_le_bytes());
+        assert!(read_stream_results(&mut &duplicate[..]).is_err());
+        let mut unknown=result.clone();
+        unknown[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert!(read_stream_results(&mut &unknown[..]).is_err());
+        let mut bad_texture=result.clone();
+        bad_texture[52..56].copy_from_slice(&70u32.to_le_bytes());
+        assert!(read_stream_results(&mut &bad_texture[..]).is_err());
+        let mut duplicate_batch=batch();
+        duplicate_batch.resources[1].id=1;
+        assert!(write_stream_batch(&mut Vec::new(),&duplicate_batch).is_err());
+        let mut bad_command=batch();
+        bad_command.commands.push(Command::CopyTexture(CopyTexture {src:1,dst:2,offset:0,pitch:4,width:1,height:1,format:28,mip:1,buffer_to_texture:true}));
+        assert!(write_stream_batch(&mut Vec::new(),&bad_command).is_err());
+    }
+
+    #[test]
+    fn stream_limits_checked_before_allocation() {
+        let mut total=MAX_STREAM_BATCH;
+        assert!(stream_add(&mut total,1).is_err());
+        let mut total=usize::MAX;
+        assert!(stream_add(&mut total,1).is_err());
+        let mut oversized=Vec::new();
+        oversized.extend_from_slice(&1u32.to_le_bytes());
+        oversized.extend_from_slice(&1u64.to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        oversized.extend_from_slice(&((MAX_STREAM_RESOURCE+1) as u32).to_le_bytes());
+        assert!(read_stream_results(&mut &oversized[..]).is_err());
+        let mut aggregate=oversized.clone();
+        aggregate[20..24].copy_from_slice(&2u32.to_le_bytes());
+        let mut input=&aggregate[..];
+        let mut reader=StreamReader {input:&mut input,total:MAX_STREAM_BATCH-1};
+        assert!(reader.resources().unwrap_err().contains("batch exceeds"));
+        let mut count=Vec::new();
+        count.extend_from_slice(&((MAX_ITEMS+1) as u32).to_le_bytes());
+        assert!(read_stream_results(&mut &count[..]).is_err());
+        let mut bad_metadata=Vec::new();
+        bad_metadata.extend_from_slice(&0u32.to_le_bytes());
+        bad_metadata.extend_from_slice(&((MAX_PAYLOAD+1) as u32).to_le_bytes());
+        assert!(read_stream_batch(&mut &bad_metadata[..]).is_err());
+    }
 
     #[test]
     fn blend_wire_legacy_and_extended() {
