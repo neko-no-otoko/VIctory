@@ -13,6 +13,7 @@ victory-loader.workspace = true
 victory-pe.workspace = true
 victory-formats.workspace = true
 victory-xg = { path = "../victory-xg" }
+victory-runtime = { path = "../victory-runtime" }
 opus-pure.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true

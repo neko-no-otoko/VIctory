@@ -4,7 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -31,12 +31,6 @@ pub const ANALYTICS: Guid = Guid::new(
     [0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b],
 );
 
-/// 38 characters (39 bytes with the NUL).
-const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
-/// The retail sandbox.
-const SANDBOX: &str = "RETAIL";
-/// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
-const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
 pub static OBJECT: Object = Object::new("system", &VTABLE);
 pub static ANALYTICS_OBJECT: Object = Object::new("analytics", &ANALYTICS_VTABLE);
@@ -59,14 +53,14 @@ pub const INTERFACES: &[Interface] = &[
 type This = *const Object;
 
 extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(CONSOLE_ID, size, buffer, used)
+    unsafe { victory_runtime::system_string(victory_runtime::SystemString::ConsoleId, size, buffer, used) }
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(SANDBOX, size, buffer, used)
+    unsafe { victory_runtime::system_string(victory_runtime::SystemString::SandboxId, size, buffer, used) }
 }
 /// The device id this title sees (titles see different ones).
 extern "system" fn device_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(DEVICE_ID, size, buffer, used)
+    unsafe { victory_runtime::system_string(victory_runtime::SystemString::DeviceId, size, buffer, used) }
 }
 
 #[repr(C)]

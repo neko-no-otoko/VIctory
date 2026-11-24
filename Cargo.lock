@@ -726,6 +726,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-runtime",
  "victory-xg",
  "windows",
  "windows-core",
@@ -773,6 +774,15 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-core",
+]
+
+[[package]]
+name = "victory-runtime"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "victory-loader",
+ "victory-pe",
 ]
 
 [[package]]

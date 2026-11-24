@@ -40,6 +40,15 @@ It checks texture decisions, null-pointer errors, a texture-computer layout,
 tile/detile round trip, an unsupported slot, and reference-counted release
 through PE imports under Rosetta, without game data.
 
+Separately, `victory_runtime::NativeResolver` exposes only
+`xgameruntime.dll!QueryApiImpl` for the two upstream XSystem interface IDs.
+The returned Windows-ABI object supports the upstream offline console ID,
+sandbox ID and device ID string methods. Other provider/interface pairs and
+all other imports remain unsupported. Its strings and buffer-error behavior
+are shared with the Windows implementation; this is not the full runtime.
+Run its synthetic PE test with
+`cargo test -p victory-runtime --target x86_64-apple-darwin --test native_guest`.
+
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls
 the executable's actual entry RVA, and detaches the DLLs if that call returns.
