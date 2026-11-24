@@ -236,21 +236,25 @@ fn wine_z_path(path: &Path) -> String {
 fn launcher_runs_real_provider_tls_and_metal_compute() {
     let f = Fixture::new();
     let exe = f.build();
-    let host = f.tracked_host();
-    let mut cmd = f.command(&exe, &host);
-    for (name, dll) in [("VICTORY_EXPECT_D3D12X_DLL", "d3d12_xs.dll"),
-        ("VICTORY_EXPECT_XG_DLL", "xg_xs.dll"), ("VICTORY_EXPECT_RUNTIME_DLL", "xgameruntime.dll")] {
-        cmd.env(name, f.winepath(&f.dll_dir.join(dll)));
+    for model in ["series-x", "series-s"] {
+        let host = f.tracked_host();
+        let mut cmd = f.command(&exe, &host);
+        for (name, dll) in [("VICTORY_EXPECT_D3D12X_DLL", "d3d12_xs.dll"),
+            ("VICTORY_EXPECT_XG_DLL", "xg_xs.dll"), ("VICTORY_EXPECT_RUNTIME_DLL", "xgameruntime.dll")] {
+            cmd.env(name, f.winepath(&f.dll_dir.join(dll)));
+        }
+        cmd.args(["--console", model]).env("VICTORY_TEST_EXPECT_CONSOLE", model);
+        cmd.arg("--").args(["argument with spaces", "--guest-option"]);
+        let out = run(&mut cmd, f.temp.path());
+        assert_eq!(out.status.code(), Some(42), "{model}: {}\n{}", out.stdout, out.stderr);
+        for marker in ["D3D12X DLL identity and launcher environment passed", "Provider DLL identities and exports passed",
+            "XG texture computer lifetime passed", "XSystem and XUser providers passed",
+            "Provider threads and static TLS callbacks passed", "Proxy DXGI model and COM lifetime passed",
+            "D3D12X synthetic compute readback 42"] {
+            assert!(out.stdout.contains(marker), "missing {marker}\n{}\n{}", out.stdout, out.stderr);
+        }
+        f.assert_host_gone();
     }
-    cmd.arg("--").args(["argument with spaces", "--guest-option"]);
-    let out = run(&mut cmd, f.temp.path());
-    assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
-    for marker in ["D3D12X DLL identity and launcher environment passed", "Provider DLL identities and exports passed",
-        "XG texture computer lifetime passed", "XSystem and XUser providers passed",
-        "Provider threads and static TLS callbacks passed", "D3D12X synthetic compute readback 42"] {
-        assert!(out.stdout.contains(marker), "missing {marker}\n{}\n{}", out.stdout, out.stderr);
-    }
-    f.assert_host_gone();
 }
 
 #[test]

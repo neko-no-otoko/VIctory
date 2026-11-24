@@ -87,7 +87,8 @@ pub(crate) fn device() -> This {
 
 /// `found` if `iid` is one of `known`.
 fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
-    object::answer(kind, iid, object::is(iid, known).then_some(found), out)
+    const UNKNOWN: Iid = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+    object::answer(kind, iid, (object::is(iid, known) || object::is(iid, &[UNKNOWN])).then_some(found), out)
 }
 
 /// The DXGI device also answers for the D3D12 device.
@@ -97,10 +98,10 @@ extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> 
     }
     query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out)
 }
-extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+pub(crate) extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(DXGI_DEVICE, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
 }
-extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
+pub(crate) extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
     object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
 

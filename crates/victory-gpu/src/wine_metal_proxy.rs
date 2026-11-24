@@ -72,6 +72,7 @@ fn config() -> Result<Config, String> {
 struct Header {
     object: Object,
     inline: [u64; 180],
+    dxgi: Object,
 }
 struct Entry {
     refs: u32,
@@ -307,6 +308,7 @@ fn trap(message: &str) -> ! {
 }
 fn supports(data: &Data, expected: Iid, iid: &Iid) -> bool {
     *iid == expected || *iid == UNKNOWN || (expected == LIST && *iid == GRAPHICS_LIST)
+        || (matches!(data, Data::Device(_)) && crate::dxgi::DEVICE_IIDS.contains(iid))
         || (matches!(data, Data::Device(c) if c.newer) && *iid == DEVICE11)
         || (matches!(data, Data::List(_, true)) && NEWER_LIST_IIDS.contains(iid))
         || (matches!(data, Data::Fence(_)) && crate::fence::FENCE_IIDS.contains(iid))
@@ -321,7 +323,7 @@ fn new(data: Data, table: &'static Table<160>, iid: *const Iid, expected: Iid, o
             return E_NOINTERFACE;
         }
     }
-    let mut header = Box::new(Header { object: Object::new(table), inline: [0; 180] });
+    let mut header = Box::new(Header { object: Object::new(table), inline: [0; 180], dxgi: Object::new(&DXGI_DEVICE_TABLE) });
     match &data {
         Data::Device(_) => header.inline[1] = 1,
         Data::Queue(queue) => header.inline[0] = u64::from(queue.kind),
@@ -333,13 +335,22 @@ fn new(data: Data, table: &'static Table<160>, iid: *const Iid, expected: Iid, o
     unsafe { *out = ptr; }
     S_OK
 }
+// The DXGI interface is embedded in its device allocation and shares the
+// controlling IUnknown and reference count. No child may outlive that count.
+fn object_key(map: &HashMap<usize, Entry>, this: This) -> Option<usize> {
+    let address = this as usize;
+    if map.contains_key(&address) { return Some(address); }
+    let device = address.checked_sub(std::mem::offset_of!(Header, dxgi))?;
+    map.get(&device).filter(|entry| matches!(entry.data, Data::Device(_))).map(|_| device)
+}
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if iid.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     unsafe { *out = std::ptr::null(); }
     let mut map = objects().lock().unwrap();
-    let Some(entry) = map.get_mut(&(this as usize)) else {
+    let Some(key) = object_key(&map, this) else { return E_INVALIDARG; };
+    let Some(entry) = map.get_mut(&key) else {
         return E_INVALIDARG;
     };
     let expected = match &entry.data {
@@ -359,23 +370,31 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         return E_NOINTERFACE;
     }
     entry.refs = entry.refs.checked_add(1).unwrap_or_else(|| trap("reference overflow"));
-    unsafe { *out = this; }
+    unsafe {
+        *out = if matches!(entry.data, Data::Device(_)) && crate::dxgi::DEVICE_IIDS.contains(&*iid) {
+            (key + std::mem::offset_of!(Header, dxgi)) as This
+        } else {
+            key as This
+        };
+    }
     S_OK
 }
 extern "system" fn add_ref(this: This) -> u32 {
     let mut m = objects().lock().unwrap();
-    let e = m.get_mut(&(this as usize)).unwrap_or_else(|| trap("invalid AddRef"));
+    let key = object_key(&m, this).unwrap_or_else(|| trap("invalid AddRef"));
+    let e = m.get_mut(&key).unwrap_or_else(|| trap("invalid AddRef"));
     e.refs = e.refs.checked_add(1).unwrap_or_else(|| trap("reference overflow"));
     e.refs
 }
 extern "system" fn release(this: This) -> u32 {
     let mut m = objects().lock().unwrap();
-    let e = m.get_mut(&(this as usize)).unwrap_or_else(|| trap("invalid Release"));
+    let key = object_key(&m, this).unwrap_or_else(|| trap("invalid Release"));
+    let e = m.get_mut(&key).unwrap_or_else(|| trap("invalid Release"));
     e.refs -= 1;
     let n = e.refs;
     if n == 0 {
-        m.remove(&(this as usize));
-        unsafe { drop(Box::from_raw(this as *mut Header)); }
+        m.remove(&key);
+        unsafe { drop(Box::from_raw(key as *mut Header)); }
     }
     n
 }
@@ -389,6 +408,12 @@ const fn base() -> [*const (); 160] {
     t[2] = release as *const ();
     t
 }
+static DXGI_DEVICE_TABLE: Table<160> = {
+    let mut t = base();
+    t[6] = crate::dxgi::device_parent as *const ();
+    t[7] = crate::dxgi::device_adapter as *const ();
+    Table(t)
+};
 static DEVICE_TABLE: Table<160> = {
     let mut t = base();
     t[8] = create_queue as *const ();

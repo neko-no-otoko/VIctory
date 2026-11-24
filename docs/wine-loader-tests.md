@@ -1194,8 +1194,8 @@ not an Xbox export.
 process, including title-provider relaunches, overriding an inherited
 `VICTORY_WINE_CONSOLE`. Independently linked XGameRuntime, XMem backend and
 D3D12.X copies initialize from that setting. XSystem analytics reports the
-selected Xbox name; the local D3D12.X HLE's DXGI adapter description reports
-the same memory split. XMem reports Series X's 10 GiB GPU-optimal plus 3.5 GiB
+selected Xbox name; the local D3D12.X HLE and Wine Metal proxy's DXGI adapter
+description report the same memory split. XMem reports Series X's 10 GiB GPU-optimal plus 3.5 GiB
 standard budget or Series S's 7,776 MiB standard budget; transfers reduce the
 standard portion in 2 MiB increments and reset for a new process.
 
@@ -1233,6 +1233,13 @@ Metal launcher compute regression. The XMem guest checks default, explicit X
 and S analytics and local DXGI budgets, transfer boundaries and invalid CLI
 selection. The relaunch guest checks S analytics and a fresh S XMem budget in
 both processes. The DXGI check uses the local HLE path, not the Metal proxy.
+
+The real Metal launcher regression also queries all three upstream DXGI device
+IIDs on the proxy for Series X and S, checks the adapter's model-specific
+memory description and COM identity/lifetime, then executes Metal compute
+and reads back its result. The proxy retains the device while its DXGI
+interface is referenced; the adapter uses the existing upstream static object.
+This does not extend the proxy's other DXGI or graphics capabilities.
 
 ## Normal Wine AcpHal HLE DLL
 
