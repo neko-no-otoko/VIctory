@@ -23,16 +23,27 @@ impl fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
-/// Byte layout of an unorm color image; shader values remain logical RGBA.
+/// Byte layout and transfer function of a color image; shader values are logical RGBA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorFormat {
     Rgba8,
     Bgra8,
+    Rgba8Srgb,
+    Bgra8Srgb,
 }
 
 impl ColorFormat {
     fn is_bgra(self) -> bool {
-        matches!(self, Self::Bgra8)
+        matches!(self, Self::Bgra8 | Self::Bgra8Srgb)
+    }
+
+    fn native_value(self) -> u32 {
+        match self {
+            Self::Rgba8 => 0,
+            Self::Bgra8 => 1,
+            Self::Rgba8Srgb => 4,
+            Self::Bgra8Srgb => 5,
+        }
     }
 }
 /// Sampled texture encoding; BC formats contain native compressed blocks.
@@ -42,6 +53,10 @@ pub enum TextureFormat {
     Bgra8,
     Bc1,
     Bc3,
+    Rgba8Srgb,
+    Bgra8Srgb,
+    Bc1Srgb,
+    Bc3Srgb,
 }
 
 impl From<ColorFormat> for TextureFormat {
@@ -49,6 +64,8 @@ impl From<ColorFormat> for TextureFormat {
         match format {
             ColorFormat::Rgba8 => Self::Rgba8,
             ColorFormat::Bgra8 => Self::Bgra8,
+            ColorFormat::Rgba8Srgb => Self::Rgba8Srgb,
+            ColorFormat::Bgra8Srgb => Self::Bgra8Srgb,
         }
     }
 }
@@ -60,6 +77,10 @@ impl TextureFormat {
             Self::Bgra8 => 1,
             Self::Bc1 => 2,
             Self::Bc3 => 3,
+            Self::Rgba8Srgb => 4,
+            Self::Bgra8Srgb => 5,
+            Self::Bc1Srgb => 6,
+            Self::Bc3Srgb => 7,
         }
     }
 }
@@ -84,7 +105,7 @@ unsafe extern "C" {
         write_mask: u8,
         alpha_source: bool,
         vertex_uv: bool,
-        bgra: bool,
+        format: u32,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -139,6 +160,11 @@ unsafe extern "C" {
         bgra: bool,
         error: *mut c_char,
         error_len: usize,
+    ) -> bool;
+    fn victory_metal_clear_float(
+        width: u32, height: u32, pitch: usize, pixels: *mut u8,
+        color: *const f32, rects: *const [u32; 4], count: usize,
+        format: u32, error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_depth_pixels(renderer: *mut c_void, pixels: *mut f32, upload: bool,
                                   error: *mut c_char, error_len: usize) -> bool;
@@ -200,6 +226,33 @@ pub fn clear_color8(
     };
     if ok { Ok(()) } else { Err(native_error(&error)) }
 }
+
+/// Clear with linear RGBA floats using a Metal render target of `format`.
+/// sRGB targets encode RGB on store; alpha remains linear. Rectangles are
+/// [left, top, right, bottom], in bounds, and an empty list clears the image.
+/// Pixels outside rectangles and row padding are preserved as raw bytes.
+pub fn clear_color_float(
+    format: ColorFormat, width: u32, height: u32, pitch: usize, pixels: &mut [u8],
+    color: [f32; 4], rects: &[[u32; 4]],
+) -> Result<(), RenderError> {
+    let row = (width as usize).checked_mul(4);
+    let len = height.checked_sub(1).and_then(|h| pitch.checked_mul(h as usize))
+        .and_then(|n| row.and_then(|r| n.checked_add(r)));
+    if width == 0 || height == 0 || row.is_none_or(|r| pitch < r)
+        || len.is_none_or(|n| pixels.len() < n)
+        || rects.iter().any(|r| r[0] > r[2] || r[1] > r[3] || r[2] > width || r[3] > height)
+    {
+        return Err(RenderError("invalid RGBA8 clear dimensions or rectangle".into()));
+    }
+    let mut error = [0 as c_char; 1024];
+    // SAFETY: all slices are validated and remain live for the synchronous call.
+    let ok = unsafe {
+        victory_metal_clear_float(width, height, pitch, pixels.as_mut_ptr(), color.as_ptr(),
+                                  rects.as_ptr(), rects.len(), format.native_value(),
+                                  error.as_mut_ptr(), error.len())
+    };
+    if ok { Ok(()) } else { Err(native_error(&error)) }
+}
 /// Clear a Depth32Float image on the GPU, preserving pixels outside the rectangles and padding.
 pub fn clear_depth32(width: u32, height: u32, pitch: usize, pixels: &mut [u8],
                      value: f32, rects: &[[u32; 4]]) -> Result<(), RenderError> {
@@ -235,7 +288,7 @@ pub struct BlendState {
 }
 
 
-/// A persistent Metal pipeline and RGBA8Unorm or BGRA8Unorm offscreen target.
+/// A persistent Metal pipeline and RGBA8/BGRA8 unorm or sRGB offscreen target.
 ///
 /// Both metallibs must be produced by Apple Metal Shader Converter. Metal
 /// attribute 11 is a per-vertex float4 at buffer slot 6, offset 0. The UV
@@ -392,7 +445,7 @@ impl Renderer {
                 blend.write_mask,
                 blend.alpha_source,
                 vertex_uv,
-                format.is_bgra(),
+                format.native_value(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -508,9 +561,9 @@ impl Renderer {
         let (mut w, mut h, mut size) = (width, height, 0usize);
         for _ in 0..levels {
             let (columns, rows, bytes_per_block) = match format {
-                TextureFormat::Rgba8 | TextureFormat::Bgra8 => (w as usize, h as usize, 4),
-                TextureFormat::Bc1 => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 8),
-                TextureFormat::Bc3 => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 16),
+                TextureFormat::Rgba8 | TextureFormat::Bgra8 | TextureFormat::Rgba8Srgb | TextureFormat::Bgra8Srgb => (w as usize, h as usize, 4),
+                TextureFormat::Bc1 | TextureFormat::Bc1Srgb => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 8),
+                TextureFormat::Bc3 | TextureFormat::Bc3Srgb => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 16),
             };
             size = columns.checked_mul(rows)
                 .and_then(|n| n.checked_mul(bytes_per_block))

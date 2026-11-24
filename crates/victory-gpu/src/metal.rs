@@ -141,7 +141,9 @@ const COPY_SOURCE: u32 = 0x800;
 fn color_format(resource: This) -> Option<victory_metal::ColorFormat> {
     match crate::resource::metal_color_format(resource)? {
         28 => Some(victory_metal::ColorFormat::Rgba8),
+        29 => Some(victory_metal::ColorFormat::Rgba8Srgb),
         87 => Some(victory_metal::ColorFormat::Bgra8),
+        91 => Some(victory_metal::ColorFormat::Bgra8Srgb),
         _ => None,
     }
 }
@@ -149,9 +151,13 @@ fn color_format(resource: This) -> Option<victory_metal::ColorFormat> {
 fn sampled_format(resource: This) -> Option<victory_metal::TextureFormat> {
     match crate::resource::metal_sampled_format(resource)? {
         28 => Some(victory_metal::TextureFormat::Rgba8),
+        29 => Some(victory_metal::TextureFormat::Rgba8Srgb),
         87 => Some(victory_metal::TextureFormat::Bgra8),
+        91 => Some(victory_metal::TextureFormat::Bgra8Srgb),
         71 => Some(victory_metal::TextureFormat::Bc1),
+        72 => Some(victory_metal::TextureFormat::Bc1Srgb),
         77 => Some(victory_metal::TextureFormat::Bc3),
+        78 => Some(victory_metal::TextureFormat::Bc3Srgb),
         _ => None,
     }
 }
@@ -335,7 +341,7 @@ enum Root {
 enum Command {
     ClearTarget {
         target: ResourceRef,
-        color: [u8; 4],
+        color: [f32; 4],
         rects: Vec<[u32; 4]>,
     },
     ClearDepth {
@@ -666,12 +672,9 @@ impl State {
                 ]
             })
             .collect();
-        // FLOAT to UNORM: NaN becomes zero; finite and infinite values clamp,
-        // then round to nearest, with halfway values rounded up.
-        let color = color.map(|c| {
-            let c = if c.is_nan() { 0.0 } else { c.clamp(0.0, 1.0) };
-            (c * 255.0 + 0.5) as u8
-        });
+        // Clamp clear values without quantizing: sRGB conversion happens on
+        // the Metal attachment and must see the original linear precision.
+        let color = color.map(|c| if c.is_nan() { 0.0 } else { c.clamp(0.0, 1.0) });
         self.use_state(rtv.resource, RENDER_TARGET)?;
         self.commands.push(Command::ClearTarget {
             target: ResourceRef::new(rtv.resource),
@@ -1186,7 +1189,7 @@ impl State {
                     // SAFETY: the retained linear texture contains all rows of
                     // its validated RGBA8 layout, including inter-row padding.
                     let pixels = unsafe { std::slice::from_raw_parts_mut(texture, len) };
-                    victory_metal::clear_color8(color_format(target.ptr()).ok_or("invalid color format")?, width, height, pitch, pixels, *color, rects)
+                    victory_metal::clear_color_float(color_format(target.ptr()).ok_or("invalid color format")?, width, height, pitch, pixels, *color, rects)
                         .map_err(|e| e.to_string())?;
                 }
                 Command::ClearDepth { target, depth, rects } => {

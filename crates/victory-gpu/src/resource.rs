@@ -1027,13 +1027,13 @@ pub(crate) fn metal_sampled_copy_mips(
 #[cfg(target_os = "macos")]
 fn sampled_desc(d: &ResourceDesc) -> bool {
     // Default 4KB_S, linear, explicit 4KB_S, and explicit 64KB_D.
-    d.dimension == 3 && matches!(d.format, 28 | 87 | 71 | 77) && d.depth_or_array_size == 1
+    d.dimension == 3 && matches!(d.format, 28 | 29 | 87 | 91 | 71 | 72 | 77 | 78) && d.depth_or_array_size == 1
         && d.sample_count == 1 && d.sample_quality == 0 && matches!(d.layout, 0 | 1 | 0x105 | 0x10a) && d.flags == 0
 }
 
 #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
 fn native_multimip_sampled(d: &ResourceDesc) -> bool {
-    d.dimension != BUFFER && matches!(d.format, 28 | 87) && d.flags == 0 && d.mip_levels > 1
+    d.dimension != BUFFER && matches!(d.format, 28 | 29 | 87 | 91) && d.flags == 0 && d.mip_levels > 1
 }
 
 #[cfg(target_os = "macos")]
@@ -1052,9 +1052,9 @@ fn sampled_dimensions(d: &ResourceDesc, mip: u32) -> Option<(u32, u32)> {
 #[cfg(target_os = "macos")]
 fn sampled_rows(format: u32, width: u32, height: u32) -> Option<(usize, usize)> {
     let (bytes, block) = match format {
-        28 | 87 => (4usize, 1u32),
-        71 => (8, 4),
-        77 => (16, 4),
+        28 | 29 | 87 | 91 => (4usize, 1u32),
+        71 | 72 => (8, 4),
+        77 | 78 => (16, 4),
         _ => return None,
     };
     let columns = width.div_ceil(block);
@@ -1088,7 +1088,7 @@ pub(crate) fn metal_color_format(this: This) -> Option<u32> {
         return None;
     }
     let format = resource(this).desc.format;
-    matches!(format, 28 | 87).then_some(format)
+    matches!(format, 28 | 29 | 87 | 91).then_some(format)
 }
 
 #[cfg(target_os = "macos")]
@@ -1097,7 +1097,7 @@ pub(crate) fn metal_sampled_format(this: This) -> Option<u32> {
         return None;
     }
     let format = resource(this).desc.format;
-    matches!(format, 28 | 87 | 71 | 77).then_some(format)
+    matches!(format, 28 | 29 | 87 | 91 | 71 | 72 | 77 | 78).then_some(format)
 }
 
 #[cfg(target_os = "macos")]
@@ -1298,7 +1298,7 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if desc.dimension != 1 && !matches!(desc.format, 28 | 40 | 87 | 71 | 77) {
+    if desc.dimension != 1 && !matches!(desc.format, 28 | 29 | 40 | 87 | 91 | 71 | 72 | 77 | 78) {
         // Unsupported texture formats must not produce a usable native guest resource.
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
@@ -1306,9 +1306,9 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     }
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if (desc.dimension != BUFFER && matches!(desc.format, 71 | 77)
+    if (desc.dimension != BUFFER && matches!(desc.format, 71 | 72 | 77 | 78)
         || native_multimip_sampled(&desc)
-        || (desc.dimension != BUFFER && matches!(desc.format, 28 | 87)
+        || (desc.dimension != BUFFER && matches!(desc.format, 28 | 29 | 87 | 91)
             && desc.flags == 0 && desc.layout != 1))
         && (heap.kind != 1 || !sampled_desc(&desc))
     {
@@ -1349,7 +1349,7 @@ pub(crate) extern "system" fn create_committed(
         AllocationInfo { size: info.size.max(size), ..info }
     } else if heap.kind == 1
         && desc.dimension == 3
-        && ((desc.format == 40 && desc.flags == 2) || (desc.format == 87 && matches!(desc.flags, 0 | 1)))
+        && ((desc.format == 40 && desc.flags == 2) || (matches!(desc.format, 28 | 29 | 87 | 91) && matches!(desc.flags, 0 | 1)))
         && desc.width != 0
         && desc.height != 0
         && desc.depth_or_array_size == 1
@@ -1475,7 +1475,7 @@ pub(crate) extern "system" fn create_at_address(
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
     if native_multimip_sampled(&desc)
-        || (desc.dimension != BUFFER && matches!(desc.format, 71 | 77))
+        || (desc.dimension != BUFFER && matches!(desc.format, 27 | 90 | 70 | 76 | 71 | 72 | 77 | 78))
     {
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
@@ -1569,7 +1569,7 @@ pub(crate) extern "system" fn create_placed(
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
     if native_multimip_sampled(&desc)
-        || (desc.dimension != BUFFER && matches!(desc.format, 71 | 77))
+        || (desc.dimension != BUFFER && matches!(desc.format, 27 | 90 | 70 | 76 | 71 | 72 | 77 | 78))
     {
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };

@@ -8,6 +8,16 @@ static bool fail(char *dst, size_t len, NSString *message) {
     if (len) snprintf(dst, len, "%s", message.UTF8String ?: "Metal error");
     return false;
 }
+
+static MTLPixelFormat colorPixelFormat(uint32_t format) {
+    switch (format) {
+        case 0: return MTLPixelFormatRGBA8Unorm;
+        case 1: return MTLPixelFormatBGRA8Unorm;
+        case 4: return MTLPixelFormatRGBA8Unorm_sRGB;
+        case 5: return MTLPixelFormatBGRA8Unorm_sRGB;
+        default: return MTLPixelFormatInvalid;
+    }
+}
 // The console backend stores texture contents in linear guest memory. Upload,
 // clear on a real Metal texture, and copy back synchronously so that clears,
 // draws and readbacks remain ordered in its existing submission pipeline.
@@ -79,6 +89,86 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
     }
 }
 
+bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, uint8_t *pixels,
+                               const float *color, const uint32_t (*rects)[4], size_t count,
+                               uint32_t format, char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        MTLPixelFormat pixelFormat = colorPixelFormat(format);
+        if (pixelFormat == MTLPixelFormatInvalid) return fail(error, error_len, @"invalid color format");
+        static id<MTLDevice> device;
+        static id<MTLCommandQueue> queue;
+        static id<MTLLibrary> library;
+        static NSString *setupError;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            device = MTLCreateSystemDefaultDevice();
+            if (!device) { setupError = @"no Metal device"; return; }
+            NSError *e = nil;
+            NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                "vertex float4 clear_vertex(uint id [[vertex_id]]) { "
+                "float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)}; "
+                "return float4(p[id], 0, 1); } "
+                "fragment float4 clear_fragment(constant float4 &color [[buffer(0)]]) { return color; }";
+            library = [device newLibraryWithSource:source options:nil error:&e];
+            queue = [device newCommandQueue];
+            if (!library || !queue) setupError = e.localizedDescription ?: @"clear pipeline setup failed";
+        });
+        if (setupError) return fail(error, error_len, setupError);
+        static dispatch_once_t pipelineOnce[6];
+        static id<MTLRenderPipelineState> pipelines[6];
+        static NSString *pipelineErrors[6];
+        dispatch_once(&pipelineOnce[format], ^{
+            NSError *e = nil;
+            MTLRenderPipelineDescriptor *pipelineDesc = [MTLRenderPipelineDescriptor new];
+            pipelineDesc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            pipelineDesc.fragmentFunction = [library newFunctionWithName:@"clear_fragment"];
+            pipelineDesc.colorAttachments[0].pixelFormat = pixelFormat;
+            pipelines[format] = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&e];
+            if (!pipelines[format])
+                pipelineErrors[format] = e.localizedDescription ?: @"clear pipeline creation failed";
+        });
+        id<MTLRenderPipelineState> pipeline = pipelines[format];
+        if (!pipeline) return fail(error, error_len, pipelineErrors[format]);
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                       width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+        if (!texture) return fail(error, error_len, @"clear texture allocation failed");
+        size_t row = (size_t)width * 4;
+        for (uint32_t y = 0; y < height; ++y)
+            [texture replaceRegion:MTLRegionMake2D(0, y, width, 1) mipmapLevel:0
+                         withBytes:pixels + (size_t)y * pitch bytesPerRow:row];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+        if (!command || !encoder) return fail(error, error_len, @"clear command creation failed");
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setFragmentBytes:color length:4 * sizeof(float) atIndex:0];
+        const uint32_t full[4] = {0, 0, width, height};
+        for (size_t i = 0; i < (count ? count : 1); ++i) {
+            const uint32_t *rect = count ? rects[i] : full;
+            uint32_t w = rect[2] - rect[0], h = rect[3] - rect[1];
+            if (!w || !h) continue;
+            [encoder setScissorRect:(MTLScissorRect){rect[0], rect[1], w, h}];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return fail(error, error_len, command.error.localizedDescription ?: @"GPU clear failed");
+        for (uint32_t y = 0; y < height; ++y)
+            [texture getBytes:pixels + (size_t)y * pitch bytesPerRow:row
+                   fromRegion:MTLRegionMake2D(0, y, width, 1) mipmapLevel:0];
+        return true;
+    }
+}
+
 
 @interface VictoryMetalRenderer : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
@@ -123,7 +213,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
                            bool blend_enabled, uint8_t write_mask, bool alpha_source,
-                           bool vertex_uv, bool bgra, char *error, size_t error_len) {
+                           bool vertex_uv, uint32_t format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -157,7 +247,8 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         desc.vertexFunction = vertex;
         desc.fragmentFunction = fragment;
         desc.vertexDescriptor = layout;
-        MTLPixelFormat colorFormat = bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+        MTLPixelFormat colorFormat = colorPixelFormat(format);
+        if (colorFormat == MTLPixelFormatInvalid) FAIL(@"invalid color format");
         desc.colorAttachments[0].pixelFormat = colorFormat;
         MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[0];
         color.writeMask = ((write_mask & 1) ? MTLColorWriteMaskRed : 0)
@@ -361,6 +452,10 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, ui
             case 1: format = MTLPixelFormatBGRA8Unorm; blockBytes = 0; break;
             case 2: format = MTLPixelFormatBC1_RGBA; blockBytes = 8; break;
             case 3: format = MTLPixelFormatBC3_RGBA; blockBytes = 16; break;
+            case 4: format = MTLPixelFormatRGBA8Unorm_sRGB; blockBytes = 0; break;
+            case 5: format = MTLPixelFormatBGRA8Unorm_sRGB; blockBytes = 0; break;
+            case 6: format = MTLPixelFormatBC1_RGBA_sRGB; blockBytes = 8; break;
+            case 7: format = MTLPixelFormatBC3_RGBA_sRGB; blockBytes = 16; break;
             default: return fail(error, error_len, @"invalid sampled texture format");
         }
         if (blockBytes && ![r.device supportsBCTextureCompression])

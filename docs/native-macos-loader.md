@@ -130,8 +130,8 @@ offset. Other layouts, varying semantics, masks, flat or packed interpolation,
 and mismatched signatures are rejected. Synthetic fixtures verify
 perspective-correct sampling, including independent UV input on indexed and
 nonindexed draws, and exercise layout, stride, and linkage rejection.
-The native color path supports committed, linear single-mip RGBA8_UNORM and
-BGRA8_UNORM 2D render targets, and sampled 2D textures with one or more valid
+The native color path supports committed, linear single-mip RGBA8 and BGRA8
+UNORM or UNORM_SRGB 2D render targets, and sampled 2D textures with valid
 mips. Sampled textures use one array slice and sample. Linear textures map each
 subresource with a 256-byte-aligned row pitch and a 512-byte-aligned start.
 Tiled textures support console GFX10 `SW_4KB_S` (layout 0 default or `0x105`
@@ -140,13 +140,13 @@ complete tiled allocation, including its shared mip tail; other tiled
 subresource maps are rejected. Each selected mip is detiled from the retained
 allocation before Metal upload, using the console texture layout. Pipe/bank XOR
 layouts, including `SW_64KB_R_X`, are not addressable and are rejected.
-Sampled textures additionally support BC1_UNORM and BC3_UNORM as compressed
+Sampled textures additionally support BC1 and BC3 UNORM or UNORM_SRGB as compressed
 4×4 blocks in the same linear or supported tiled layouts. Linear mapped rows
 are 256-byte aligned in blocks, and partial mip edges occupy whole blocks.
 Metal's `supportsBCTextureCompression` is queried before upload; devices
 without native BC support reject the draw rather than decoding or substituting
 data. The tested Apple M3 Max reports native BC support under Rosetta.
-BC typeless, sRGB and other compressed formats are rejected.
+BC typeless and other compressed formats are rejected.
 Render-target formats must match their pipeline and copy footprint; explicit
 views must match their resource, and default views are also supported. 2D SRVs
 require identity component mapping, zero plane and resource LOD clamp, and a
@@ -156,9 +156,12 @@ nearest or linear mip filter, zero bias and finite nonnegative ordered LOD clamp
 relative to the SRV's first mip. Other texture layouts and sampler modes are rejected.
 Channel masks, blending and clear colors use logical RGBA, while mapped and
 readback memory uses the texture's RGBA or BGRA byte order and padded rows.
-Typeless, sRGB and other unsupported texture formats are rejected. The BGRA
+Typeless and other unsupported texture formats are rejected. The BGRA
 fixture covers asymmetric colors in both source and target formats, default and
 explicit views, padded readback, clears, blending, masks, and retained resources.
+For sRGB views, Metal decodes sampled RGB to linear and encodes linear shader
+output and clear colors to the target; blending is performed in linear space.
+Alpha stays linear and readback preserves encoded storage bytes.
 The mip fixture samples different levels of RGBA8 and BGRA8 textures through
 default and ranged SRVs and sampler LOD clamps, checks mapped subresources and
 retained descriptors, and rejects invalid ranges.
@@ -184,6 +187,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_mips -- --ignor
 cargo test -p victory --target x86_64-apple-darwin --test native_tiled -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_tiled64 -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_bc -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_srgb -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

@@ -57,7 +57,7 @@ unsigned mainCRTStartup(void) {
     CreateResource make=SLOT(dev,0xd8,CreateResource); CreateObject create=SLOT(dev,0x70,CreateObject);
     D3D12_HEAP_PROPERTIES hp={D3D12_HEAP_TYPE_DEFAULT,0,0,0,0};
     D3D12_RESOURCE_DESC rd={D3D12_RESOURCE_DIMENSION_TEXTURE2D,0,2,2,1,1,DXGI_FORMAT_B8G8R8A8_TYPELESS,{1,0},D3D12_TEXTURE_LAYOUT_UNKNOWN,0};
-    for (unsigned i=0;i<2;i++) { void *bad=0; rd.Format=(DXGI_FORMAT)(i?91:90); if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&bad)==S_OK) return 2+i; }
+    for (unsigned i=0;i<2;i++) { void *bad=0; rd.Format=(DXGI_FORMAT)(i?93:90); if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&bad)==S_OK) return 2+i; }
     ID3D12CommandAllocator *allocator=0; ID3D12CommandQueue *queue=0;
     if (ID3D12Device_CreateCommandAllocator((ID3D12Device *)dev,0,&IID_ID3D12CommandAllocator,(void **)&allocator)!=S_OK) return 4;
     D3D12_COMMAND_QUEUE_DESC qd={0,0,0,0}; if (ID3D12Device_CreateCommandQueue((ID3D12Device *)dev,&qd,&IID_ID3D12CommandQueue,(void **)&queue)!=S_OK) return 5;

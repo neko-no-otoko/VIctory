@@ -65,7 +65,7 @@ unsigned mainCRTStartup(void) {
           rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
           rd.Format=(DXGI_FORMAT)(format-1); /* typeless */
           if (make(dev,&hp,0,&rd,0x80,0,&IID_ID3D12Resource,&bad)==S_OK) return 38;
-          rd.Format=(DXGI_FORMAT)(format+1); /* sRGB */
+          rd.Format=(DXGI_FORMAT)(format==71?74:80); /* unsupported BC2/BC4 */
           if (make(dev,&hp,0,&rd,0x80,0,&IID_ID3D12Resource,&bad)==S_OK) return 39;
           rd.Format=(DXGI_FORMAT)format;
           rd.MipLevels=7;

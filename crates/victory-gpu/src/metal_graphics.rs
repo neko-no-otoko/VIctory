@@ -612,7 +612,9 @@ impl StreamState {
             15 => {
                 self.color_format = match get(4) {
                     28 => Some(victory_metal::ColorFormat::Rgba8),
+                    29 => Some(victory_metal::ColorFormat::Rgba8Srgb),
                     87 => Some(victory_metal::ColorFormat::Bgra8),
+                    91 => Some(victory_metal::ColorFormat::Bgra8Srgb),
                     _ => None,
                 };
                 self.color_format.is_some() && (1..8).all(|i| get(4 + i * 4) == 0) && get(36) == 1
