@@ -6,24 +6,39 @@ const MAX_ITEMS: usize = 4096;
 const MAX_RESOURCE: usize = 16 * 1024 * 1024;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
 
-/// Returns tightly packed RGBA8 mip dimensions, offset and length.
-pub fn mip_layout(width:u32,height:u32,mips:u32,mip:u32)->Option<(u32,u32,usize,usize)> {
+/// Returns the packed row byte length and row count for a supported texture format.
+pub fn block_geometry(format:u32,width:u32,height:u32)->Option<(usize,usize)> {
+    if width==0 || height==0 {return None}
+    let (block_width,block_height,bytes)=match format {
+        28|29|40|87|91=>(1usize,1usize,4usize),
+        71|72=>(4,4,8),
+        77|78=>(4,4,16),
+        _=>return None,
+    };
+    let columns=(width as usize-1)/block_width+1;
+    let rows=(height as usize-1)/block_height+1;
+    Some((columns.checked_mul(bytes)?,rows))
+}
+
+/// Returns tightly packed mip dimensions, offset and length for a supported format.
+pub fn mip_layout(format:u32,width:u32,height:u32,mips:u32,mip:u32)->Option<(u32,u32,usize,usize)> {
     if width==0 || height==0 || mips==0 || mips>u32::BITS-width.max(height).leading_zeros() || mip>=mips {return None}
     let mut offset=0usize;
     let mut result=None;
     for level in 0..mips {
         let w=(width>>level).max(1);
         let h=(height>>level).max(1);
-        let len=(w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+        let (row_bytes,rows)=block_geometry(format,w,h)?;
+        let len=row_bytes.checked_mul(rows)?;
         if level==mip {result=Some((w,h,offset,len));}
         offset=offset.checked_add(len)?;
     }
     result
 }
 
-/// Returns the byte length of all tightly packed RGBA8 mip levels.
-pub fn texture_size(width:u32,height:u32,mips:u32)->Option<usize> {
-    let (_,_,offset,len)=mip_layout(width,height,mips,mips.checked_sub(1)?)?;
+/// Returns the byte length of all tightly packed mip levels.
+pub fn texture_size(format:u32,width:u32,height:u32,mips:u32)->Option<usize> {
+    let (_,_,offset,len)=mip_layout(format,width,height,mips,mips.checked_sub(1)?)?;
     offset.checked_add(len)
 }
 
@@ -92,8 +107,8 @@ impl<'a> Reader<'a> {
     fn done(&self)->Result<(),String> { if self.pos!=self.data.len() { Err("trailing wire data".into()) } else { Ok(()) } }
 }
 fn validate_resource(r:&Resource)->Result<(),String> {
-    if let ResourceKind::Texture {width,height,mips,..}=r.kind {
-        if texture_size(width,height,mips)!=Some(r.bytes.len()) {return Err("invalid texture dimensions, mip count or byte length".into())}
+    if let ResourceKind::Texture {width,height,format,mips}=r.kind {
+        if texture_size(format,width,height,mips)!=Some(r.bytes.len()) {return Err("invalid texture format, dimensions, mip count or byte length".into())}
     }
     Ok(())
 }
@@ -113,11 +128,11 @@ fn validate_commands(resources:&[Resource],commands:&[Command])->Result<(),Strin
             },
             Command::CopyTexture(c)=>{
                 let id=if c.buffer_to_texture {c.dst} else {c.src};
-                let (width,height,mips)=match resources.iter().find(|r|r.id==id).map(|r|r.kind) {
-                    Some(ResourceKind::Texture {width,height,mips,..})=>(width,height,mips),
+                let (width,height,format,mips)=match resources.iter().find(|r|r.id==id).map(|r|r.kind) {
+                    Some(ResourceKind::Texture {width,height,format,mips})=>(width,height,format,mips),
                     _=>return Err("unknown copy texture".into()),
                 };
-                if mip_layout(width,height,mips,c.mip).is_none() {return Err("invalid copy mip".into())}
+                if mip_layout(format,width,height,mips,c.mip).is_none() {return Err("invalid copy mip".into())}
             },
             _=>{},
         }
@@ -233,15 +248,72 @@ mod tests {
 
     #[test]
     fn mip_layout_odd_dimensions_and_invalid_levels() {
-        assert_eq!(mip_layout(7,3,3,0),Some((7,3,0,84)));
-        assert_eq!(mip_layout(7,3,3,1),Some((3,1,84,12)));
-        assert_eq!(mip_layout(7,3,3,2),Some((1,1,96,4)));
-        assert_eq!(texture_size(7,3,3),Some(100));
-        assert_eq!(mip_layout(1,5,3,1),Some((1,2,20,8)));
+        assert_eq!(mip_layout(28,7,3,3,0),Some((7,3,0,84)));
+        assert_eq!(mip_layout(28,7,3,3,1),Some((3,1,84,12)));
+        assert_eq!(mip_layout(28,7,3,3,2),Some((1,1,96,4)));
+        assert_eq!(texture_size(28,7,3,3),Some(100));
+        assert_eq!(mip_layout(28,1,5,3,1),Some((1,2,20,8)));
         for (w,h,n,level) in [(0,1,1,0),(1,0,1,0),(1,1,0,0),(7,3,4,0),(7,3,3,3)] {
-            assert_eq!(mip_layout(w,h,n,level),None);
+            assert_eq!(mip_layout(28,w,h,n,level),None);
         }
-        assert_eq!(texture_size(u32::MAX,u32::MAX,1),None);
+        assert_eq!(texture_size(28,u32::MAX,u32::MAX,1),None);
+    }
+
+    #[test]
+    fn format_block_geometry_and_mip_offsets() {
+        for format in [28,29,40,87,91] {
+            assert_eq!(block_geometry(format,7,3),Some((28,3)));
+            assert_eq!(texture_size(format,7,3,3),Some(100));
+        }
+        for (format,block) in [(71,8),(72,8),(77,16),(78,16)] {
+            assert_eq!(block_geometry(format,9,5),Some((3*block,2)));
+            assert_eq!(mip_layout(format,8,8,4,0),Some((8,8,0,4*block)));
+            assert_eq!(mip_layout(format,8,8,4,1),Some((4,4,4*block,block)));
+            assert_eq!(mip_layout(format,8,8,4,2),Some((2,2,5*block,block)));
+            assert_eq!(mip_layout(format,8,8,4,3),Some((1,1,6*block,block)));
+            assert_eq!(texture_size(format,8,8,4),Some(7*block));
+            assert_eq!(block_geometry(format,0,1),None);
+            assert_eq!(block_geometry(format,1,0),None);
+            assert_eq!(mip_layout(format,8,8,5,0),None);
+            assert_eq!(mip_layout(format,8,8,4,4),None);
+            assert_eq!(texture_size(format,8,8,0),None);
+        }
+        for format in [0,27,70,73,76,79,u32::MAX] {
+            assert_eq!(block_geometry(format,4,4),None);
+            assert_eq!(mip_layout(format,4,4,1,0),None);
+            assert_eq!(texture_size(format,4,4,1),None);
+        }
+        assert_eq!(texture_size(77,u32::MAX,u32::MAX,1),None);
+    }
+
+    #[test]
+    fn compressed_resources_round_trip_and_reject_invalid_lengths() {
+        for (format,block) in [(71,8),(72,8),(77,16),(78,16)] {
+            let resource=Resource {id:1,state:0,kind:ResourceKind::Texture {width:8,height:8,format,mips:4},bytes:vec![0x5a;7*block]};
+            let encoded=encode_results(&[resource.clone()]).unwrap();
+            let decoded=decode_results(&encoded).unwrap();
+            assert_eq!(encode_results(&decoded).unwrap(),encoded);
+            let batch=Batch {resources:vec![resource.clone()],pipelines:vec![],commands:vec![]};
+            let encoded_batch=encode_batch(&batch).unwrap();
+            assert_eq!(encode_batch(&decode_batch(&encoded_batch).unwrap()).unwrap(),encoded_batch);
+
+            for len in [7*block-1,7*block+1] {
+                let mut invalid=resource.clone();
+                invalid.bytes.resize(len,0);
+                assert!(encode_results(&[invalid.clone()]).is_err());
+                assert!(encode_batch(&Batch {resources:vec![invalid],pipelines:vec![],commands:vec![]}).is_err());
+                let mut wire=encoded.clone();
+                wire[36..40].copy_from_slice(&(len as u32).to_le_bytes());
+                wire.resize(40+len,0);
+                assert!(decode_results(&wire).is_err());
+            }
+            let mut wire=encoded.clone();
+            wire[28..32].copy_from_slice(&70u32.to_le_bytes());
+            assert!(decode_results(&wire).is_err());
+            let mut invalid=resource;
+            invalid.kind=ResourceKind::Texture {width:8,height:8,format:70,mips:4};
+            assert!(encode_results(&[invalid]).is_err());
+        }
     }
 
     #[test]

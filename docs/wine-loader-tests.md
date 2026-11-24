@@ -323,8 +323,9 @@ The supported subset includes multiple full color/depth clears, buffer copies,
 full texture uploads and readbacks, resource transitions, and multiple
 nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
 and pipeline changes. Committed default-heap resources are limited to
-RGBA8_UNORM sampled textures (including multiple mips), single-mip
-RGBA8_UNORM color targets, single-mip D32_FLOAT depth textures, and buffers.
+RGBA8_UNORM and typed BC1/BC3 linear or sRGB sampled textures (including
+multiple mips), single-mip RGBA8_UNORM color targets, single-mip D32_FLOAT
+depth textures, and buffers.
 Graphics supports POSITION float4, optionally followed by TEXCOORD0
 float2; one color target and optional depth target per draw; the native depth
 comparison/write subset; source-alpha blending and color write masks; and a
@@ -333,8 +334,9 @@ must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
 This remains restricted: no partial clears, cross-process shared fences,
-tiled textures, BGRA/sRGB/BC formats through this proxy, stencil, arbitrary
-sampler/address modes, or general D3D12 resource or pipeline states.
+tiled textures, BGRA or uncompressed sRGB formats through this proxy, BC2
+and other compressed formats, stencil, arbitrary sampler/address modes, or
+general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
 4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
 and 64 MiB per request. Shader translation and drawing use the existing
@@ -342,8 +344,8 @@ native Metal path, not MetalVulkan.
 
 Sampled multi-mip textures use 2D `TEXTURE_LAYOUT_UNKNOWN`, one array layer,
 one sample, explicit nonzero mip count and no render/depth flags. Null SRVs
-cover all levels; explicit RGBA8 Texture2D SRVs support a validated first
-mip and count, including `UINT_MAX` for the remaining levels, with default
+cover all levels; explicit matching-format Texture2D SRVs support a validated
+first mip and count, including `UINT_MAX` for the remaining levels, with default
 component mapping, plane zero and zero resource LOD clamp. The existing point
 or linear clamp sampler has min/max LOD zero, so sampling selects level zero
 relative to the SRV's first mip; arbitrary sampler LOD is not supported.
@@ -352,6 +354,30 @@ and 256-byte row pitches; partial regions and per-subresource barriers are
 rejected. Packed mip bytes in the internal transport are not console tiling.
 This incompatible mip-aware batch uses opcode 5; old opcode 3 is rejected
 rather than misdecoded.
+
+BC sampling supports `BC1_UNORM`, `BC1_UNORM_SRGB`, `BC3_UNORM` and
+`BC3_UNORM_SRGB`, with top-level width and height multiples of four. Typed
+resources and explicit SRVs must have identical formats; typeless resources
+and reinterpretation are rejected. Metal performs the sRGB decode on RGB;
+alpha remains linear. The host checks Metal's BC texture compression support
+at draw time and fails if the device lacks it; there is no software fallback.
+Only untiled full-mip copies are supported. Each BC mip uses
+`ceil(width / 4)` blocks per row and `ceil(height / 4)` block rows, with
+8-byte BC1 or 16-byte BC3 blocks. Copy footprints report dimensions rounded
+up to whole blocks and retain the 256-byte pitch and 512-byte offset rules,
+including for mips smaller than a block. The proxy exposes
+`GetCopyableFootprints` for its supported buffer and 2D texture subset.
+
+On an M3 Max using Wine 11 under Rosetta and the Apple converter, a normally
+launched guest uploaded and read back independently constructed BC1/BC3
+linear and sRGB blocks at 8x8, 4x4, 2x2 and 1x1 mips with padded rows and
+distinct offsets. Translated Metal draws sampled each mip and verified
+readback colors and alpha; recorded resources and descriptor heaps were
+released before submission. Invalid formats, layouts, SRV ranges, mips,
+offsets and pitches were rejected. Run the focused test with the launcher
+environment below using `cargo test --locked -p victory --target
+x86_64-apple-darwin --test wine_bc -- --ignored --nocapture`. This verifies
+the listed subset, not console tiling or game compatibility.
 
 On Wine 11 under Rosetta, a normally launched TLS guest uploaded odd-sized
 7x5, 3x2 and 1x1 mips with independent offsets/pitches, sampled each through

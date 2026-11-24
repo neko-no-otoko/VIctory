@@ -341,6 +341,7 @@ static DEVICE_TABLE: Table<160> = {
     t[73] = create_list_x as *const ();
     t[27] = create_resource as *const ();
     t[36] = create_fence as *const ();
+    t[38] = copyable_footprints as *const ();
     Table(t)
 };
 static HEAP_TABLE: Table<160> = {
@@ -505,6 +506,49 @@ struct ResourceDesc {
     layout: u32,
     flags: u32,
 }
+const _: () = assert!(std::mem::size_of::<ResourceDesc>() == std::mem::size_of::<crate::resource::ResourceDesc>());
+
+// Delegate the proven upstream layout after checking the proxy's supported
+// resource subset and every arithmetic bound used by the upstream helper.
+extern "system" fn copyable_footprints(
+    this: This, desc: *const ResourceDesc, first: u32, count: u32, base: u64,
+    layouts: *mut crate::resource::PlacedFootprint, rows: *mut u32, row_sizes: *mut u64, total: *mut u64,
+) {
+    if !total.is_null() { unsafe { *total = u64::MAX; } }
+    let Some(r) = (unsafe { desc.as_ref() }) else { return; };
+    if device(this).is_none() || r.alignment != 0 || r.width == 0 || r.depth != 1 || r.mips == 0
+        || r.samples != 1 || r.quality != 0 || first.checked_add(count).is_none_or(|end| end > u32::from(r.mips)) {
+        return;
+    }
+    if r.dimension == 1 {
+        if r.width > MAX_BUFFER as u64 || r.height != 1 || r.mips != 1 || r.format != 0
+            || r.layout != 1 || !matches!(r.flags, 0 | 4) { return; }
+    } else if r.dimension == 3 {
+        if r.width > u32::MAX as u64 || wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)).is_none_or(|n| n > MAX_BUFFER)
+            || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1)
+            || (r.mips != 1 && (r.flags != 0 || r.layout != 0))
+            || (matches!(r.format, 71 | 72 | 77 | 78) && (r.width % 4 != 0 || r.height % 4 != 0 || r.layout != 0 || r.flags != 0))
+            || (r.format == 28 && !matches!(r.flags, 0 | 1))
+            || (r.format == 40 && (r.mips != 1 || r.flags != 2)) { return; }
+    } else { return; }
+    let mut end = base;
+    for mip in first..first + count {
+        let (row, rows) = if r.dimension == 1 {
+            (r.width as usize, 1)
+        } else {
+            let Some((w, h, _, _)) = wine_transport::mip_layout(r.format, r.width as u32, r.height, u32::from(r.mips), mip) else { return; };
+            let Some(v) = wine_transport::block_geometry(r.format, w, h) else { return; };
+            v
+        };
+        let Some(offset) = end.checked_add(511).map(|v| v & !511) else { return; };
+        let Some(pitch) = (row as u64).checked_add(255).map(|v| v & !255).filter(|&v| v <= u32::MAX as u64) else { return; };
+        let Some(next) = pitch.checked_mul((rows - 1) as u64).and_then(|n| offset.checked_add(n)).and_then(|n| n.checked_add(row as u64)) else { return; };
+        end = next;
+    }
+    // SAFETY: both descriptions are repr(C), have identical D3D12 fields,
+    // and optional outputs follow the upstream method's `count` contract.
+    crate::resource::copyable_footprints(this, desc.cast(), first, count, base, layouts, rows, row_sizes, total);
+}
 extern "system" fn create_resource(
     this: This,
     hp: *const HeapProps,
@@ -527,9 +571,11 @@ extern "system" fn create_resource(
     }
     if r.dimension == 3 {
         if r.width > u32::MAX as u64 { return E_INVALIDARG; }
-        let Some(size) = wine_transport::texture_size(r.width as u32, r.height, u32::from(r.mips)) else { return E_INVALIDARG; };
-        if size > MAX_BUFFER || !matches!(r.format, 28 | 40) || !matches!(r.layout, 0 | 1)
+        let Some(size) = wine_transport::texture_size(r.format, r.width as u32, r.height, u32::from(r.mips)) else { return E_INVALIDARG; };
+        let bc = matches!(r.format, 71 | 72 | 77 | 78);
+        if size > MAX_BUFFER || !matches!(r.format, 28 | 40 | 71 | 72 | 77 | 78) || !matches!(r.layout, 0 | 1)
             || (r.mips != 1 && (r.flags != 0 || r.layout != 0))
+            || (bc && (r.width % 4 != 0 || r.height % 4 != 0 || r.layout != 0 || r.flags != 0 || !matches!(state, 0 | 0x400 | 0x800 | 0x80)))
             || (r.format == 28 && (!matches!(r.flags, 0 | 1) || !matches!(state, 0 | 4 | 0x400 | 0x800 | 0x80)))
             || (r.format == 40 && (r.mips != 1 || r.flags != 2 || !matches!(state, 0 | 0x10 | 0x800))) {
             return E_INVALIDARG;
@@ -602,7 +648,7 @@ extern "system" fn create_uav(
 }
 extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle: u64) {
     let (Some(Data::Texture(t)), Some(Data::Heap(_, h))) = (data(res), data(handle as This)) else { trap("invalid SRV"); };
-    if device(this).is_none() || t.format != 28 { trap("unsupported SRV"); }
+    if device(this).is_none() || !matches!(t.format, 28 | 71 | 72 | 77 | 78) { trap("unsupported SRV"); }
     let (first_mip, mip_count) = if desc.is_null() {
         (0, t.mips)
     } else {
@@ -615,7 +661,7 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
         };
         let Some(remaining) = t.mips.checked_sub(first).filter(|&n| n != 0) else { trap("invalid SRV mip range"); };
         let count = if levels == u32::MAX { remaining } else { levels };
-        if format != 28 || dimension != 4 || mapping != 5768 || plane != 0 || lod != 0.0
+        if format != t.format || dimension != 4 || mapping != 5768 || plane != 0 || lod != 0.0
             || count == 0 || count > remaining {
             trap("unsupported SRV");
         }
@@ -1333,13 +1379,16 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
     // the rest of the D3D12_TEXTURE_COPY_LOCATION union.
     let mip = unsafe { subresource.data.subresource };
     let footprint = unsafe { footprint.data.footprint };
-    let Some((width, height, _, _)) = wine_transport::mip_layout(texture.width, texture.height, texture.mips, mip) else { l.invalid = true; return; };
-    let row = u64::from(width) * 4;
-    let end = (footprint.pitch as u64).checked_mul(u64::from(height) - 1)
-        .and_then(|n| footprint.offset.checked_add(n)).and_then(|n| n.checked_add(row));
-    if footprint.offset % 512 != 0 || footprint.format != texture.format || footprint.width != width
-        || footprint.height != height || footprint.depth != 1 || footprint.pitch % 256 != 0
-        || (footprint.pitch as u64) < row || end.is_none_or(|n| n > buffer.len() as u64) { l.invalid = true; return; }
+    let Some((width, height, _, _)) = wine_transport::mip_layout(texture.format, texture.width, texture.height, texture.mips, mip) else { l.invalid = true; return; };
+    let Some((row, rows)) = wine_transport::block_geometry(texture.format, width, height) else { l.invalid = true; return; };
+    let end = (footprint.pitch as u64).checked_mul((rows - 1) as u64)
+        .and_then(|n| footprint.offset.checked_add(n)).and_then(|n| n.checked_add(row as u64));
+    let compressed = matches!(texture.format, 71 | 72 | 77 | 78);
+    let footprint_width = if compressed { width.next_multiple_of(4) } else { width };
+    let footprint_height = if compressed { height.next_multiple_of(4) } else { height };
+    if footprint.offset % 512 != 0 || footprint.format != texture.format || footprint.width != footprint_width
+        || footprint.height != footprint_height || footprint.depth != 1 || footprint.pitch % 256 != 0
+        || (footprint.pitch as u64) < row as u64 || end.is_none_or(|n| n > buffer.len() as u64) { l.invalid = true; return; }
     let (src_id, dst_id) = if upload { (buffer.id, texture.id) } else { (texture.id, buffer.id) };
     let command = Command::CopyTexture(CopyTexture { src: src_id, dst: dst_id, offset: footprint.offset,
         pitch: footprint.pitch, width, height, format: texture.format, mip, buffer_to_texture: upload });
@@ -1395,7 +1444,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         match resources.get(&r.id) {
             Some(GraphicsResource::Buffer(b)) if matches!(r.kind, ResourceKind::Buffer) && r.bytes.len() == b.len() => {},
             Some(GraphicsResource::Texture(t)) if matches!(r.kind, ResourceKind::Texture { width, height, format, mips } if width == t.width && height == t.height && format == t.format && mips == t.mips)
-                && wine_transport::texture_size(t.width, t.height, t.mips) == Some(r.bytes.len()) => {},
+                && wine_transport::texture_size(t.format, t.width, t.height, t.mips) == Some(r.bytes.len()) => {},
             _ => return Err("invalid resource result".into()),
         }
     }
