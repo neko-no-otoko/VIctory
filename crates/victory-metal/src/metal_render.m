@@ -91,6 +91,7 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
 @property(nonatomic) BOOL textureEnabled;
 @property(nonatomic) BOOL linearFilter;
 @property(nonatomic) size_t fragmentConstantBytes;
+@property(nonatomic) size_t vertexStride;
 @property(nonatomic) uint32_t width;
 @property(nonatomic) uint32_t height;
 @property(nonatomic) size_t stride;
@@ -112,7 +113,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
                            bool blend_enabled, uint8_t write_mask, bool alpha_source,
-                           char *error, size_t error_len) {
+                           bool vertex_uv, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -134,7 +135,13 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         layout.attributes[11].format = MTLVertexFormatFloat4;
         layout.attributes[11].offset = 0;
         layout.attributes[11].bufferIndex = 6;
-        layout.layouts[6].stride = 4 * sizeof(float);
+        if (vertex_uv) {
+            layout.attributes[12].format = MTLVertexFormatFloat2;
+            layout.attributes[12].offset = 4 * sizeof(float);
+            layout.attributes[12].bufferIndex = 6;
+        }
+        r.vertexStride = (vertex_uv ? 6 : 4) * sizeof(float);
+        layout.layouts[6].stride = r.vertexStride;
         layout.layouts[6].stepFunction = MTLVertexStepFunctionPerVertex;
         MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
         desc.vertexFunction = vertex;
@@ -377,10 +384,10 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
                  char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
-        if ((size_t)count > SIZE_MAX / (4 * sizeof(float)))
-            return fail(error, error_len, @"vertex buffer size overflow");
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
-        size_t size = (size_t)count * 4 * sizeof(float);
+        if ((size_t)count > SIZE_MAX / r.vertexStride)
+            return fail(error, error_len, @"vertex buffer size overflow");
+        size_t size = (size_t)count * r.vertexStride;
         if (!r.vertices || r.vertices.length < size)
             r.vertices = [r.device newBufferWithLength:size options:MTLResourceStorageModeShared];
         if (!r.vertices) return fail(error, error_len, @"vertex buffer allocation failed");

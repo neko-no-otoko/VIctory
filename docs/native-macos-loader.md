@@ -121,12 +121,15 @@ The synthetic blend fixture verifies translucent draw ordering, alpha and
 channel masks, retained pipeline state, and unsupported-state rejection.
 Translated vertex and pixel stages can also share one matched 32-bit
 `TEXCOORD0.xy` varying with perspective-center interpolation, from vertex
-output register 1 to pixel input register 0. The vertex input remains a single
-`POSITION0` float4; shaders may derive the varying from it. Other register
-layouts, varying semantics, masks, flat or packed interpolation, and
-mismatched stage signatures are rejected. The varying fixture samples a
-texture at several pixels using different clip-space w values, checks the
-perspective-correct result, and exercises rejection paths.
+output register 1 to pixel input register 0. Input layouts support either one
+`POSITION0` float4 at offset 0 with stride 16, or interleaved `POSITION0`
+float4 at offset 0 and independent `TEXCOORD0` float2 at offset 16 with
+stride 24, both per-vertex in slot 0. The latter requires native fetch VGPRs
+4–7 and 8–9 respectively. The buffer view may start at a nonzero aligned
+offset. Other layouts, varying semantics, masks, flat or packed interpolation,
+and mismatched signatures are rejected. Synthetic fixtures verify
+perspective-correct sampling, including independent UV input on indexed and
+nonindexed draws, and exercise layout, stride, and linkage rejection.
 With the same prerequisites, run:
 
 ```sh
@@ -136,6 +139,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_viewport -- --i
 cargo test -p victory --target x86_64-apple-darwin --test native_depth -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_blend -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_varying -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_uv -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

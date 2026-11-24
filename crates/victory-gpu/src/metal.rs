@@ -276,6 +276,7 @@ struct VertexBuffer {
     resource: ResourceRef,
     offset: u64,
     size: u32,
+    stride: u32,
 }
 struct IndexBuffer {
     resource: ResourceRef,
@@ -325,6 +326,7 @@ enum Command {
         vertex: ResourceRef,
         vertex_offset: u64,
         vertices: u32,
+        vertex_stride: u32,
         target: ResourceRef,
         depth: Option<ResourceRef>,
         indexed: Option<IndexedDraw>,
@@ -533,8 +535,8 @@ impl State {
         if !self.open() {
             return;
         }
-        if view.stride != 16 || view.size == 0 || view.address % 4 != 0 {
-            self.reject("expected an aligned float4 vertex buffer");
+        if !matches!(view.stride, 16 | 24) || view.size < view.stride || view.address % 4 != 0 {
+            self.reject("expected an aligned supported vertex buffer");
             return;
         }
         let Some((resource, offset)) =
@@ -548,6 +550,7 @@ impl State {
             resource: ResourceRef(resource as usize),
             offset,
             size: view.size,
+            stride: view.stride,
         });
     }
     pub(crate) fn set_index(&mut self, view: Option<IndexView>) {
@@ -712,6 +715,10 @@ impl State {
         }
         let pipeline = self.graphics.clone().ok_or("no graphics pipeline")?;
         let vertex = self.vertex.as_ref().ok_or("no vertex buffer")?;
+        let vertex_stride = vertex.stride;
+        if pipeline.lock().unwrap_or_else(|e| e.into_inner()).vertex_stride != vertex_stride {
+            return Err("vertex stride does not match pipeline input layout".into());
+        }
         let (vertex_offset, vertices, indexed) = if let Some(base_vertex) = base_vertex {
             let index = self.index.as_ref().ok_or("no index buffer")?;
             let start = u64::from(first) * u64::from(index.element_size);
@@ -720,13 +727,13 @@ impl State {
                 return Err("draw exceeds index buffer view".into());
             }
             let offset = index.offset.checked_add(start).ok_or("index offset overflow")?;
-            (vertex.offset, vertex.size / 16, Some(IndexedDraw {
+            (vertex.offset, vertex.size / vertex_stride, Some(IndexedDraw {
                 resource: ResourceRef::new(index.resource.ptr()),
                 offset, count, element_size: index.element_size, base_vertex,
             }))
         } else {
-            let start = u64::from(first) * 16;
-            let bytes = u64::from(count) * 16;
+            let start = u64::from(first) * u64::from(vertex_stride);
+            let bytes = u64::from(count) * u64::from(vertex_stride);
             if start.checked_add(bytes).is_none_or(|end| end > u64::from(vertex.size)) {
                 return Err("draw exceeds vertex buffer view".into());
             }
@@ -853,6 +860,7 @@ impl State {
             vertex,
             vertex_offset,
             vertices,
+            vertex_stride,
             indexed,
             constants,
             sampled,
@@ -1141,6 +1149,7 @@ impl State {
                     vertex,
                     vertex_offset,
                     vertices,
+                    vertex_stride,
                     indexed,
                     constants,
                     sampled,
@@ -1190,7 +1199,7 @@ impl State {
                     submission.access(target.ptr(), RENDER_TARGET)?;
                     let (buffer, size) = crate::resource::buffer_bytes(vertex.ptr())
                         .ok_or("invalid vertex buffer")?;
-                    let vertex_bytes = u64::from(*vertices) * 16;
+                    let vertex_bytes = u64::from(*vertices) * u64::from(*vertex_stride);
                     if vertex_offset
                         .checked_add(vertex_bytes)
                         .is_none_or(|end| end > size)
@@ -1218,10 +1227,14 @@ impl State {
                     }
                     // SAFETY: the buffer is retained, the offset is aligned and the range was checked.
                     let verts = unsafe {
-                        std::slice::from_raw_parts(
-                            buffer.add(*vertex_offset as usize).cast::<[f32; 4]>(),
-                            *vertices as usize,
-                        )
+                        let ptr = buffer.add(*vertex_offset as usize);
+                        if *vertex_stride == 24 {
+                            crate::metal_graphics::Vertices::PositionUv(
+                                std::slice::from_raw_parts(ptr.cast::<[f32; 6]>(), *vertices as usize))
+                        } else {
+                            crate::metal_graphics::Vertices::Position(
+                                std::slice::from_raw_parts(ptr.cast::<[f32; 4]>(), *vertices as usize))
+                        }
                     };
                     let indices = if let Some(indexed) = indexed {
                         submission.access(indexed.resource.ptr(), INDEX_BUFFER)?;

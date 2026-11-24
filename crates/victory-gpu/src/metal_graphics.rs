@@ -5,6 +5,7 @@ use victory_shader::{Container, FourCC, HwStage, emit, io, ir, native, resource}
 pub(crate) struct GraphicsState {
     depth: Option<victory_metal::DepthState>,
     blend: victory_metal::BlendState,
+    input_uv: bool,
 }
 
 
@@ -16,6 +17,7 @@ pub(crate) struct Prepared {
     pub(crate) texture_slot: Option<u8>,
     pub(crate) sampler_slot: Option<u8>,
     pub(crate) depth: Option<victory_metal::DepthState>,
+    pub(crate) vertex_stride: u32,
     blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
 }
@@ -23,13 +25,18 @@ pub(crate) struct Prepared {
 // The renderer owns Metal objects and is only accessed through the pipeline's
 // mutex; its synchronous draws complete before another thread can use it.
 unsafe impl Send for Prepared {}
+pub(crate) enum Vertices<'a> {
+    Position(&'a [[f32; 4]]),
+    PositionUv(&'a [[f32; 6]]),
+}
+
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
-        let varying = varying_signatures(vertex, pixel)?;
-        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0))?;
+        let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
+        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0), graphics.input_uv)?;
         let (pixel_host, texture_slot, sampler_slot) =
-            validate(pixel, HwStage::Ps, varying.map(|v| v.1))?;
+            validate(pixel, HwStage::Ps, varying.map(|v| v.1), false)?;
         let vertex = convert(&vertex_host, HwStage::Vs, false)?;
         let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
         let dwords = pixel_host.user_data_dwords() as usize;
@@ -43,6 +50,7 @@ impl Prepared {
             sampler_slot,
             depth: graphics.depth,
             blend: graphics.blend,
+            vertex_stride: if graphics.input_uv { 24 } else { 16 },
             renderer: None,
         })
     }
@@ -51,7 +59,7 @@ impl Prepared {
         &mut self,
         width: u32,
         height: u32,
-        vertices: &[[f32; 4]],
+        vertices: Vertices<'_>,
         indices: Option<(victory_metal::IndexData<'_>, i32)>,
         viewport: [f64; 6],
         scissor: [u32; 4],
@@ -67,7 +75,12 @@ impl Prepared {
             return Err("depth attachment does not match pipeline".into());
         }
         if !matches!(&self.renderer, Some((w, h, _)) if *w == width && *h == height) {
-            let renderer = victory_metal::Renderer::new_configured(
+            let create = if self.vertex_stride == 24 {
+                victory_metal::Renderer::new_configured_uv
+            } else {
+                victory_metal::Renderer::new_configured
+            };
+            let renderer = create(
                 &self.vertex, "main", &self.pixel, "main", width, height,
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
             ).map_err(|e| e.to_string())?;
@@ -83,9 +96,10 @@ impl Prepared {
                 .set_fragment_texture(width, height, texels, filter)
                 .map_err(|e| e.to_string())?;
         }
-        match indices {
-            Some((indices, base)) => renderer.draw_indexed_preserving(vertices, indices, base, constants, pixels),
-            None => renderer.draw_preserving(vertices, constants, pixels),
+        match (vertices, indices) {
+            (Vertices::Position(v), Some((indices, base))) => renderer.draw_indexed_preserving(v, indices, base, constants, pixels),
+            (Vertices::Position(v), None) => renderer.draw_preserving(v, constants, pixels),
+            (Vertices::PositionUv(v), indices) => renderer.draw_uv_preserving(v, indices, constants, pixels),
         }.map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref_mut() {
             renderer.read_depth_pixels(pixels).map_err(|e| e.to_string())?;
@@ -160,10 +174,13 @@ fn signature(
     Ok(varying)
 }
 
-fn varying_signatures(vertex: &[u8], pixel: &[u8]) -> Result<Option<(u8, u8)>, String> {
+fn varying_signatures(vertex: &[u8], pixel: &[u8], input_uv: bool) -> Result<Option<(u8, u8)>, String> {
     let vs = Container::parse(vertex).map_err(|e| e.to_string())?;
     let ps = Container::parse(pixel).map_err(|e| e.to_string())?;
-    signature(&vs, FourCC::ISG1, Some((b"POSITION", 0)), false, false)?;
+    let vertex_uv = signature(&vs, FourCC::ISG1, Some((b"POSITION", 0)), false, input_uv)?;
+    if vertex_uv != input_uv.then_some(1) {
+        return Err("vertex input signature does not match input layout".into());
+    }
     let output = signature(&vs, FourCC::OSG1, Some((b"SV_Position", 1)), false, true)?;
     let input = signature(&ps, FourCC::ISG1, None, true, true)?;
     signature(&ps, FourCC::OSG1, Some((b"SV_Target", 64)), false, false)?;
@@ -180,6 +197,7 @@ fn validate(
     bytes: &[u8],
     stage: HwStage,
     varying: Option<u8>,
+    input_uv: bool,
 ) -> Result<(emit::HostShader, Option<u8>, Option<u8>), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
@@ -274,10 +292,13 @@ fn validate(
     }
     match (&p.io, stage, varying) {
         (native::StageIo::Vs { inputs, outputs }, HwStage::Vs, row)
-            if inputs.len() == 1
+            if inputs.len() == (if input_uv { 2 } else { 1 })
                 && inputs[0].usage == native::Usage::Generic
                 && inputs[0].row == 0
                 && inputs[0].mask == 15
+                && (!input_uv || (inputs[0].vgpr == 4
+                    && inputs[1].usage == native::Usage::Generic && inputs[1].row == 1
+                    && inputs[1].mask == 3 && inputs[1].vgpr == 8))
                 && match row {
                     None => outputs.is_empty(),
                     Some(row) => outputs.len() == 1
@@ -373,7 +394,8 @@ fn validate(
     }
     let raised = io::raise(&program, p).map_err(|e| e.to_string())?;
     if raised.inputs.iter().any(|(_, input)| match stage {
-        HwStage::Vs => !matches!(input, io::Input::Attribute { row: 0, .. }),
+        HwStage::Vs => !matches!(input, io::Input::Attribute { row: 0, .. })
+            && !(input_uv && matches!(input, io::Input::Attribute { row: 1, channel: 0 | 1 })),
         HwStage::Ps => !matches!(input, io::Input::Position(_))
             && !(varying.is_some() && matches!(input, io::Input::Barycentric {
                 kind: io::Barycentric::PerspectiveCenter, index: 0 | 1
@@ -501,6 +523,7 @@ pub(crate) struct StreamState {
     depth: Option<victory_metal::DepthState>,
     depth_format: u32,
     blend: Option<victory_metal::BlendState>,
+    input_uv: bool,
 }
 
 impl StreamState {
@@ -564,7 +587,10 @@ impl StreamState {
                     enabled == 0 && stencil == 0
                 }
             }
-            12 => unsafe { input_layout(data) },
+            12 => match unsafe { input_layout(data) } {
+                Some(uv) => { self.input_uv = uv; true }
+                None => false,
+            },
             13 => get(4) == 0,
             14 => get(4) == 3,
             15 => get(4) == 28 && (1..8).all(|i| get(4 + i * 4) == 0) && get(36) == 1,
@@ -595,6 +621,7 @@ impl StreamState {
         }
         Ok(GraphicsState {
             depth: self.depth,
+            input_uv: self.input_uv,
             blend: self.blend.unwrap_or(victory_metal::BlendState {
                 enabled: false, write_mask: 15, alpha_source: false,
             }),
@@ -602,24 +629,27 @@ impl StreamState {
     }
 }
 
-unsafe fn input_layout(data: &[u8]) -> bool {
-    let ptr = u64::from_le_bytes(data[8..16].try_into().unwrap()) as *const u8;
-    if ptr.is_null() || word(data, 16).ok() != Some(1) {
-        return false;
+unsafe fn input_layout(data: &[u8]) -> Option<bool> {
+    let ptr = u64::from_le_bytes(data[8..16].try_into().ok()?) as *const u8;
+    let count = word(data, 16).ok()?;
+    if ptr.is_null() || !matches!(count, 1 | 2) {
+        return None;
     }
-    // D3D12_INPUT_ELEMENT_DESC: name pointer followed by six u32 fields.
-    let name = unsafe { ptr.cast::<*const i8>().read_unaligned() };
-    if name.is_null()
-        || unsafe { CStr::from_ptr(name) }
-            .to_bytes()
-            .eq_ignore_ascii_case(b"POSITION")
-            == false
-    {
-        return false;
+    // SAFETY: the guest supplies `count` D3D12_INPUT_ELEMENT_DESC entries
+    // and NUL-terminated semantic names for pipeline creation.
+    let valid = |at: *const u8, semantic: &[u8], expected: [u32; 6]| {
+        let name = unsafe { at.cast::<*const i8>().read_unaligned() };
+        if name.is_null() || !unsafe { CStr::from_ptr(name) }.to_bytes().eq_ignore_ascii_case(semantic) {
+            return false;
+        }
+        let element = unsafe { std::slice::from_raw_parts(at, 32) };
+        expected.iter().enumerate().all(|(i, v)| word(element, 8 + i * 4).ok() == Some(*v))
+    };
+    if !valid(ptr, b"POSITION", [0, 2, 0, 0, 0, 0]) {
+        return None;
     }
-    let element = unsafe { std::slice::from_raw_parts(ptr, 32) };
-    [0, 2, 0, 0, 0, 0]
-        .iter()
-        .enumerate()
-        .all(|(i, expected)| word(element, 8 + i * 4).ok() == Some(*expected))
+    if count == 2 && !valid(unsafe { ptr.add(32) }, b"TEXCOORD", [0, 16, 0, 16, 0, 0]) {
+        return None;
+    }
+    Some(count == 2)
 }

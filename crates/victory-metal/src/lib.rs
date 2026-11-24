@@ -1,8 +1,8 @@
 //! Native offscreen Metal triangle rendering, not a console GPU backend.
 //!
 //! `Renderer` retains its device, pipeline, render target and readback buffer
-//! across draws. It supports one float4 vertex attribute, fragment b0
-//! constants, and one 2D texture/sampler in the converter's resource heaps.
+//! across draws. It supports float4 position vertices, optionally followed by
+//! float2 texture coordinates, fragment b0 constants, and one 2D texture/sampler.
 
 #![cfg(target_os = "macos")]
 
@@ -41,6 +41,7 @@ unsafe extern "C" {
         blend_enabled: bool,
         write_mask: u8,
         alpha_source: bool,
+        vertex_uv: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -173,11 +174,13 @@ pub struct BlendState {
 
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
 ///
-/// Both metallibs must be produced by Apple Metal Shader Converter. Vertex
-/// attribute 0 is a per-vertex float4 at buffer slot 6. Supported fragment
-/// bindings are `b0, space0` at offset 0 in the converter's automatic linear
-/// argument buffer, and texture and sampler heap index 0. The caller must
-/// verify those layouts via converter reflection and translated shader metadata.
+/// Both metallibs must be produced by Apple Metal Shader Converter. Metal
+/// attribute 11 is a per-vertex float4 at buffer slot 6, offset 0. The UV
+/// layout additionally supplies attribute 12 as a float2 at offset 16, with
+/// stride 24 rather than 16. Supported fragment bindings are `b0, space0`
+/// at offset 0 in the converter's automatic linear argument buffer, and
+/// texture and sampler heap index 0. The caller must verify those layouts via
+/// converter reflection and translated shader metadata.
 /// The output is tightly packed RGBA8, top row first.
 pub struct Renderer {
     handle: NonNull<c_void>,
@@ -186,6 +189,7 @@ pub struct Renderer {
     fragment_texture: bool,
     texture_bound: bool,
     depth_enabled: bool,
+    vertex_uv: bool,
     width: u32,
     height: u32,
     viewport: [f64; 6],
@@ -236,6 +240,27 @@ impl Renderer {
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
     ) -> Result<Self, RenderError> {
+        Self::new_configured_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                                   width, height, fragment_constant_dwords, fragment_texture,
+                                   depth, blend, false)
+    }
+
+    /// Create a pipeline with float4 position and independent float2 UV vertices.
+    pub fn new_configured_uv(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
+    ) -> Result<Self, RenderError> {
+        Self::new_configured_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                                   width, height, fragment_constant_dwords, fragment_texture,
+                                   depth, blend, true)
+    }
+
+    fn new_configured_inner(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, vertex_uv: bool,
+    ) -> Result<Self, RenderError> {
         if depth.is_some_and(|state| !(1..=8).contains(&state.compare)) {
             return Err(RenderError("invalid depth comparison".into()));
         }
@@ -280,6 +305,7 @@ impl Renderer {
                 blend.enabled,
                 blend.write_mask,
                 blend.alpha_source,
+                vertex_uv,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -292,6 +318,7 @@ impl Renderer {
             fragment_texture,
             texture_bound: false,
             depth_enabled: depth.is_some(),
+            vertex_uv,
             width,
             height,
             viewport: [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
@@ -417,6 +444,9 @@ impl Renderer {
         fragment_constants: &[u32],
         pixels: &mut [u8],
     ) -> Result<(), RenderError> {
+        if self.vertex_uv {
+            return Err(RenderError("renderer requires position and UV vertices".into()));
+        }
         let valid_index = |index: u32| {
             let vertex = i64::from(index) + i64::from(base_vertex);
             vertex >= 0 && (vertex as u64) < vertices.len() as u64
@@ -461,6 +491,78 @@ impl Renderer {
         if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
+    /// Draw position/UV triangles over the existing pixels, optionally indexed.
+    /// Each index plus its base vertex must identify an element of `vertices`.
+    pub fn draw_uv_preserving(
+        &mut self,
+        vertices: &[[f32; 6]],
+        indices: Option<(IndexData<'_>, i32)>,
+        constants: &[u32],
+        pixels: &mut [u8],
+    ) -> Result<(), RenderError> {
+        if !self.vertex_uv {
+            return Err(RenderError("renderer requires position-only vertices".into()));
+        }
+        if vertices.is_empty() || pixels.len() != self.pixel_len
+            || constants.len() != self.fragment_constant_dwords
+        {
+            return Err(RenderError("expected nonempty vertices and exact-sized constants and output buffers".into()));
+        }
+        if self.fragment_texture && !self.texture_bound {
+            return Err(RenderError("fragment texture has not been bound".into()));
+        }
+        let vertex_count = u32::try_from(vertices.len())
+            .map_err(|_| RenderError("too many vertices".into()))?;
+        vertices.len().checked_mul(std::mem::size_of::<[f32; 6]>())
+            .ok_or_else(|| RenderError("vertex buffer size overflow".into()))?;
+        let indexed = if let Some((indices, base_vertex)) = indices {
+            let valid_index = |index: u32| {
+                let vertex = i64::from(index) + i64::from(base_vertex);
+                vertex >= 0 && (vertex as u64) < vertices.len() as u64
+            };
+            let (ptr, len, size, valid) = match indices {
+                IndexData::U16(data) => (data.as_ptr().cast::<c_void>(), data.len(), 2u32,
+                                         data.iter().all(|&i| valid_index(u32::from(i)))),
+                IndexData::U32(data) => (data.as_ptr().cast::<c_void>(), data.len(), 4u32,
+                                         data.iter().all(|&i| valid_index(i))),
+            };
+            if len == 0 || len % 3 != 0 || !valid {
+                return Err(RenderError("expected valid nonempty indexed triangles".into()));
+            }
+            let count = u32::try_from(len).map_err(|_| RenderError("too many indices".into()))?;
+            len.checked_mul(size as usize)
+                .ok_or_else(|| RenderError("index buffer size overflow".into()))?;
+            Some((ptr, count, size, base_vertex))
+        } else {
+            if vertices.len() % 3 != 0 {
+                return Err(RenderError("expected a nonempty triangle list".into()));
+            }
+            None
+        };
+        if self.scissor[2] == 0 || self.scissor[3] == 0 {
+            return Ok(());
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: the renderer uses the UV layout, and all slices, sizes and
+        // indexed vertex bounds remain valid for the synchronous native draw.
+        let ok = unsafe {
+            if let Some((ptr, count, size, base_vertex)) = indexed {
+                victory_metal_draw_indexed(
+                    self.handle.as_ptr(), vertices.as_ptr().cast(), vertex_count, ptr,
+                    count, size, base_vertex, constants.as_ptr(), pixels.as_mut_ptr(),
+                    self.viewport.as_ptr(), self.scissor.as_ptr(), error.as_mut_ptr(), error.len(),
+                )
+            } else {
+                victory_metal_draw(
+                    self.handle.as_ptr(), vertices.as_ptr().cast(), vertex_count,
+                    constants.as_ptr(), pixels.as_mut_ptr(), true, self.viewport.as_ptr(),
+                    self.scissor.as_ptr(), error.as_mut_ptr(), error.len(),
+                )
+            }
+        };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
     fn draw_inner(
         &mut self,
         vertices: &[[f32; 4]],
@@ -468,6 +570,9 @@ impl Renderer {
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), RenderError> {
+        if self.vertex_uv {
+            return Err(RenderError("renderer requires position and UV vertices".into()));
+        }
         if vertices.is_empty()
             || vertices.len() % 3 != 0
             || pixels.len() != self.pixel_len
