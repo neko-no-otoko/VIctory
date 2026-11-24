@@ -1026,8 +1026,9 @@ pub(crate) fn metal_sampled_copy_mips(
 
 #[cfg(target_os = "macos")]
 fn sampled_desc(d: &ResourceDesc) -> bool {
+    // Default 4KB_S, linear, explicit 4KB_S, and explicit 64KB_D.
     d.dimension == 3 && matches!(d.format, 28 | 87) && d.depth_or_array_size == 1
-        && d.sample_count == 1 && d.sample_quality == 0 && matches!(d.layout, 0 | 1 | 0x105) && d.flags == 0
+        && d.sample_count == 1 && d.sample_quality == 0 && matches!(d.layout, 0 | 1 | 0x105 | 0x10a) && d.flags == 0
 }
 
 #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
