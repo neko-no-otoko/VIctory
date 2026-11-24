@@ -676,6 +676,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-acphal-dll"
+version = "0.1.0"
+dependencies = [
+ "victory-hle",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [

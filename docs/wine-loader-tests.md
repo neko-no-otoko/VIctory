@@ -706,13 +706,13 @@ On x86-64 macOS (including Rosetta on Apple Silicon), `victory wine-run`
 launches a trusted PE as a normal Wine process and starts a separate native
 Metal host. Supply the Wine executable, `winepath`, Metal host, Apple
 converter, Wine prefix and HLE DLL directory explicitly. The directory must
-contain `d3d12_xs.dll`, `xg_xs.dll`, `xgameruntime.dll`, `xmem.dll` and the
-private `victory_xmem_backend.dll`. For example, after the setup above:
+contain `d3d12_xs.dll`, `xg_xs.dll`, `xgameruntime.dll`, `xmem.dll`,
+`acphal.dll` and the private `victory_xmem_backend.dll`. For example:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/victory-launcher-target
 cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
-  -p victory-xmem-dll -p victory-xmem-backend --target x86_64-pc-windows-gnullvm
+  -p victory-xmem-dll -p victory-xmem-backend -p victory-acphal-dll --target x86_64-pc-windows-gnullvm
 cargo build --locked -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
 cargo build --locked -p victory --target x86_64-apple-darwin
 export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
@@ -731,7 +731,7 @@ child environments, not printed. Other same-user processes may be able to
 read those environments; the token is not a sandbox or a boundary against
 such processes. The launcher preserves unrelated environment settings,
 prepends the selected DLL directory to `WINEPATH`, and requires native loading
-for those four providers; conflicting existing provider overrides are
+for those five providers; conflicting existing provider overrides are
 rejected. `VICTORY_WINE_METAL_PRESENT=1` remains an inherited opt-in for the
 existing presentation path.
 
@@ -745,7 +745,7 @@ Windows, System, System32 and SysWOW64 directories. Unreadable directories,
 ambiguous Windows directory components and dangling provider links fail the
 check. These are snapshots, not pinned opens.
 
-Direct executable imports from the four providers are checked against their
+Direct executable imports from the five providers are checked against their
 named exports; provider ordinal imports are rejected. Transitive and dynamic
 imports, activation contexts, Known DLLs, loaded modules, path-specific
 registry overrides, guest-controlled search paths and changes after preflight
@@ -760,8 +760,8 @@ handles activation contexts and previously loaded modules before ordinary
 directory lookup. Its native/builtin
 [overrides](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/ntdll/unix/loadorder.c#L316-L423)
 select loading behavior, not an exact provider file. The launcher has no
-enforcement mechanism for those decisions. GameInput, if separately
-installed, is not provisioned or preflighted by this launcher.
+enforcement mechanism for those decisions. GameInput provisioning is a
+separate opt-in described above.
 
 The host readiness signal confirms binding, not converter ABI or shader
 support; converter loading and shader errors can occur on first use. Wine and
@@ -781,10 +781,11 @@ export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
 export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/examples/wine_metal_compute_host"
 export VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
 export VICTORY_TEST_DLL_DIR="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug"
+export VICTORY_TEST_GAMEINPUT_DLL=/path/to/gameinput.dll
 cargo test --locked -p victory --target x86_64-apple-darwin --test wine_launcher -- --ignored --nocapture
 ```
 
-On Wine 11 under Rosetta on an M3 Max, all six tests passed: a real
+On Wine 11 under Rosetta on an M3 Max, all seven tests passed: a real
 TLS-bearing Wine PE called the provider DLLs and verified Metal readback 42;
 unacknowledged search and known shadow DLLs were rejected; host exit and
 signal paths cleaned up the host; and two simultaneous launches used distinct
@@ -824,3 +825,32 @@ mapping callback against the same backend. It rejected an unknown import and
 the launcher rejected XMem and companion collisions. The queue check selects
 the local HLE path; the separate Metal launcher regression performs actual GPU
 compute readback, not a Metal tiled-page-mapping test.
+
+## Normal Wine AcpHal HLE DLL
+
+`acphal.dll` forwards the nine named exports in the existing AcpHal registry
+to its actual HLE implementation. The exports share one heap, SHAPE-context
+state and XMA decoder worker in the DLL. The DLL pins itself on first use so
+returned pointers, object vtables and the worker cannot outlive its code.
+Pinning failure terminates the process rather than returning unsafe objects.
+Other names are absent; linker-assigned ordinals are not claimed as console
+ordinal mappings.
+
+The upstream implementation is not complete audio hardware: XMA decoding,
+heap address translation and the ACP message/command subset are implemented,
+but SHAPE rate conversion, EQ, filtering and mixing are not. Some unknown
+commands are acknowledged without being executed, and configured heap sizes
+are not enforced as limits. This is not a claim that a title's audio works.
+
+With the launcher test environment above:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_acphal -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, three synthetic tests passed: a compiler-TLS PE
+used all named imports, concurrent heap operations, contexts, ACP message
+queues and a synthetic XMA stream; a separate guest verified module pinning
+after `FreeLibrary`; and unsupported imports, ordinal imports and a
+same-named DLL collision failed before host startup. The upstream HLE audio
+regression also passed five Windows tests under Wine.

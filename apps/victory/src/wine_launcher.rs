@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol, layout};
 
-const PROVIDERS: [&str; 4] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll"];
+const PROVIDERS: [&str; 5] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "acphal.dll"];
 const XMEM_BACKEND: &str = "victory_xmem_backend.dll";
 const XMEM_EXPORTS: [&str; 13] = [
     "XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
@@ -255,8 +255,8 @@ fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Resul
     }
 }
 fn wine_overrides(gameinput: bool) -> Result<OsString> {
-    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem", b"gameinput"];
-    let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime,xmem=n");
+    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem", b"acphal"];
+    let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime,xmem,acphal=n");
     if gameinput {
         result.push(";gameinput=n");
     }
@@ -271,7 +271,8 @@ fn wine_overrides(gameinput: bool) -> Result<OsString> {
                 let base = if basename.len() >= 4 && basename[basename.len()-4..].eq_ignore_ascii_case(b".dll") {
                     &basename[..basename.len()-4]
                 } else { basename };
-                if owned[..if gameinput { 5 } else { 4 }].iter().any(|item| base.eq_ignore_ascii_case(item)) {
+                if owned.iter().any(|item| base.eq_ignore_ascii_case(item))
+                    || (gameinput && base.eq_ignore_ascii_case(b"gameinput")) {
                     let mode = entry[eq+1..].trim_ascii();
                     if !mode.eq_ignore_ascii_case(b"n") && !mode.eq_ignore_ascii_case(b"native") {
                         bail!("conflicting WINEDLLOVERRIDES setting for {}", String::from_utf8_lossy(name));
