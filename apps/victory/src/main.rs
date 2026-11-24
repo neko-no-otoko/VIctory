@@ -3,22 +3,32 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(windows)]
 mod census;
 mod inspect;
+#[cfg(windows)]
 mod run;
+#[cfg(windows)]
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(windows)]
+use clap::ValueEnum;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "victory",
-    version,
-    about = "Run an Xbox Series title natively on Windows"
+#[command(name = "victory", version)]
+#[cfg_attr(
+    windows,
+    command(about = "Run an Xbox Series title natively on Windows")
+)]
+#[cfg_attr(
+    not(windows),
+    command(about = "Inspect PE images and COFF import libraries offline")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,6 +47,7 @@ enum Command {
         #[arg(long)]
         exports: bool,
     },
+    #[cfg(windows)]
     /// Aggregate the imports of every PE image under the given paths and
     /// show which ones our runtime covers. Defaults to the configured
     /// game and test-title directories.
@@ -56,6 +67,7 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    #[cfg(windows)]
     /// Find shader containers in files or directories (also inside engine
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
@@ -67,6 +79,7 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
+    #[cfg(windows)]
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     Translate {
@@ -85,6 +98,7 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    #[cfg(windows)]
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -105,16 +119,19 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    #[cfg(windows)]
     /// Show the resolved configuration and check it.
     Config,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, ValueEnum)]
 enum Unimplemented {
     Trap,
     Zero,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, ValueEnum)]
 enum Console {
     SeriesX,
@@ -122,6 +139,7 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -135,17 +153,20 @@ fn main() -> Result<()> {
             imports,
             exports,
         } => inspect::run(&file, imports, exports),
+        #[cfg(windows)]
         Command::Census {
             paths,
             strict,
             missing,
         } => census::run(paths, strict, missing),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
+        #[cfg(windows)]
         Command::ShaderInfo {
             paths,
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -153,6 +174,7 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        #[cfg(windows)]
         Command::Run {
             exe,
             unimplemented,
@@ -161,10 +183,12 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        #[cfg(windows)]
         Command::Config => show_config(),
     }
 }
 
+#[cfg(windows)]
 fn show_config() -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let status = |p: &Option<PathBuf>| match p {
@@ -196,6 +220,7 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 /// Paths given on the command line, or the configured game + test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     if !paths.is_empty() {

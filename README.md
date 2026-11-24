@@ -44,6 +44,22 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
+## Offline inspection on macOS
+
+The native macOS build supports read-only PE32+ x86-64 image and COFF import
+library inspection. It does not load or execute titles, provide Xbox runtime
+services, or implement a Metal renderer. These commands also work on Windows.
+Use the pinned Rust toolchain and build only the CLI package:
+
+```sh
+cargo build -p victory
+target/debug/victory inspect /path/to/title.exe --imports --exports
+target/debug/victory lib-exports /path/to/import.lib --list
+cargo test -p victory -p victory-pe
+```
+
+Input files are supplied by the user; see [the asset policy](docs/asset-policy.md).
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
