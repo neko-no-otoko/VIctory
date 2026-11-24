@@ -238,15 +238,16 @@ does not establish game compatibility or ARM-native PE execution.
 The opt-in proxy keeps D3D12.X HLE objects and vtables inside the Wine PE
 process. It copies bounded, ordered resource and command data over
 authenticated loopback TCP to a separate x86-64 macOS host, which uses
-VIctory's Metal paths and synchronously copies results back. No
+VIctory's Metal paths and returns each completed request's results. No
 guest pointers or COM objects cross the process boundary. Wine and the native
 host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
 execution. This is a trusted-workload experiment, not a process sandbox.
 
 The restricted compute path supports one committed default raw UAV buffer, a
 one-entry shader-visible heap, root constants in slot 0, descriptor table in
-slot 1, and synchronous dispatch/readback. Limits are 4 MiB per shader,
-16 MiB per buffer and 64 constant dwords. Restricted graphics and opt-in
+slot 1, and dispatch/readback. A pending queue wait can defer the work as
+described below. Limits are 4 MiB per shader, 16 MiB per buffer and 64
+constant dwords. Restricted graphics and opt-in
 presentation paths are described below. Root CBVs, general resource states
 and arbitrary D3D12.X methods remain unsupported; some unsupported void
 methods abort rather than pretend to succeed. The loopback bearer token is not
@@ -314,9 +315,9 @@ configured; these results are not evidence of game compatibility.
 Graphics submissions carry ID-keyed resources and pipelines and an ordered
 command stream. The proxy retains guest objects referenced by recorded
 commands, snapshots their data when the queue executes, and writes the
-resulting bytes and resource states back after the host completes. All proxy
-queue submissions are serialized and synchronous; this is not asynchronous
-fence or cross-process shared-memory support.
+resulting bytes and resource states back after the host completes. Host GPU
+work remains serialized and synchronous; an unsatisfied queue fence wait can
+defer subsequent operations without blocking the calling thread.
 
 The supported subset includes multiple full color/depth clears, buffer copies,
 full texture uploads and readbacks, resource transitions, and multiple
@@ -330,7 +331,7 @@ single sampled texture and point or linear clamp sampler. Shader constants
 must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
-This remains restricted: no asynchronous fences or partial clears,
+This remains restricted: no partial clears, cross-process shared fences,
 multi-mip or tiled textures, BGRA/sRGB/BC formats through this proxy, stencil,
 arbitrary sampler/address modes, or general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
@@ -449,10 +450,11 @@ environment before starting it. Without that opt-in, presentation requests
 fail and the helper remains headless. The Wine queue accepts one plane with
 one live RGBA8_UNORM resource and null present parameters. The plane token is
 accepted but does not pace presentation, matching the upstream shortcut.
-Submission and presentation are synchronous and serialized; source pixels
-and resource state are preserved. The caller must not modify mapped resources
-concurrently. Other formats, multiple planes, placement, non-null present
-parameters, HDR and general swap-chain behavior are unsupported.
+Presentation is synchronous and serialized; it returns `E_NOTIMPL` rather
+than bypassing a pending queue wait. Source pixels and resource state are
+preserved. The caller must not modify mapped resources concurrently. Other
+formats, multiple planes, placement, non-null present parameters, HDR and
+general swap-chain behavior are unsupported.
 
 The helper owns a visible AppKit window and `CAMetalLayer` on the macOS main
 thread. It stretches each source to the current view backing size, presents
@@ -519,6 +521,33 @@ as the base list; unimplemented methods still trap. Resource creation and
 presentation remain limited to the proxy subsets described above; placed or
 aliased resources and advanced queue semantics are not added by these IIDs.
 This is not complete Device11, console queue, or title compatibility.
+
+### Wine Metal queue fences
+
+The proxy supports non-shared `CreateFence` (zero flags), completed values,
+CPU `Signal` and `SetEventOnCompletion`, plus queue `Signal` and `Wait` on the
+same device for both documented queue layouts. Event registrations duplicate
+the supplied Windows event handle; a null event blocks the caller until the
+value is reached. Shared/cross-adapter fence flags, `UINT64_MAX` values and
+cross-device fence operations are rejected. Valid Windows event handles are
+required.
+
+Idle queues execute and read back GPU work synchronously. A queue waiting for
+an unreached value instead returns to the caller and retains subsequent work
+and signals in order on a per-queue worker. Another queue or CPU signal can
+release the wait. Queue and fence state and recorded resources stay alive for
+those queued operations, even if their guest COM references are released.
+An unsignaled dependency can remain pending indefinitely; the proxy never
+fabricates completion. Worker submission failures terminate rather than signal
+a false success. Fence state is process-local, not a shared Metal event or a
+cross-process Windows fence; advanced queue methods remain unsupported.
+
+With the launcher test environment below, run
+`cargo test --locked -p victory --target x86_64-apple-darwin --test wine_launcher launcher_runs_real_metal_fence_ordering -- --ignored --nocapture`.
+On Wine 11 under Rosetta the compiled TLS guest passed an unsignaled timeout,
+real translated compute/readback before signal, cross-queue wait and signal,
+event and object lifetimes, and old/new queue ABI checks. It does not establish
+game compatibility.
 
 With the presentation-enabled Metal helper running and the DLL environment
 below configured, the following test launches its compiled TLS-bearing PE

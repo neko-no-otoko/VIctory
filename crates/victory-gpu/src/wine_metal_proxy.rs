@@ -1,11 +1,11 @@
 //! Synchronous Wine D3D12.X bridge with copied, ordered graphics submissions.
 use std::{
     cell::UnsafeCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::c_void,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Arc, LazyLock, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{Arc, Condvar, LazyLock, Mutex, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
 use crate::object::{guid, HRESULT, Iid, Object, Table, This, E_INVALIDARG, E_NOINTERFACE, S_OK};
@@ -85,7 +85,8 @@ enum Data {
     Pipeline(Arc<Vec<u8>>),
     Allocator(u32),
     List(Arc<Mutex<ListState>>, bool),
-    Queue(Arc<Config>, u32),
+    Queue(Arc<ProxyQueue>),
+    Fence(Arc<ProxyFence>),
     Texture(Arc<Texture>),
     Rtv(Arc<Mutex<(Option<Arc<Texture>>, u64)>>),
     Dsv(Arc<Mutex<(Option<Arc<Texture>>, u64)>>),
@@ -164,6 +165,65 @@ struct ListState {
     kind: u32,
     graphics: GraphicsState,
 }
+
+struct EventHandle(usize);
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0 as *mut c_void); }
+    }
+}
+
+struct FenceState {
+    value: u64,
+    events: Vec<(u64, EventHandle)>,
+}
+struct ProxyFence {
+    config: Arc<Config>,
+    state: Mutex<FenceState>,
+    changed: Condvar,
+}
+impl ProxyFence {
+    fn value(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).value
+    }
+    fn wait(&self, value: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.value < value {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    fn signal(&self, value: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.value = value;
+        let mut index = 0;
+        while index < state.events.len() {
+            if state.events[index].0 <= value {
+                let (_, event) = state.events.swap_remove(index);
+                unsafe { windows_sys::Win32::System::Threading::SetEvent(event.0 as *mut c_void); }
+            } else {
+                index += 1;
+            }
+        }
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct QueueState {
+    active: bool,
+    pending: VecDeque<QueueOp>,
+}
+struct ProxyQueue {
+    config: Arc<Config>,
+    kind: u32,
+    state: Mutex<QueueState>,
+}
+enum QueueOp {
+    Wait(Arc<ProxyFence>, u64),
+    Signal(Arc<ProxyFence>, u64),
+    Compute(Vec<Job>),
+    Graphics(Vec<GraphicsJob>),
+}
 static OBJECTS: LazyLock<Mutex<HashMap<usize, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 fn objects() -> &'static Mutex<HashMap<usize, Entry>> {
@@ -181,6 +241,7 @@ fn supports(data: &Data, expected: Iid, iid: &Iid) -> bool {
     *iid == expected || *iid == UNKNOWN || (expected == LIST && *iid == GRAPHICS_LIST)
         || (matches!(data, Data::Device(c) if c.newer) && *iid == DEVICE11)
         || (matches!(data, Data::List(_, true)) && NEWER_LIST_IIDS.contains(iid))
+        || (matches!(data, Data::Fence(_)) && crate::fence::FENCE_IIDS.contains(iid))
 }
 fn new(data: Data, table: &'static Table<160>, iid: *const Iid, expected: Iid, out: *mut This) -> HRESULT {
     if iid.is_null() || out.is_null() {
@@ -195,7 +256,7 @@ fn new(data: Data, table: &'static Table<160>, iid: *const Iid, expected: Iid, o
     let mut header = Box::new(Header { object: Object::new(table), inline: [0; 180] });
     match &data {
         Data::Device(_) => header.inline[1] = 1,
-        Data::Queue(_, kind) => header.inline[0] = u64::from(*kind),
+        Data::Queue(queue) => header.inline[0] = u64::from(queue.kind),
         Data::List(state, _) => header.inline[0] = u64::from(state.lock().unwrap().kind),
         _ => {}
     }
@@ -220,7 +281,8 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         Data::Pipeline(_) => PIPELINE,
         Data::Allocator(_) => ALLOCATOR,
         Data::List(..) => LIST,
-        Data::Queue(_, _) => QUEUE,
+        Data::Queue(_) => QUEUE,
+        Data::Fence(_) => crate::fence::FENCE_IIDS[0],
         Data::Texture(_) => RESOURCE,
         Data::Rtv(_) | Data::Dsv(_) => HEAP,
         Data::GraphicsPipeline(_) => PIPELINE,
@@ -275,6 +337,7 @@ static DEVICE_TABLE: Table<160> = {
     t[48] = create_queue_x as *const ();
     t[73] = create_list_x as *const ();
     t[27] = create_resource as *const ();
+    t[36] = create_fence as *const ();
     Table(t)
 };
 static HEAP_TABLE: Table<160> = {
@@ -292,6 +355,13 @@ static BUFFER_TABLE: Table<160> = {
 };
 static PIPELINE_TABLE: Table<160> = Table(base());
 static ALLOCATOR_TABLE: Table<160> = Table(base());
+static FENCE_TABLE: Table<160> = {
+    let mut t = base();
+    t[8] = fence_completed as *const ();
+    t[9] = fence_event as *const ();
+    t[10] = fence_signal as *const ();
+    Table(t)
+};
 static LIST_TABLE: Table<160> = {
     let mut t = base();
     t[8] = list_type as *const ();
@@ -322,6 +392,8 @@ static LIST_TABLE: Table<160> = {
 static QUEUE_TABLE: Table<160> = {
     let mut t = base();
     t[10] = execute as *const ();
+    t[14] = queue_signal as *const ();
+    t[15] = queue_wait as *const ();
     t[30] = present as *const ();
     t[33] = execute_x as *const ();
     Table(t)
@@ -329,15 +401,36 @@ static QUEUE_TABLE: Table<160> = {
 static NEWER_QUEUE_TABLE: Table<160> = {
     let mut t = base();
     t[10] = execute as *const ();
+    t[16] = queue_signal as *const ();
+    t[17] = queue_wait as *const ();
     t[32] = present as *const ();
     t[35] = execute_x as *const ();
     Table(t)
 };
 
+fn pin_proxy() -> bool {
+    static PINNED: LazyLock<bool> = LazyLock::new(|| {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+        };
+        let mut module = std::ptr::null_mut();
+        // The proxy's objects and deferred queue worker contain code in this DLL.
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                create as *const () as *const u16,
+                &mut module,
+            ) != 0
+        }
+    });
+    *PINNED
+}
+
 pub(super) fn create(iid: &Iid, out: *mut This) -> HRESULT {
     unsafe { *out = std::ptr::null(); }
     match config() {
         Ok(mut c) if *iid == crate::device::IID || *iid == DEVICE11 => {
+            if !pin_proxy() { return FAIL; }
             c.newer = *iid == DEVICE11;
             new(Data::Device(Arc::new(c)), &DEVICE_TABLE, iid, crate::device::IID, out)
         }
@@ -573,7 +666,7 @@ extern "system" fn create_queue(this: This, d: *const QueueDesc, iid: *const Iid
         return E_INVALIDARG;
     }
     let table = if c.newer { &NEWER_QUEUE_TABLE } else { &QUEUE_TABLE };
-    new(Data::Queue(c, d.kind), table, iid, QUEUE, out)
+    new(Data::Queue(Arc::new(ProxyQueue { config: c, kind: d.kind, state: Mutex::new(QueueState::default()) })), table, iid, QUEUE, out)
 }
 
 #[repr(C)]
@@ -592,7 +685,66 @@ extern "system" fn create_queue_x(this: This, d: *const QueueDescX, iid: *const 
         return E_INVALIDARG;
     }
     let table = if c.newer { &NEWER_QUEUE_TABLE } else { &QUEUE_TABLE };
-    new(Data::Queue(c, d.kind), table, iid, QUEUE, out)
+    new(Data::Queue(Arc::new(ProxyQueue { config: c, kind: d.kind, state: Mutex::new(QueueState::default()) })), table, iid, QUEUE, out)
+}
+
+extern "system" fn create_fence(this: This, initial: u64, flags: u32, iid: *const Iid, out: *mut This) -> HRESULT {
+    if !out.is_null() { unsafe { *out = std::ptr::null(); } }
+    let Some(config) = device(this) else { return E_INVALIDARG; };
+    if flags != 0 || initial == u64::MAX { return E_INVALIDARG; }
+    let fence = ProxyFence {
+        config,
+        state: Mutex::new(FenceState { value: initial, events: Vec::new() }),
+        changed: Condvar::new(),
+    };
+    new(Data::Fence(Arc::new(fence)), &FENCE_TABLE, iid, crate::fence::FENCE_IIDS[0], out)
+}
+
+extern "system" fn fence_completed(this: This) -> u64 {
+    match data(this) { Some(Data::Fence(fence)) => fence.value(), _ => u64::MAX }
+}
+
+extern "system" fn fence_signal(this: This, value: u64) -> HRESULT {
+    let Some(Data::Fence(fence)) = data(this) else { return E_INVALIDARG; };
+    if value == u64::MAX { return E_INVALIDARG; }
+    fence.signal(value);
+    S_OK
+}
+
+extern "system" fn fence_event(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetEvent};
+    let Some(Data::Fence(fence)) = data(this) else { return E_INVALIDARG; };
+    if value == u64::MAX { return E_INVALIDARG; }
+    if event.is_null() {
+        fence.wait(value);
+        return S_OK;
+    }
+    let mut copy = std::ptr::null_mut();
+    let process = unsafe { GetCurrentProcess() };
+    if unsafe { DuplicateHandle(process, event, process, &mut copy, 0, 0, DUPLICATE_SAME_ACCESS) } == 0 {
+        return E_INVALIDARG;
+    }
+    let copy = EventHandle(copy as usize);
+    let mut state = fence.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.value >= value {
+        if unsafe { SetEvent(copy.0 as *mut c_void) } == 0 { return E_INVALIDARG; }
+    } else {
+        state.events.push((value, copy));
+    }
+    S_OK
+}
+
+extern "system" fn queue_signal(this: This, fence: This, value: u64) -> HRESULT {
+    let (Some(Data::Queue(queue)), Some(Data::Fence(fence))) = (data(this), data(fence)) else { return E_INVALIDARG; };
+    if value == u64::MAX || !Arc::ptr_eq(&queue.config, &fence.config) { return E_INVALIDARG; }
+    submit_queue(&queue, QueueOp::Signal(fence, value))
+}
+
+extern "system" fn queue_wait(this: This, fence: This, value: u64) -> HRESULT {
+    let (Some(Data::Queue(queue)), Some(Data::Fence(fence))) = (data(this), data(fence)) else { return E_INVALIDARG; };
+    if value == u64::MAX || !Arc::ptr_eq(&queue.config, &fence.config) { return E_INVALIDARG; }
+    submit_queue(&queue, QueueOp::Wait(fence, value))
 }
 
 #[repr(C)]
@@ -786,56 +938,104 @@ fn run(c: &Config, j: &Job) -> Result<(), String> {
     tracing::info!("Wine Metal proxy connected");
     Ok(())
 }
-extern "system" fn execute(this: This, count: u32, lists: *const This) {
-    let Some(Data::Queue(c, kind)) = data(this) else {
-        trap("invalid queue");
-    };
-    if count == 0 || lists.is_null() {
-        trap("invalid command lists");
+fn perform_queue_op(queue: &ProxyQueue, op: QueueOp) -> Result<(), String> {
+    match op {
+        QueueOp::Wait(fence, value) => fence.wait(value),
+        QueueOp::Signal(fence, value) => fence.signal(value),
+        QueueOp::Compute(jobs) => {
+            let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+            for job in &jobs {
+                let descriptor = job.heap.lock().unwrap_or_else(|e| e.into_inner());
+                if !descriptor.as_ref().is_some_and(|buffer| Arc::ptr_eq(buffer, &job.buffer)) {
+                    return Err("UAV descriptor changed after dispatch".into());
+                }
+                run(&queue.config, job)?;
+            }
+        }
+        QueueOp::Graphics(jobs) => {
+            if !jobs.is_empty() {
+                let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+                run_graphics(&queue.config, &jobs)?;
+            }
+        }
     }
-    let _submission = SUBMISSION.lock().unwrap();
+    Ok(())
+}
+
+// Idle queues keep the existing synchronous submission contract. An
+// unsatisfied queue wait starts a per-queue worker; later operations are
+// retained in FIFO order without blocking the caller or the global GPU lock.
+fn submit_queue(queue: &Arc<ProxyQueue>, op: QueueOp) -> HRESULT {
+    let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.active {
+        state.pending.push_back(op);
+        return S_OK;
+    }
+    if let QueueOp::Wait(fence, value) = &op {
+        if fence.value() >= *value { return S_OK; }
+        state.pending.push_back(op);
+        state.active = true;
+        let queue = queue.clone();
+        if std::thread::Builder::new().name("victory-wine-queue".into()).spawn(move || {
+            loop {
+                let next = {
+                    let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+                    match state.pending.pop_front() {
+                        Some(op) => op,
+                        None => { state.active = false; return; }
+                    }
+                };
+                if let Err(error) = perform_queue_op(&queue, next) { trap(&error); }
+            }
+        }).is_err() {
+            state.active = false;
+            state.pending.clear();
+            return FAIL;
+        }
+        return S_OK;
+    }
+    if let Err(error) = perform_queue_op(queue, op) { trap(&error); }
+    S_OK
+}
+
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    let Some(Data::Queue(queue)) = data(this) else { trap("invalid queue"); };
+    if count == 0 || lists.is_null() { trap("invalid command lists"); }
     let mut graphics_jobs = Vec::new();
+    let mut compute_jobs = Vec::new();
     for &p in unsafe { std::slice::from_raw_parts(lists, count as usize) } {
         let l = list(p);
         let l = l.lock().unwrap();
-        if !l.closed || l.invalid || l.kind != kind {
-            trap("invalid or open command list");
-        }
+        if !l.closed || l.invalid || l.kind != queue.kind { trap("invalid or open command list"); }
         if l.kind == 0 {
             graphics_jobs.extend(l.graphics.jobs.iter().cloned());
-            continue;
-        }
-        for j in &l.jobs {
-            let descriptor = j.heap.lock().unwrap();
-            if !descriptor.as_ref().is_some_and(|b| Arc::ptr_eq(b, &j.buffer)) {
-                trap("UAV descriptor changed after dispatch");
-            }
-            if let Err(e) = run(&c, j) {
-                trap(&e);
-            }
+        } else {
+            compute_jobs.extend(l.jobs.iter().cloned());
         }
     }
-    if kind == 0 && !graphics_jobs.is_empty() {
-        if let Err(e) = run_graphics(&c, &graphics_jobs) { trap(&e); }
-    }
+    let op = if queue.kind == 0 { QueueOp::Graphics(graphics_jobs) } else { QueueOp::Compute(compute_jobs) };
+    if submit_queue(&queue, op) != S_OK { trap("could not schedule queue submission"); }
 }
 
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, flags: u32) {
     if flags != 0 { trap("unsupported command submission flags"); }
-    // Frame tokens are pacing metadata; submissions here complete in order.
+    // Frame tokens are pacing metadata; submission order is preserved.
     execute(this, count, lists);
 }
 
 extern "system" fn present(this: This, planes: u32, plane: *const crate::queue::Plane, parameters: *const u8) -> HRESULT {
-    let Some(Data::Queue(c, 0)) = data(this) else { return E_INVALIDARG; };
+    let Some(Data::Queue(queue)) = data(this) else { return E_INVALIDARG; };
+    if queue.kind != 0 { return E_INVALIDARG; }
     if planes != 1 || plane.is_null() || !parameters.is_null() { return E_INVALIDARG; }
     let plane = unsafe { &*plane };
     if plane.count != 1 || plane.resources.is_null() { return E_INVALIDARG; }
+    let state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.active { return crate::object::E_NOTIMPL; }
     let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Data::Texture(texture)) = data(unsafe { *plane.resources }) else { return E_INVALIDARG; };
     if texture.format != 28 { return E_INVALIDARG; }
     let bytes = texture.bytes.lock().unwrap_or_else(|e| e.into_inner());
-    match crate::wine_present::send(c.addr, c.token, texture.width, texture.height, texture.format, texture.width * 4, &bytes, false) {
+    match crate::wine_present::send(queue.config.addr, queue.config.token, texture.width, texture.height, texture.format, texture.width * 4, &bytes, false) {
         Ok(_) => S_OK,
         Err(e) => { tracing::error!(%e, "Wine presentation failed"); FAIL }
     }

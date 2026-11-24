@@ -115,6 +115,22 @@ impl Fixture {
         exe
     }
 
+    fn build_fence(&self) -> PathBuf {
+        let dir = self.temp.path();
+        // Build the existing fixture to prepare its provider import libraries.
+        self.build();
+        let exe = dir.join("fence.exe");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wine_launcher_fence.c");
+        let mut cmd = Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"));
+        cmd.args(["-std=c11", "-fno-emulated-tls", "-O1"]).arg(source);
+        for name in ["d3d12_xs", "xg_xs", "xgameruntime"] {
+            cmd.arg(dir.join(format!("{name}.lib")));
+        }
+        cmd.arg("-o").arg(&exe);
+        self.checked(&mut cmd);
+        exe
+    }
+
     fn build_gameinput(&self, ordinal: u16) -> PathBuf {
         let dir = self.temp.path();
         // Reuse the ordinary provider import libraries built by the existing fixture.
@@ -234,6 +250,20 @@ fn launcher_runs_real_provider_tls_and_metal_compute() {
         "Provider threads and static TLS callbacks passed", "D3D12X synthetic compute readback 42"] {
         assert!(out.stdout.contains(marker), "missing {marker}\n{}\n{}", out.stdout, out.stderr);
     }
+    f.assert_host_gone();
+}
+
+#[test]
+#[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn launcher_runs_real_metal_fence_ordering() {
+    let f = Fixture::new();
+    let exe = f.build_fence();
+    let host = f.tracked_host();
+    let mut cmd = f.command(&exe, &host);
+    let out = run(&mut cmd, f.temp.path());
+    assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("D3D12X Wine Metal fence ordering passed"),
+        "missing fence ordering marker\n{}\n{}", out.stdout, out.stderr);
     f.assert_host_gone();
 }
 
