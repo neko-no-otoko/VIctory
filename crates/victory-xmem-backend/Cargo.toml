@@ -1,0 +1,19 @@
+[package]
+name = "victory-xmem-backend"
+description = "Shared XMem implementation for Wine-facing VIctory DLLs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "victory_xmem_backend"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+victory-hle.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true
