@@ -311,17 +311,22 @@ The native resolver also exposes restricted `VirtualAlloc`, `VirtualFree`,
 only its own anonymous reservations and uses 64-KiB reservation alignment and
 the host's translated page size. It supports reserve, reserve-and-commit,
 commit within a tracked reservation, nonzero-range decommit, and whole-region
-release. Supported protections are `PAGE_NOACCESS`, `PAGE_READONLY`, and
-`PAGE_READWRITE`; executable pages and other flags are rejected. Explicit
-addresses for new reservations and null-address commit-only calls are not
+release. Supported protections are `PAGE_NOACCESS`, `PAGE_READONLY`,
+`PAGE_READWRITE`, `PAGE_EXECUTE`, and `PAGE_EXECUTE_READ`. Writable-executable
+protections and other flags are rejected; host security policy can also deny
+executable mappings. Execute-only pages may be readable on x86 hardware.
+Explicit addresses for new reservations and null-address commit-only calls are not
 supported. Recommitted pages are zeroed; protection changes require committed
 pages. `VirtualQuery` reports the allocation and contiguous state/protection
 run from the queried page forward for tracked reservations. It rejects
 untracked addresses rather than describing host mappings or reporting them as
-free; a full 48-byte Windows x64 result buffer is required.
+free; a full 48-byte Windows x64 result buffer is required. On macOS,
+executable transitions synchronize the instruction cache; the guest must
+quiesce writers and synchronize other threads, and must not execute the range
+until the transition returns. This is not a sandbox or a general JIT runtime.
 `GetLastError` and `SetLastError` share the file provider's thread-local
 error state and are available without a file root. This is not Windows process
-initialization or executable guest memory support.
+initialization or game support.
 
 The native `kernel32.dll` resolver also provides `QueryPerformanceCounter`,
 `QueryPerformanceFrequency`, `GetTickCount64`, and `Sleep`. The counters use

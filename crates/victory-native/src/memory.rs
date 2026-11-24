@@ -16,6 +16,8 @@ const MEM_PRIVATE: u32 = 0x20000;
 const PAGE_NOACCESS: u32 = 1;
 const PAGE_READONLY: u32 = 2;
 const PAGE_READWRITE: u32 = 4;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
@@ -57,9 +59,31 @@ fn protection(value: u32) -> Option<i32> {
         PAGE_NOACCESS => Some(libc::PROT_NONE),
         PAGE_READONLY => Some(libc::PROT_READ),
         PAGE_READWRITE => Some(libc::PROT_READ | libc::PROT_WRITE),
+        PAGE_EXECUTE => Some(libc::PROT_EXEC),
+        PAGE_EXECUTE_READ => Some(libc::PROT_READ | libc::PROT_EXEC),
         _ => None,
     }
 }
+
+fn executable(value: u32) -> bool {
+    matches!(value, PAGE_EXECUTE | PAGE_EXECUTE_READ)
+}
+
+// The mapping lock serializes provider operations, not guest writes or
+// execution. Guests must finish writing and synchronize other threads before
+// changing protection, and must not execute the range until the call returns.
+// This cache maintenance makes those completed writes visible to instruction
+// fetch; it does not itself provide guest-thread synchronization.
+#[cfg(target_os = "macos")]
+unsafe fn invalidate_instruction_cache(address: *mut c_void, len: usize) {
+    unsafe extern "C" {
+        fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    }
+    unsafe { sys_icache_invalidate(address, len); }
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn invalidate_instruction_cache(_address: *mut c_void, _len: usize) {}
 fn round_up(value: usize, align: usize) -> Option<usize> {
     value.checked_add(align - 1).map(|n| n / align * align)
 }
@@ -126,6 +150,9 @@ extern "win64" fn virtual_alloc(address: *mut c_void, size: usize, kind: u32, pr
                 unsafe { libc::munmap(base as *mut c_void, len); }
                 return error(ERROR_NOT_ENOUGH_MEMORY, null);
             }
+            if executable(protect) {
+                unsafe { invalidate_instruction_cache(base as *mut c_void, len); }
+            }
             pages.fill(protect);
         }
         map.insert(base, Reservation { size: len, allocation_protect: protect, pages });
@@ -139,33 +166,47 @@ extern "win64" fn virtual_alloc(address: *mut c_void, size: usize, kind: u32, pr
     let end = first + len / page;
     // Recommitting a committed page is a no-op, including its protection.
     // Zero newly committed pages explicitly: Darwin's advice need not discard
-    // contents immediately. Roll back all newly committed runs on failure.
+    // contents immediately. The private marker identifies only runs changed by
+    // this call, so rollback never alters previously committed pages.
+    const NEW: u32 = 0x8000_0000;
     let mut i = first;
+    let mut failed = false;
     while i < end {
         if reservation.pages[i] != 0 { i += 1; continue; }
         let begin = i;
         while i < end && reservation.pages[i] == 0 { i += 1; }
         let ptr = (base + begin * page) as *mut c_void;
         let bytes = (i - begin) * page;
-        let ok = unsafe {
-            if libc::mprotect(ptr, bytes, libc::PROT_READ | libc::PROT_WRITE) != 0 { false }
-            else {
-                ptr::write_bytes(ptr, 0, bytes);
-                libc::mprotect(ptr, bytes, host_protect) == 0
-            }
-        };
-        if !ok {
-            for j in first..i {
-                if reservation.pages[j] == 0 {
-                    unsafe { libc::mprotect((base + j * page) as *mut c_void, page, libc::PROT_NONE); }
-                }
-            }
-            return error(ERROR_NOT_ENOUGH_MEMORY, null);
+        if unsafe { libc::mprotect(ptr, bytes, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+            failed = true;
+            break;
         }
+        reservation.pages[begin..i].fill(NEW | PAGE_READWRITE);
+        unsafe {
+            ptr::write_bytes(ptr, 0, bytes);
+            if executable(protect) { invalidate_instruction_cache(ptr, bytes); }
+        }
+        if unsafe { libc::mprotect(ptr, bytes, host_protect) } != 0 {
+            failed = true;
+            break;
+        }
+        reservation.pages[begin..i].fill(NEW | protect);
     }
-    for state in &mut reservation.pages[first..end] {
-        if *state == 0 { *state = protect; }
+    let mut i = first;
+    while i < end {
+        let state = reservation.pages[i];
+        if state & NEW == 0 { i += 1; continue; }
+        let begin = i;
+        while i < end && reservation.pages[i] == state { i += 1; }
+        let actual = state & !NEW;
+        let restored = failed && unsafe {
+            libc::mprotect((base + begin * page) as *mut c_void, (i - begin) * page, libc::PROT_NONE) == 0
+        };
+        // If rollback itself fails, retain the host protection in the query
+        // state rather than claiming these pages are inaccessible reservations.
+        reservation.pages[begin..i].fill(if restored { 0 } else { actual });
     }
+    if failed { return error(ERROR_NOT_ENOUGH_MEMORY, null); }
     start as *mut c_void
 }
 
@@ -205,6 +246,11 @@ extern "win64" fn virtual_protect(address: *mut c_void, size: usize, protect: u3
     let pages = &mut reservation.pages[first..first + len / page];
     if pages.contains(&0) { return error(ERROR_INVALID_ADDRESS, 0); }
     if unsafe { libc::mprotect(start as *mut c_void, len, host_protect) } != 0 { return error(ERROR_INVALID_ADDRESS, 0); }
+    // Flush all executable transitions, including READONLY -> EXEC after an
+    // earlier write. The guest must not execute until this call returns.
+    if executable(protect) {
+        unsafe { invalidate_instruction_cache(start as *mut c_void, len); }
+    }
     // The guest must provide a writable old-protection pointer.
     unsafe { *old = pages[0]; }
     pages.fill(protect);
@@ -335,6 +381,36 @@ mod tests {
         assert_eq!(virtual_protect(base, page * 3, PAGE_READWRITE, &mut old), 0);
         assert_eq!(virtual_free(base, 0, MEM_RELEASE), 1);
         assert_eq!(virtual_free(base, 0, MEM_RELEASE), 0);
+    }
+    #[test]
+    fn executable_pages_keep_distinct_tracked_protections() {
+        let page = page_size();
+        let base = virtual_alloc(ptr::null_mut(), page * 2, MEM_RESERVE, PAGE_EXECUTE_READ);
+        assert!(!base.is_null());
+        assert_eq!(virtual_alloc(base, page, MEM_COMMIT, PAGE_READWRITE), base);
+        unsafe { *(base as *mut u8) = 42; }
+        let mut old = 0;
+        assert_eq!(virtual_protect(base, page, PAGE_READONLY, &mut old), 1);
+        assert_eq!(old, PAGE_READWRITE);
+        assert_eq!(virtual_protect(base, page, PAGE_EXECUTE_READ, &mut old), 1);
+        assert_eq!(old, PAGE_READONLY);
+        let second = (base as usize + page) as *mut c_void;
+        assert_eq!(virtual_alloc(second, page, MEM_COMMIT, PAGE_EXECUTE), second);
+        let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::uninit();
+        assert_eq!(virtual_query(base, info.as_mut_ptr(), 48), 48);
+        let first = unsafe { info.assume_init_read() };
+        assert_eq!((first.state, first.protect, first.region_size), (MEM_COMMIT, PAGE_EXECUTE_READ, page));
+        assert_eq!(first.allocation_protect, PAGE_EXECUTE_READ);
+        assert_eq!(virtual_query(second, info.as_mut_ptr(), 48), 48);
+        let second_info = unsafe { info.assume_init_read() };
+        assert_eq!((second_info.state, second_info.protect), (MEM_COMMIT, PAGE_EXECUTE));
+        assert_eq!(virtual_protect(base, page, 0x40, &mut old), 0);
+        assert_eq!(virtual_protect(base, page, 0x80, &mut old), 0);
+        assert_eq!(virtual_free(second, page, MEM_DECOMMIT), 1);
+        assert_eq!(virtual_query(second, info.as_mut_ptr(), 48), 48);
+        let reserved = unsafe { info.assume_init_read() };
+        assert_eq!((reserved.state, reserved.protect), (MEM_RESERVE, 0));
+        assert_eq!(virtual_free(base, 0, MEM_RELEASE), 1);
     }
     #[test]
     fn rejects_unsupported_and_unowned_ranges() {

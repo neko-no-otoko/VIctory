@@ -961,6 +961,119 @@ unsigned entry(void) {
 }
 
 #[test]
+fn native_fixture_executes_protected_virtual_memory() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nVirtualAlloc\nVirtualFree\nVirtualProtect\nVirtualQuery\nGetLastError\nSetLastError\n").unwrap();
+    std::fs::write(dir.path().join("execute.c"), r#"
+typedef unsigned long DWORD;
+typedef unsigned long long SIZE_T;
+typedef int BOOL;
+typedef struct {
+    void *BaseAddress, *AllocationBase;
+    DWORD AllocationProtect, alignment1;
+    SIZE_T RegionSize;
+    DWORD State, Protect, Type, alignment2;
+} MEMORY_BASIC_INFORMATION;
+_Static_assert(sizeof(MEMORY_BASIC_INFORMATION) == 48, "x64 MBI size");
+__declspec(dllimport) void *VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
+__declspec(dllimport) BOOL VirtualFree(void *, SIZE_T, DWORD);
+__declspec(dllimport) BOOL VirtualProtect(void *, SIZE_T, DWORD, DWORD *);
+__declspec(dllimport) SIZE_T VirtualQuery(const void *, MEMORY_BASIC_INFORMATION *, SIZE_T);
+__declspec(dllimport) DWORD GetLastError(void);
+__declspec(dllimport) void SetLastError(DWORD);
+#define COMMIT 0x1000
+#define RESERVE 0x2000
+#define DECOMMIT 0x4000
+#define RELEASE 0x8000
+#define READWRITE 0x04
+#define EXECUTE 0x10
+#define EXECUTE_READ 0x20
+#define EXECUTE_READWRITE 0x40
+#define EXECUTE_WRITECOPY 0x80
+#define PRIVATE 0x20000
+#define PAGE 4096ULL
+int execute_marker = 7;
+int *volatile execute_relocation = &execute_marker;
+static int region(void *p, DWORD state, DWORD protect) {
+    MEMORY_BASIC_INFORMATION m;
+    return VirtualQuery(p, &m, sizeof(m)) == sizeof(m) &&
+        m.BaseAddress == p && m.AllocationBase == p &&
+        m.AllocationProtect == READWRITE && m.RegionSize == PAGE &&
+        m.State == state && m.Protect == protect && m.Type == PRIVATE;
+}
+unsigned entry(void) {
+    volatile unsigned char *p;
+    DWORD old, untouched;
+    unsigned (*code)(void);
+    if (*execute_relocation != 7) return 1;
+    p = (volatile unsigned char *)VirtualAlloc(0, PAGE, RESERVE | COMMIT, READWRITE);
+    if (!p || !region((void *)p, COMMIT, READWRITE)) return 2;
+    /* mov eax, 42; ret */
+    p[0] = 0xb8; p[1] = 42; p[2] = 0; p[3] = 0; p[4] = 0; p[5] = 0xc3;
+    untouched = 0xdeadbeef;
+    SetLastError(0);
+    if (VirtualProtect((void *)p, PAGE, EXECUTE_READWRITE, &untouched) ||
+        !GetLastError() || untouched != 0xdeadbeef) return 3;
+    SetLastError(0);
+    if (VirtualProtect((void *)p, PAGE, EXECUTE_WRITECOPY, &untouched) ||
+        !GetLastError() || untouched != 0xdeadbeef) return 4;
+    SetLastError(0);
+    if (VirtualAlloc(0, PAGE, RESERVE | COMMIT, EXECUTE_READWRITE) || !GetLastError()) return 5;
+    SetLastError(0);
+    if (VirtualAlloc(0, PAGE, RESERVE | COMMIT, EXECUTE_WRITECOPY) || !GetLastError()) return 6;
+    if (!region((void *)p, COMMIT, READWRITE)) return 7;
+    if (!VirtualProtect((void *)p, PAGE, EXECUTE_READ, &old) || old != READWRITE) return 8;
+    if (!region((void *)p, COMMIT, EXECUTE_READ)) return 9;
+    code = (unsigned (*)(void))p;
+    if (code() != 42) return 10;
+#ifdef FAULT_EXECUTE_WRITE
+    p[1] = 17;
+    return 90;
+#endif
+    if (!VirtualProtect((void *)p, PAGE, EXECUTE, &old) || old != EXECUTE_READ) return 11;
+    if (!region((void *)p, COMMIT, EXECUTE) || code() != 42) return 12;
+    if (!VirtualProtect((void *)p, PAGE, READWRITE, &old) || old != EXECUTE) return 13;
+    p[1] = 73;
+    if (!VirtualProtect((void *)p, PAGE, EXECUTE_READ, &old) || old != READWRITE) return 14;
+    if (code() != 73) return 15;
+    if (!VirtualFree((void *)p, PAGE, DECOMMIT)) return 16;
+    if (!region((void *)p, RESERVE, 0)) return 17;
+    untouched = 0xdeadbeef;
+    SetLastError(0);
+    if (VirtualProtect((void *)p, PAGE, EXECUTE_READ, &untouched) ||
+        !GetLastError() || untouched != 0xdeadbeef) return 18;
+    if (!VirtualFree((void *)p, 0, RELEASE)) return 19;
+    SetLastError(0);
+    if (VirtualQuery((void *)p, &(MEMORY_BASIC_INFORMATION){0}, sizeof(MEMORY_BASIC_INFORMATION)) ||
+        !GetLastError()) return 20;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    for (name, define) in [("execute", ""), ("execute_write_fault", "-DFAULT_EXECUTE_WRITE")] {
+        let object = format!("{name}.obj");
+        let executable = format!("{name}.exe");
+        let mut args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"];
+        if !define.is_empty() {
+            args.push(define);
+        }
+        args.extend(["-c", "execute.c", "-o", &object]);
+        tool(dir.path(), "x86_64-w64-mingw32-clang", &args);
+        tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", &format!("/out:{executable}"), &object, "kernel32.lib"]);
+        let exe = dir.path().join(executable);
+        let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+        if define.is_empty() {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+        } else {
+            assert!(matches!(output.status.signal(), Some(10 | 11)), "{name}: status {:?}, stdout {}, stderr {}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
+#[test]
 fn native_fixture_maps_only_scoped_game_files() {
     let dir = tempfile::tempdir().unwrap();
     let game = dir.path().join("game");
