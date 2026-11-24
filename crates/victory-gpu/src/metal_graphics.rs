@@ -1,6 +1,12 @@
 //! Restricted vertex/pixel pipelines for the offscreen Metal renderer.
 use std::ffi::CStr;
 use victory_shader::{Container, FourCC, HwStage, emit, io, ir, native, resource};
+#[derive(Clone, Copy)]
+pub(crate) struct GraphicsState {
+    depth: Option<victory_metal::DepthState>,
+    blend: victory_metal::BlendState,
+}
+
 
 pub(crate) struct Prepared {
     vertex: Vec<u8>,
@@ -10,6 +16,7 @@ pub(crate) struct Prepared {
     pub(crate) texture_slot: Option<u8>,
     pub(crate) sampler_slot: Option<u8>,
     pub(crate) depth: Option<victory_metal::DepthState>,
+    blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
 }
 
@@ -18,7 +25,7 @@ pub(crate) struct Prepared {
 unsafe impl Send for Prepared {}
 
 impl Prepared {
-    pub(crate) fn new(vertex: &[u8], pixel: &[u8], depth: Option<victory_metal::DepthState>) -> Result<Self, String> {
+    pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
         let (vertex, _, _, _, _) = convert(vertex, HwStage::Vs)?;
         let (pixel, user_data, dwords, texture_slot, sampler_slot) = convert(pixel, HwStage::Ps)?;
         Ok(Self {
@@ -28,7 +35,8 @@ impl Prepared {
             dwords,
             texture_slot,
             sampler_slot,
-            depth,
+            depth: graphics.depth,
+            blend: graphics.blend,
             renderer: None,
         })
     }
@@ -53,17 +61,10 @@ impl Prepared {
             return Err("depth attachment does not match pipeline".into());
         }
         if !matches!(&self.renderer, Some((w, h, _)) if *w == width && *h == height) {
-            let renderer = if let Some(state) = self.depth {
-                victory_metal::Renderer::new_depth(
-                    &self.vertex, "main", &self.pixel, "main", width, height,
-                    self.dwords as u32, self.texture_slot.is_some(), state,
-                )
-            } else {
-                victory_metal::Renderer::new(
-                    &self.vertex, "main", &self.pixel, "main", width, height,
-                    self.dwords as u32, self.texture_slot.is_some(),
-                )
-            }.map_err(|e| e.to_string())?;
+            let renderer = victory_metal::Renderer::new_configured(
+                &self.vertex, "main", &self.pixel, "main", width, height,
+                self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
+            ).map_err(|e| e.to_string())?;
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
@@ -419,6 +420,7 @@ pub(crate) struct StreamState {
     error: Option<String>,
     depth: Option<victory_metal::DepthState>,
     depth_format: u32,
+    blend: Option<victory_metal::BlendState>,
 }
 
 impl StreamState {
@@ -441,6 +443,24 @@ impl StreamState {
         let valid = match kind {
             0 => data[8..16] == [0; 8],
             1 | 2 => true,
+            // One RT; D3D ignores RT1..7 when independent blending is off.
+            8 => {
+                let (enabled, logic, mask) = (get(12), get(16), data[48]);
+                let basic = get(4) == 0 && get(8) == 0 && enabled <= 1 && logic == 0 && mask <= 15;
+                let factors = enabled == 0 || (
+                    get(20) == 5 && get(24) == 6 && get(28) == 1
+                    && matches!(get(32), 2 | 5) && get(36) == 6 && get(40) == 1
+                );
+                if basic && factors {
+                    self.blend = Some(victory_metal::BlendState {
+                        enabled: enabled == 1, write_mask: mask,
+                        alpha_source: enabled == 1 && get(32) == 5,
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
             // Solid, no culling, no bias, depth clipping on, no MSAA or conservative raster.
             10 => {
                 get(4) == 3
@@ -478,7 +498,7 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<Option<victory_metal::DepthState>, String> {
+    pub(crate) fn finish(self) -> Result<GraphicsState, String> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -493,7 +513,12 @@ impl StreamState {
         {
             return Err("depth format does not match depth state".into());
         }
-        Ok(self.depth)
+        Ok(GraphicsState {
+            depth: self.depth,
+            blend: self.blend.unwrap_or(victory_metal::BlendState {
+                enabled: false, write_mask: 15, alpha_source: false,
+            }),
+        })
     }
 }
 

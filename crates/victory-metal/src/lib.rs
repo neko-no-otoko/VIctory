@@ -38,6 +38,9 @@ unsafe extern "C" {
         fragment_texture: bool,
         depth_compare: u32,
         depth_write: bool,
+        blend_enabled: bool,
+        write_mask: u8,
+        alpha_source: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -159,6 +162,14 @@ pub struct DepthState {
     pub compare: u32,
 }
 
+/// Source-alpha blending and D3D RGBA channel write mask.
+#[derive(Clone, Copy, Debug)]
+pub struct BlendState {
+    pub enabled: bool,
+    pub write_mask: u8,
+    pub alpha_source: bool,
+}
+
 
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
 ///
@@ -205,8 +216,9 @@ impl Renderer {
         fragment_constant_dwords: u32,
         fragment_texture: bool,
     ) -> Result<Self, RenderError> {
-        Self::new_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
-                        width, height, fragment_constant_dwords, fragment_texture, None)
+        Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                             width, height, fragment_constant_dwords, fragment_texture, None,
+                             BlendState { enabled: false, write_mask: 15, alpha_source: false })
     }
 
     pub fn new_depth(
@@ -214,18 +226,22 @@ impl Renderer {
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, state: DepthState,
     ) -> Result<Self, RenderError> {
-        if !(1..=8).contains(&state.compare) {
-            return Err(RenderError("invalid depth comparison".into()));
-        }
-        Self::new_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
-                        width, height, fragment_constant_dwords, fragment_texture, Some(state))
+        Self::new_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                             width, height, fragment_constant_dwords, fragment_texture, Some(state),
+                             BlendState { enabled: false, write_mask: 15, alpha_source: false })
     }
 
-    fn new_inner(
+    pub fn new_configured(
         vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
-        fragment_texture: bool, depth: Option<DepthState>,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
     ) -> Result<Self, RenderError> {
+        if depth.is_some_and(|state| !(1..=8).contains(&state.compare)) {
+            return Err(RenderError("invalid depth comparison".into()));
+        }
+        if blend.write_mask & !15 != 0 {
+            return Err(RenderError("invalid color write mask".into()));
+        }
         if width == 0 || height == 0 || vertex_metallib.is_empty() || fragment_metallib.is_empty() {
             return Err(RenderError(
                 "nonzero dimensions and both metallibs are required".into(),
@@ -261,6 +277,9 @@ impl Renderer {
                 fragment_texture,
                 depth.map_or(0, |s| s.compare),
                 depth.is_some_and(|s| s.write),
+                blend.enabled,
+                blend.write_mask,
+                blend.alpha_source,
                 error.as_mut_ptr(),
                 error.len(),
             )

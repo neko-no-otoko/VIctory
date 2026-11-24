@@ -111,10 +111,12 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
+                           bool blend_enabled, uint8_t write_mask, bool alpha_source,
                            char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
+        if (write_mask & ~0x0f) FAIL(@"invalid color write mask");
         VictoryMetalRenderer *r = [VictoryMetalRenderer new];
         r.device = MTLCreateSystemDefaultDevice();
         if (!r.device) FAIL(@"no Metal device");
@@ -139,6 +141,18 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         desc.fragmentFunction = fragment;
         desc.vertexDescriptor = layout;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[0];
+        color.writeMask = ((write_mask & 1) ? MTLColorWriteMaskRed : 0)
+                        | ((write_mask & 2) ? MTLColorWriteMaskGreen : 0)
+                        | ((write_mask & 4) ? MTLColorWriteMaskBlue : 0)
+                        | ((write_mask & 8) ? MTLColorWriteMaskAlpha : 0);
+        color.blendingEnabled = blend_enabled;
+        color.rgbBlendOperation = MTLBlendOperationAdd;
+        color.alphaBlendOperation = MTLBlendOperationAdd;
+        color.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        color.sourceAlphaBlendFactor = alpha_source ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
+        color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");

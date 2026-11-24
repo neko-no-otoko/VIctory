@@ -111,6 +111,14 @@ other depth formats, and DEPTH_READ are rejected. Depth-only clears accept
 finite values in [0, 1], including clipped rectangles. The synthetic depth
 fixture checks all comparisons, write masking, overlapping indexed and
 nonindexed draws, clears, retained resources, and color and mapped-depth values.
+For RGBA8, pipeline blend state supports disabled blending or ADD with
+SRC_ALPHA and INV_SRC_ALPHA for RGB, and ONE or SRC_ALPHA with INV_SRC_ALPHA
+for alpha. Each RGBA write-mask bit is supported, including a zero mask.
+Alpha-to-coverage, independent blending, logic operations, other factors and
+other blend operations are rejected. When blending is disabled, inactive
+factors are ignored; with independent blending disabled, RT1–RT7 are ignored.
+The synthetic blend fixture verifies translucent draw ordering, alpha and
+channel masks, retained pipeline state, and unsupported-state rejection.
 With the same prerequisites, run:
 
 ```sh
@@ -118,6 +126,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_graphics -- --i
 cargo test -p victory --target x86_64-apple-darwin --test native_indexed -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_viewport -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_depth -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_blend -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the
