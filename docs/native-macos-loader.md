@@ -80,6 +80,13 @@ The native graphics fixture exercises a restricted vertex/pixel pipeline,
 render-target clear, two triangle draws with different root constants, and a
 texture-to-buffer copy with padded rows through the same CLI. It checks the
 readback pixels and that an unsupported indexed-draw slot aborts safely.
+A second synthetic PE samples two RGBA8 textures using shader-visible SRV and
+sampler heaps and graphics root descriptor tables. It switches point and
+linear filtering and textures between draws, releases caller references before
+submission, changes texture contents after recording, and checks the sampled
+pixels and row padding on readback. It also checks an unsupported device
+method terminates the child. This covers the existing restricted sampled
+texture path, not general descriptor or sampler support.
 With the same prerequisites, run:
 
 ```sh

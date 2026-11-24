@@ -9,9 +9,11 @@ fn signature(name: &[u8], system: u32) -> Vec<u8> {
     put32(&mut s, 20, system); put32(&mut s, 24, 3); s[32] = 15;
     s.extend_from_slice(name); s
 }
-// Matches the self-authored GFX10 programs in metal_graphics_tests.rs.
-fn shader(vertex: bool) -> Vec<u8> {
-    let words: &[u32] = if vertex { &[0xf80018cf, 0x07060504, 0xbf810000] } else {
+// Matches the self-authored GFX10 programs in the Metal graphics tests.
+fn shader(vertex: bool, textured: bool) -> Vec<u8> {
+    let words: &[u32] = if vertex { &[0xf80018cf, 0x07060504, 0xbf810000] } else if textured {
+        &[0x7e040200, 0x7e0602f0, 0xbe820309, 0xbe890380, 0xbe830380, 0xf4080204, 0xfa000000, 0xf40c0001, 0xfa000000, 0xf0800f08, 0x00400002, 0xf800180f, 0x03020100, 0xbf810000]
+    } else {
         &[0x7e000202, 0x7e020280, 0x7e040280, 0x7e0602ff, 0x3f800000, 0xf800180f, 0x03020100, 0xbf810000]
     };
     let mut p = vec![0; 0x68]; put64(&mut p, 0, 6);
@@ -22,9 +24,20 @@ fn shader(vertex: bool) -> Vec<u8> {
     put32(&mut p, record + 0x14, 0x20); put32(&mut p, record + 0x50, 8);
     if vertex { p[stage + 0x24..stage + 0x29].copy_from_slice(&[6, 0, 15, 4, 0]); put32(&mut p, stage + 0xc4, 1); }
     else { for i in 0..8 { put32(&mut p, stage + 0x14c + i * 404, u32::MAX); }
-        put64(&mut p, record + 0x28, (code + words.len() * 4) as u64); put32(&mut p, record + 0x38, 1); }
+        if !textured { put64(&mut p, record + 0x28, (code + words.len() * 4) as u64); put32(&mut p, record + 0x38, 1); } }
     for w in words { p.extend_from_slice(&w.to_le_bytes()); }
-    if !vertex { let root = p.len(); p.resize(root + 20, 0); put32(&mut p, root + 8, 3); p[root + 17] = 3; }
+    if !vertex && !textured { let root = p.len(); p.resize(root + 20, 0); put32(&mut p, root + 8, 3); p[root + 17] = 3; }
+    if !vertex && textured {
+        let layout = p.len(); p.resize(layout + 100, 0);
+        put64(&mut p, record + 0x28, layout as u64); put64(&mut p, record + 0x30, (layout + 60) as u64);
+        put32(&mut p, record + 0x38, 3); put32(&mut p, record + 0x3c, 2);
+        for (i, (kind, user, slot)) in [(0, 0, 0), (3, 8, 1), (3, 9, 2)].into_iter().enumerate() {
+            let at = layout + i * 20; put32(&mut p, at, kind); put32(&mut p, at + 8, 1); p[at + 16] = user; p[at + 17] = slot;
+        }
+        for (i, (kind, dwords, user, slot)) in [(1, 4, 8, 1), (0, 8, 9, 2)].into_iter().enumerate() {
+            let at = layout + 60 + i * 20; p[at] = kind; p[at + 1] = 3; p[at + 16] = dwords; p[at + 17] = user; p[at + 18] = slot;
+        }
+    }
     let mut f = b"FSSM".to_vec(); f.extend_from_slice(&0x101u32.to_le_bytes()); f.extend_from_slice(&(p.len() as u64).to_le_bytes()); f.extend_from_slice(&p);
     let packed = miniz_oxide::deflate::compress_to_vec_zlib(&f, 6);
     let mut blob = b"XBCH".to_vec(); blob.extend_from_slice(&3u32.to_le_bytes()); blob.extend_from_slice(&(packed.len() as u64).to_le_bytes()); blob.extend_from_slice(&(f.len() as u64).to_le_bytes()); blob.extend_from_slice(&packed);
@@ -44,7 +57,7 @@ fn tool(dir: &std::path::Path, name: &str, args: &[&str]) {
 fn synthetic_console_graphics_through_native_cli() {
     assert!(std::env::var_os("VICTORY_METAL_CONVERTER").is_some());
     let dir = tempfile::tempdir().unwrap(); let root = dir.path();
-    let arrays = [("vs", shader(true)), ("ps", shader(false))].into_iter().map(|(name, bytes)| {
+    let arrays = [("vs", shader(true, false)), ("ps", shader(false, false))].into_iter().map(|(name, bytes)| {
         format!("static const unsigned char {name}[] = {{{}}};\n", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
     }).collect::<String>();
     std::fs::write(root.join("shaders.h"), arrays).unwrap();
@@ -60,6 +73,34 @@ fn synthetic_console_graphics_through_native_cli() {
         "    D3D12_VERTEX_BUFFER_VIEW view=",
         "    ((void (*)(void))(*(void ***)list)[13])();\n    D3D12_VERTEX_BUFFER_VIEW view=",
     );
+    std::fs::write(root.join("trap.c"), trap).unwrap();
+    tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "trap.c", "-o", "trap.obj"]);
+    tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:trap.exe", "trap.obj", "d3d.lib"]);
+    let trap = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("trap.exe")).arg("--execute").output().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(trap.status.signal(), Some(6), "{}", String::from_utf8_lossy(&trap.stderr));
+    assert!(String::from_utf8_lossy(&trap.stderr).contains("unsupported native D3D12.X vtable method"));
+}
+
+#[test]
+#[ignore = "requires a trusted Apple Metal Shader Converter and Metal GPU"]
+fn synthetic_textured_graphics_through_native_cli() {
+    assert!(std::env::var_os("VICTORY_METAL_CONVERTER").is_some());
+    let dir = tempfile::tempdir().unwrap(); let root = dir.path();
+    let arrays = [("vs", shader(true, true)), ("ps", shader(false, true))].into_iter().map(|(name, bytes)| {
+        format!("static const unsigned char {name}[] = {{{}}};\n", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+    }).collect::<String>();
+    std::fs::write(root.join("shaders.h"), arrays).unwrap();
+    let source = include_str!("../../../tests/fixtures/macos_d3d12x_texture.c");
+    std::fs::write(root.join("texture.c"), source).unwrap();
+    std::fs::write(root.join("d3d.def"), "LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n").unwrap();
+    tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "d3d.def", "-l", "d3d.lib"]);
+    tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "texture.c", "-o", "texture.obj"]);
+    tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:texture.exe", "texture.obj", "d3d.lib"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("texture.exe")).arg("--execute").output().unwrap();
+    assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let trap = source.replace("    D3D12_VERTEX_BUFFER_VIEW view=", "    ((void (*)(void))(*(void ***)dev)[21])();\n    D3D12_VERTEX_BUFFER_VIEW view=");
     std::fs::write(root.join("trap.c"), trap).unwrap();
     tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "trap.c", "-o", "trap.obj"]);
     tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:trap.exe", "trap.obj", "d3d.lib"]);

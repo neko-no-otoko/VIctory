@@ -443,6 +443,12 @@ mod native {
     extern "win64" fn heap(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
         descriptor::create_heap(this, desc.cast(), iid, out)
     }
+    extern "win64" fn srv(this: This, resource: This, desc: *const [u32; 10], handle: u64) {
+        descriptor::create_srv(this, resource, desc, handle)
+    }
+    extern "win64" fn sampler(this: This, desc: *const [u32; 13], handle: u64) {
+        descriptor::create_sampler(this, desc, handle)
+    }
     extern "win64" fn uav(this: This, resource: This, counter: This, desc: *const [u32; 10], handle: u64) {
         descriptor::create_uav(this, resource, counter, desc, handle)
     }
@@ -469,8 +475,10 @@ mod native {
         f[11] = compute as *const ();
         f[12] = list as *const ();
         f[14] = heap as *const ();
+        f[18] = srv as *const ();
         f[19] = uav as *const ();
         f[20] = rtv as *const ();
+        f[22] = sampler as *const ();
         f[27] = committed as *const ();
         f[36] = fence as *const ();
         f[86] = stream as *const ();
