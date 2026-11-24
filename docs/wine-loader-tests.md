@@ -122,7 +122,7 @@ lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib \
   /tmp/victory-cli-fixture/kernel32.lib /tmp/victory-cli-fixture/xgameruntime.lib
 export VICTORY_TEST_CLI_PE="$(winepath -w /tmp/victory-cli-fixture/probe.exe)"
 cargo test -p victory --test windows_run --target x86_64-pc-windows-gnullvm \
-  -- --ignored --nocapture
+  executes_synthetic_pe_through_cli -- --ignored --nocapture
 ```
 
 Verified with Rust 1.98.1, LLVM-MinGW 20261117 UCRT, Wine 11.0 and
@@ -132,6 +132,31 @@ prints `VIctory synthetic entry executed`, and returns 42 to the CLI.
 It uses temporary cache and data folders.
 This validates only a small synthetic PE; it does not run a title or exercise
 the GPU, and Wine is neither native macOS execution nor a native Metal backend.
+
+### Synthetic D3D12.X object path
+
+After the setup and `kernel32.lib` creation above, build the separate fixture
+and run its ignored test:
+
+```sh
+printf 'LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n' > /tmp/victory-cli-fixture/d3d12_xs.def
+llvm-dlltool -m i386:x86-64 -d /tmp/victory-cli-fixture/d3d12_xs.def \
+  -l /tmp/victory-cli-fixture/d3d12_xs.lib
+x86_64-w64-mingw32-clang -O2 -c tests/fixtures/windows_d3d12x_probe.c \
+  -o /tmp/victory-cli-fixture/d3d12x.obj
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib \
+  /out:/tmp/victory-cli-fixture/d3d12x.exe /tmp/victory-cli-fixture/d3d12x.obj \
+  /tmp/victory-cli-fixture/kernel32.lib /tmp/victory-cli-fixture/d3d12_xs.lib
+export VICTORY_TEST_D3D12X_PE="$(winepath -w /tmp/victory-cli-fixture/d3d12x.exe)"
+cargo test -p victory --test windows_run --target x86_64-pc-windows-gnullvm \
+  executes_synthetic_d3d12x_through_cli -- --ignored --nocapture
+```
+
+The guest calls VIctory's `D3D12XboxCreateDevice` HLE, creates a queue,
+allocator, command list and fence, submits an empty list, and checks a
+fence value. The test requires the host D3D12 device to initialize. The
+fence operation is implemented in HLE; the empty list performs no rendering,
+compute, or GPU readback and does not establish title compatibility.
 
 In that same prefix, the synthetic loader integration tests passed 2/2. A
 separate GPU compute experiment compiled self-authored HLSL with Microsoft
