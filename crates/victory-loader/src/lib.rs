@@ -23,6 +23,9 @@
 
 #[cfg(windows)]
 mod crash;
+/// Experimental PE mapping for x86-64 macOS processes (including Rosetta).
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub mod macos;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]

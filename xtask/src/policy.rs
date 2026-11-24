@@ -21,6 +21,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "metal_compute_probe.m",
     "metal_render.m",
     "rosetta-avx-probe.c",
+    "macos_pe_fixture.c",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
