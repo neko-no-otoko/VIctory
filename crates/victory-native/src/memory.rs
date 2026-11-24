@@ -12,6 +12,7 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
+const MEM_PRIVATE: u32 = 0x20000;
 const PAGE_NOACCESS: u32 = 1;
 const PAGE_READONLY: u32 = 2;
 const PAGE_READWRITE: u32 = 4;
@@ -22,8 +23,22 @@ const GRANULARITY: usize = 65536;
 
 struct Reservation {
     size: usize,
+    allocation_protect: u32,
     // Zero means reserved but uncommitted; other values are Win32 protections.
     pages: Vec<u32>,
+}
+
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    _alignment1: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+    _alignment2: u32,
 }
 
 static MAPPINGS: LazyLock<Mutex<BTreeMap<usize, Reservation>>> =
@@ -71,6 +86,7 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
         "VirtualAlloc" => virtual_alloc as *const () as usize,
         "VirtualFree" => virtual_free as *const () as usize,
         "VirtualProtect" => virtual_protect as *const () as usize,
+        "VirtualQuery" => virtual_query as *const () as usize,
         _ => return None,
     })
 }
@@ -112,7 +128,7 @@ extern "win64" fn virtual_alloc(address: *mut c_void, size: usize, kind: u32, pr
             }
             pages.fill(protect);
         }
-        map.insert(base, Reservation { size: len, pages });
+        map.insert(base, Reservation { size: len, allocation_protect: protect, pages });
         return base as *mut c_void;
     }
     if address.is_null() { return error(ERROR_INVALID_ADDRESS, null); }
@@ -195,9 +211,90 @@ extern "win64" fn virtual_protect(address: *mut c_void, size: usize, protect: u3
     1
 }
 
+extern "win64" fn virtual_query(address: *const c_void, info: *mut MemoryBasicInformation, length: usize) -> usize {
+    const INFO_SIZE: usize = 48;
+    if info.is_null() || length < INFO_SIZE {
+        return error(ERROR_INVALID_PARAMETER, 0);
+    }
+    let page = page_size();
+    let start = address as usize / page * page;
+    let map = mappings().lock().unwrap();
+    let Some(base) = containing(&map, start, page) else {
+        return error(ERROR_INVALID_ADDRESS, 0);
+    };
+    let reservation = &map[&base];
+    let first = (start - base) / page;
+    let protect = reservation.pages[first];
+    let mut end = first + 1;
+    while end < reservation.pages.len() && reservation.pages[end] == protect {
+        end += 1;
+    }
+    let result = MemoryBasicInformation {
+        base_address: start as *mut c_void,
+        allocation_base: base as *mut c_void,
+        allocation_protect: reservation.allocation_protect,
+        _alignment1: 0,
+        region_size: (end - first) * page,
+        state: if protect == 0 { MEM_RESERVE } else { MEM_COMMIT },
+        protect,
+        kind: MEM_PRIVATE,
+        _alignment2: 0,
+    };
+    // As with the other exports, the guest must provide writable output memory.
+    unsafe { ptr::write_unaligned(info, result); }
+    INFO_SIZE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn query_reports_forward_runs_and_original_allocation_protection() {
+        assert_eq!(std::mem::size_of::<MemoryBasicInformation>(), 48);
+        assert_eq!(std::mem::offset_of!(MemoryBasicInformation, region_size), 24);
+        assert_eq!(std::mem::offset_of!(MemoryBasicInformation, kind), 40);
+        let symbol = ImportSymbol::Name { hint: 0, name: "VirtualQuery".into() };
+        let query = resolve("kernel32.dll", &symbol).unwrap();
+        let query: extern "win64" fn(*const c_void, *mut MemoryBasicInformation, usize) -> usize =
+            unsafe { std::mem::transmute(query) };
+        let page = page_size();
+        let base = virtual_alloc(ptr::null_mut(), page * 4, MEM_RESERVE, PAGE_READONLY);
+        assert!(!base.is_null());
+        let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::uninit();
+        let check = |offset: usize, state: u32, protect: u32, size: usize| {
+            let mut result = std::mem::MaybeUninit::<MemoryBasicInformation>::uninit();
+            assert_eq!(query((base as usize + offset) as *const c_void, result.as_mut_ptr(), 48), 48);
+            let result = unsafe { result.assume_init() };
+            assert_eq!(result.base_address as usize, base as usize + offset / page * page);
+            assert_eq!(result.allocation_base, base);
+            assert_eq!(result.allocation_protect, PAGE_READONLY);
+            assert_eq!(result.region_size, size);
+            assert_eq!(result.state, state);
+            assert_eq!(result.protect, protect);
+            assert_eq!(result.kind, MEM_PRIVATE);
+        };
+        check(page + 1, MEM_RESERVE, 0, page * 3);
+        assert_eq!(virtual_alloc((base as usize + page) as *mut c_void, page * 2, MEM_COMMIT, PAGE_READWRITE),
+            (base as usize + page) as *mut c_void);
+        check(0, MEM_RESERVE, 0, page);
+        check(page + 1, MEM_COMMIT, PAGE_READWRITE, page * 2);
+        check(page * 2 + 1, MEM_COMMIT, PAGE_READWRITE, page);
+        let mut old = 0;
+        assert_eq!(virtual_protect((base as usize + page * 2) as *mut c_void, page, PAGE_NOACCESS, &mut old), 1);
+        check(page, MEM_COMMIT, PAGE_READWRITE, page);
+        check(page * 2, MEM_COMMIT, PAGE_NOACCESS, page);
+        assert_eq!(virtual_free((base as usize + page) as *mut c_void, page * 2, MEM_DECOMMIT), 1);
+        check(page + 1, MEM_RESERVE, 0, page * 3);
+        assert_eq!(query(base, info.as_mut_ptr(), 47), 0);
+        assert_eq!(query(base, ptr::null_mut(), 48), 0);
+        assert_eq!(virtual_free(base, 0, MEM_RELEASE), 1);
+        assert_eq!(query(base, info.as_mut_ptr(), 48), 0);
+        let get = crate::files::resolve("kernel32.dll", &ImportSymbol::Name {
+            hint: 0, name: "GetLastError".into(),
+        }).unwrap();
+        let get: extern "win64" fn() -> u32 = unsafe { std::mem::transmute(get) };
+        assert_eq!(get(), ERROR_INVALID_ADDRESS);
+    }
     #[test]
     fn exports_share_thread_local_error_without_file_scope() {
         let symbol = |name: &str| ImportSymbol::Name { hint: 0, name: name.into() };

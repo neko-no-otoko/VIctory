@@ -871,3 +871,91 @@ unsigned entry(void) {
         }
     }
 }
+
+#[test]
+fn native_fixture_virtual_query_reports_tracked_regions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nVirtualAlloc\nVirtualFree\nVirtualProtect\nVirtualQuery\nGetLastError\nSetLastError\n").unwrap();
+    std::fs::write(dir.path().join("query.c"), r#"
+typedef unsigned long DWORD;
+typedef unsigned long long SIZE_T;
+typedef int BOOL;
+typedef struct {
+    void *BaseAddress;
+    void *AllocationBase;
+    DWORD AllocationProtect;
+    DWORD alignment1;
+    SIZE_T RegionSize;
+    DWORD State;
+    DWORD Protect;
+    DWORD Type;
+    DWORD alignment2;
+} MEMORY_BASIC_INFORMATION;
+_Static_assert(sizeof(MEMORY_BASIC_INFORMATION) == 48, "x64 MBI size");
+_Static_assert(__builtin_offsetof(MEMORY_BASIC_INFORMATION, RegionSize) == 24, "x64 RegionSize offset");
+_Static_assert(__builtin_offsetof(MEMORY_BASIC_INFORMATION, State) == 32, "x64 State offset");
+_Static_assert(__builtin_offsetof(MEMORY_BASIC_INFORMATION, Type) == 40, "x64 Type offset");
+__declspec(dllimport) void *VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
+__declspec(dllimport) BOOL VirtualFree(void *, SIZE_T, DWORD);
+__declspec(dllimport) BOOL VirtualProtect(void *, SIZE_T, DWORD, DWORD *);
+__declspec(dllimport) SIZE_T VirtualQuery(const void *, MEMORY_BASIC_INFORMATION *, SIZE_T);
+__declspec(dllimport) DWORD GetLastError(void);
+__declspec(dllimport) void SetLastError(DWORD);
+#define COMMIT 0x1000
+#define RESERVE 0x2000
+#define DECOMMIT 0x4000
+#define RELEASE 0x8000
+#define READONLY 0x02
+#define READWRITE 0x04
+#define PRIVATE 0x20000
+#define INVALID_ADDRESS 487
+#define PAGE 4096ULL
+int query_marker = 7;
+int *volatile query_relocation = &query_marker;
+static int region(void *address, void *base, void *allocation, SIZE_T size,
+                  DWORD state, DWORD protect) {
+    MEMORY_BASIC_INFORMATION m;
+    if (VirtualQuery(address, &m, sizeof(m)) != 48) return 0;
+    return m.BaseAddress == base && m.AllocationBase == allocation &&
+        m.AllocationProtect == READWRITE && m.RegionSize == size &&
+        m.State == state && m.Protect == protect && m.Type == PRIVATE;
+}
+unsigned entry(void) {
+    unsigned char *p;
+    MEMORY_BASIC_INFORMATION m;
+    DWORD old;
+    if (*query_relocation != 7) return 1;
+    p = (unsigned char *)VirtualAlloc(0, 8 * PAGE, RESERVE, READWRITE);
+    if (!p) return 2;
+    if (!region(p + PAGE + 17, p + PAGE, p, 7 * PAGE, RESERVE, 0)) return 3;
+    if (VirtualAlloc(p + 2 * PAGE, 4 * PAGE, COMMIT, READWRITE) != p + 2 * PAGE) return 4;
+    if (!region(p, p, p, 2 * PAGE, RESERVE, 0)) return 5;
+    if (!region(p + 3 * PAGE + 11, p + 3 * PAGE, p, 3 * PAGE, COMMIT, READWRITE)) return 6;
+    if (!region(p + 6 * PAGE, p + 6 * PAGE, p, 2 * PAGE, RESERVE, 0)) return 7;
+    if (!VirtualProtect(p + 3 * PAGE, 2 * PAGE, READONLY, &old) || old != READWRITE) return 8;
+    if (!region(p + 2 * PAGE, p + 2 * PAGE, p, PAGE, COMMIT, READWRITE)) return 9;
+    if (!region(p + 3 * PAGE + 1, p + 3 * PAGE, p, 2 * PAGE, COMMIT, READONLY)) return 10;
+    if (!region(p + 4 * PAGE, p + 4 * PAGE, p, PAGE, COMMIT, READONLY)) return 11;
+    if (!VirtualFree(p + 3 * PAGE, 2 * PAGE, DECOMMIT)) return 12;
+    if (!region(p + 3 * PAGE, p + 3 * PAGE, p, 2 * PAGE, RESERVE, 0)) return 13;
+    if (!region(p + 5 * PAGE, p + 5 * PAGE, p, PAGE, COMMIT, READWRITE)) return 14;
+    if (VirtualAlloc(p + 3 * PAGE, 2 * PAGE, COMMIT, READWRITE) != p + 3 * PAGE) return 15;
+    if (!region(p + 3 * PAGE, p + 3 * PAGE, p, 3 * PAGE, COMMIT, READWRITE)) return 16;
+    SetLastError(0);
+    if (VirtualQuery(p, &m, sizeof(m) - 1) != 0 || !GetLastError()) return 17;
+    SetLastError(0);
+    if (VirtualQuery(&query_marker, &m, sizeof(m)) != 0 || GetLastError() != INVALID_ADDRESS) return 18;
+    if (!VirtualFree(p, 0, RELEASE)) return 19;
+    SetLastError(0);
+    if (VirtualQuery(p, &m, sizeof(m)) != 0 || GetLastError() != INVALID_ADDRESS) return 20;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "query.c", "-o", "query.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:query.exe", "query.obj", "kernel32.lib"]);
+    let exe = dir.path().join("query.exe");
+    let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+}

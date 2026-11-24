@@ -267,8 +267,8 @@ Without `--file-root`, file and discovery imports remain unresolved.
 This path binding is not a process sandbox: guest code and host callbacks execute
 unsandboxed and must be trusted.
 
-The native resolver also exposes a restricted `VirtualAlloc`, `VirtualFree`,
-and `VirtualProtect` implementation without requiring a file root. It tracks
+The native resolver also exposes restricted `VirtualAlloc`, `VirtualFree`,
+`VirtualProtect`, and `VirtualQuery` implementations without requiring a file root. It tracks
 only its own anonymous reservations and uses 64-KiB reservation alignment and
 the host's translated page size. It supports reserve, reserve-and-commit,
 commit within a tracked reservation, nonzero-range decommit, and whole-region
@@ -276,7 +276,11 @@ release. Supported protections are `PAGE_NOACCESS`, `PAGE_READONLY`, and
 `PAGE_READWRITE`; executable pages and other flags are rejected. Explicit
 addresses for new reservations and null-address commit-only calls are not
 supported. Recommitted pages are zeroed; protection changes require committed
-pages. `GetLastError` and `SetLastError` share the file provider's thread-local
+pages. `VirtualQuery` reports the allocation and contiguous state/protection
+run from the queried page forward for tracked reservations. It rejects
+untracked addresses rather than describing host mappings or reporting them as
+free; a full 48-byte Windows x64 result buffer is required.
+`GetLastError` and `SetLastError` share the file provider's thread-local
 error state and are available without a file root. This is not Windows process
 initialization or executable guest memory support.
 
