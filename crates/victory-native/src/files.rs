@@ -137,14 +137,15 @@ impl Drop for FileScope {
     }
 }
 
-/// Resolve last-error exports independently of file scope; file operations
-/// remain available only while a scope is active.
+/// Resolve last-error and CloseHandle exports independently of file scope;
+/// file operations remain available only while a scope is active.
 pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
     if !dll.eq_ignore_ascii_case("kernel32.dll") { return None; }
     let ImportSymbol::Name { name, .. } = symbol else { return None };
     match name.as_str() {
         "GetLastError" => return Some(get_last_error as *const () as usize),
         "SetLastError" => return Some(set_last_error as *const () as usize),
+        "CloseHandle" => return Some(close_handle as *const () as usize),
         _ => {}
     }
     if !CONTEXT.with(|slot| slot.borrow().is_some()) { return None; }
@@ -165,13 +166,28 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
         "CreateFileMappingW" => create_file_mapping_w as *const () as usize,
         "MapViewOfFile" => map_view_of_file as *const () as usize,
         "UnmapViewOfFile" => unmap_view_of_file as *const () as usize,
-        "CloseHandle" => close_handle as *const () as usize,
         _ => return None,
     })
 }
 
 pub(crate) fn fail(code: u32) {
     LAST_ERROR.with(|error| error.set(code));
+}
+
+/// File and mapping handles are valid only in their owning thread's scope.
+pub(crate) fn is_scoped_handle(handle: usize) -> bool {
+    CONTEXT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|context| {
+            context.handles.contains_key(&handle) || context.mappings.contains_key(&handle)
+        })
+    })
+}
+
+/// Allocate from the shared, process-wide namespace without ever recycling IDs.
+pub(crate) fn allocate_handle() -> Result<usize, u32> {
+    NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        (value != INVALID_HANDLE).then(|| value + 1)
+    }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)
 }
 
 fn error_code(error: &io::Error, intermediate: bool) -> u32 {
@@ -547,9 +563,7 @@ unsafe extern "win64" fn create_file_w(
                 ERROR_SHARING_VIOLATION
             } else { error_code(&error, false) });
         }
-        let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            (value != INVALID_HANDLE).then(|| value + 1)
-        }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        let handle = allocate_handle()?;
         context.handles.insert(handle, GuestFile { file, readable, writable, save });
         Ok((handle, created))
     });
@@ -672,6 +686,7 @@ unsafe extern "win64" fn get_file_size_ex(handle: usize, size: *mut i64) -> i32 
 }
 
 extern "win64" fn close_handle(handle: usize) -> i32 {
+    if crate::sync::close(handle) { return 1; }
     let closed = CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         slot.as_mut().is_some_and(|c| c.handles.remove(&handle).is_some() || c.mappings.remove(&handle).is_some())
@@ -697,9 +712,7 @@ unsafe extern "win64" fn create_file_mapping_w(
         if size == 0 { return Err(ERROR_FILE_INVALID); }
         if size > length { return Err(ERROR_ACCESS_DENIED); }
         let file = file.file.try_clone().map_err(|e| error_code(&e, false))?;
-        let mapping = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            (value != INVALID_HANDLE).then(|| value + 1)
-        }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        let mapping = allocate_handle()?;
         context.mappings.insert(mapping, GuestMapping { file, size });
         Ok(mapping)
     });
@@ -938,9 +951,7 @@ unsafe extern "win64" fn find_first_file_w(path: *const u16, output: *mut FindDa
         let mut records = collect_matches(root, relative)?.into_iter();
         let first = records.next().ok_or(ERROR_FILE_NOT_FOUND)?;
         drop(_lock);
-        let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            (value != INVALID_HANDLE).then(|| value + 1)
-        }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        let handle = allocate_handle()?;
         context.searches.insert(handle, records);
         Ok((handle, first))
     }));
@@ -984,6 +995,80 @@ mod tests {
     unsafe fn open(path: &str) -> usize {
         // SAFETY: the UTF-16 buffer stays alive for the call.
         unsafe { create_file_w(wide(path).as_ptr(), 0x8000_0000, 1, null(), 3, 0x80, null_mut()) }
+    }
+
+    #[test]
+    fn event_handles_are_process_wide_but_file_handles_remain_scoped() {
+        fn symbol(name: &str) -> ImportSymbol {
+            ImportSymbol::Name { hint: 0, name: name.into() }
+        }
+        let create: extern "win64" fn(*const c_void, i32, i32, *const u16) -> usize = unsafe {
+            std::mem::transmute(crate::sync::resolve("kernel32.dll", &symbol("CreateEventW")).unwrap())
+        };
+        let set: extern "win64" fn(usize) -> i32 = unsafe {
+            std::mem::transmute(crate::sync::resolve("kernel32.dll", &symbol("SetEvent")).unwrap())
+        };
+        let wait: extern "win64" fn(usize, u32) -> u32 = unsafe {
+            std::mem::transmute(crate::sync::resolve("kernel32.dll", &symbol("WaitForSingleObject")).unwrap())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"data").unwrap();
+        let scope = FileScope::enter(dir.path()).unwrap();
+        let file = unsafe { open("file") };
+        assert_ne!(file, INVALID_HANDLE);
+        let event = create(null(), 0, 0, null());
+        assert_ne!(event, 0);
+        assert_ne!(event, file);
+        fail(1234);
+        std::thread::spawn(move || {
+            assert_eq!(close_handle(file), 0);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(set(event), 1);
+            assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+        }).join().unwrap();
+        assert_eq!(get_last_error(), 1234);
+        assert_eq!(wait(event, 0), 0);
+        assert_eq!(close_handle(file), 1);
+        drop(scope);
+        assert_eq!(set(event), 1);
+        assert_eq!(wait(event, 0), 0);
+        assert_eq!(close_handle(event), 1);
+    }
+
+    #[test]
+    fn waiting_on_scoped_file_or_mapping_is_unsupported_not_invalid() {
+        let symbol = ImportSymbol::Name { hint: 0, name: "WaitForSingleObject".into() };
+        let wait: extern "win64" fn(usize, u32) -> u32 = unsafe {
+            std::mem::transmute(crate::sync::resolve("kernel32.dll", &symbol).unwrap())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"data").unwrap();
+        let scope = FileScope::enter(dir.path()).unwrap();
+        let file = unsafe { open("file") };
+        assert_ne!(file, INVALID_HANDLE);
+        let mapping = unsafe { create_file_mapping_w(file, null(), 2, 0, 0, null()) };
+        assert_ne!(mapping, 0);
+        for handle in [file, mapping] {
+            assert_eq!(wait(handle, 0), u32::MAX);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+        }
+        std::thread::spawn(move || {
+            for handle in [file, mapping] {
+                assert_eq!(wait(handle, 0), u32::MAX);
+                assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+            }
+        }).join().unwrap();
+        let mut size = 0;
+        assert_eq!(unsafe { get_file_size_ex(file, &mut size) }, 1);
+        assert_eq!(size, 4);
+        assert_eq!(close_handle(file), 1);
+        assert_eq!(wait(file, 0), u32::MAX);
+        assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
+        assert_eq!(wait(mapping, 0), u32::MAX);
+        assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+        drop(scope);
+        assert_eq!(wait(mapping, 0), u32::MAX);
+        assert_eq!(get_last_error(), ERROR_INVALID_HANDLE);
     }
 
     #[test]

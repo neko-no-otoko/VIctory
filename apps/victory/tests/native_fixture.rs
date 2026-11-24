@@ -1236,6 +1236,94 @@ unsigned entry(void) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
 }
 
+#[test]
+fn native_fixture_uses_events_without_file_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateEventW\nSetEvent\nResetEvent\nWaitForSingleObject\nCloseHandle\nGetLastError\nSetLastError\nGetTickCount64\n").unwrap();
+    std::fs::write(dir.path().join("events.c"), r#"
+typedef unsigned long DWORD;
+typedef unsigned long long ULONGLONG;
+typedef int BOOL;
+typedef void *HANDLE;
+typedef unsigned short WCHAR;
+typedef struct { DWORD length; void *descriptor; BOOL inherit; } SECURITY_ATTRIBUTES;
+__declspec(dllimport) HANDLE CreateEventW(SECURITY_ATTRIBUTES *, BOOL, BOOL, const WCHAR *);
+__declspec(dllimport) BOOL SetEvent(HANDLE);
+__declspec(dllimport) BOOL ResetEvent(HANDLE);
+__declspec(dllimport) DWORD WaitForSingleObject(HANDLE, DWORD);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) DWORD GetLastError(void);
+__declspec(dllimport) void SetLastError(DWORD);
+__declspec(dllimport) ULONGLONG GetTickCount64(void);
+#define WAIT_OBJECT_0 0
+#define WAIT_TIMEOUT 258
+#define WAIT_FAILED 0xffffffffUL
+#define ERROR_INVALID_HANDLE 6
+#define INFINITE 0xffffffffUL
+int event_marker = 7;
+int *volatile event_relocation = &event_marker;
+unsigned entry(void) {
+    HANDLE manual, automatic, replacement;
+    ULONGLONG start, elapsed;
+    static const WCHAR name[] = {'n','a','m','e',0};
+    SECURITY_ATTRIBUTES security = {sizeof(SECURITY_ATTRIBUTES), 0, 0};
+    if (*event_relocation != 7) return 1;
+    SetLastError(1234);
+    manual = CreateEventW(0, 1, 0, 0);
+    if (!manual || GetLastError() != 1234) return 2;
+    if (WaitForSingleObject(manual, 0) != WAIT_TIMEOUT || GetLastError() != 1234) return 3;
+    start = GetTickCount64();
+    if (WaitForSingleObject(manual, 30) != WAIT_TIMEOUT) return 4;
+    elapsed = GetTickCount64() - start;
+    if (elapsed < 25 || elapsed > 10000 || GetLastError() != 1234) return 5;
+    if (!SetEvent(manual) || GetLastError() != 1234) return 6;
+    if (WaitForSingleObject(manual, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(manual, INFINITE) != WAIT_OBJECT_0) return 7;
+    if (!SetEvent(manual) || !ResetEvent(manual) ||
+        WaitForSingleObject(manual, 0) != WAIT_TIMEOUT) return 8;
+    automatic = CreateEventW(0, 0, 1, 0);
+    if (!automatic || WaitForSingleObject(automatic, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(automatic, 0) != WAIT_TIMEOUT) return 9;
+    if (!SetEvent(automatic) || !SetEvent(automatic) ||
+        WaitForSingleObject(automatic, INFINITE) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(automatic, 0) != WAIT_TIMEOUT) return 10;
+    if (!SetEvent(automatic) || !ResetEvent(automatic) ||
+        WaitForSingleObject(automatic, 0) != WAIT_TIMEOUT) return 11;
+    if (!CloseHandle(manual)) return 12;
+    SetLastError(0);
+    if (WaitForSingleObject(manual, 0) != WAIT_FAILED || GetLastError() != ERROR_INVALID_HANDLE) return 13;
+    SetLastError(0);
+    if (SetEvent(manual) || GetLastError() != ERROR_INVALID_HANDLE) return 14;
+    SetLastError(0);
+    if (ResetEvent(manual) || GetLastError() != ERROR_INVALID_HANDLE) return 15;
+    SetLastError(0);
+    if (CloseHandle(manual) || GetLastError() != ERROR_INVALID_HANDLE) return 16;
+    replacement = CreateEventW(0, 1, 1, 0);
+    if (!replacement || replacement == manual) return 17;
+    SetLastError(0);
+    if (WaitForSingleObject(manual, 0) != WAIT_FAILED || GetLastError() != ERROR_INVALID_HANDLE ||
+        WaitForSingleObject(replacement, 0) != WAIT_OBJECT_0) return 18;
+    SetLastError(0);
+    if (WaitForSingleObject(0, 0) != WAIT_FAILED || GetLastError() != ERROR_INVALID_HANDLE) return 19;
+    SetLastError(0);
+    if (SetEvent((HANDLE)(unsigned long long)0x1234) || GetLastError() != ERROR_INVALID_HANDLE) return 20;
+    SetLastError(0);
+    if (CreateEventW(0, 0, 0, name) || GetLastError() != 50) return 21;
+    SetLastError(0);
+    if (CreateEventW(&security, 0, 0, 0) || GetLastError() != 50) return 22;
+    if (!CloseHandle(automatic) || !CloseHandle(replacement)) return 23;
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "events.c", "-o", "events.obj"]);
+    tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:events.exe", "events.obj", "kernel32.lib"]);
+    let exe = dir.path().join("events.exe");
+    let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
+}
+
 // A small PE32+ assembled in memory, so the census test does not depend on a
 // linker choosing a particular section layout. Its entry point is UD2.
 fn census_pe() -> Vec<u8> {

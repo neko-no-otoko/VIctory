@@ -8,6 +8,8 @@ mod memory;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod timing;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod sync;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub use files::FileScope;
 
 
@@ -23,6 +25,9 @@ mod macos {
     impl ImportResolver for NativeResolver {
         fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
             if let Some(address) = crate::files::resolve(dll, symbol) {
+                return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
+            }
+            if let Some(address) = crate::sync::resolve(dll, symbol) {
                 return Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
             }
             if let Some(address) = crate::memory::resolve(dll, symbol) {

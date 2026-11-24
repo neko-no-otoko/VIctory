@@ -306,7 +306,8 @@ Supported patterns are a literal name, `*`, `*.*`, or a literal prefix followed
 by one `*` (not after a dot); `?`, other wildcard positions, and wildcards in
 parent components return `ERROR_NOT_SUPPORTED`. This is a limited subset,
 not full Windows DOS wildcard behavior.
-Without `--file-root`, file and discovery imports remain unresolved.
+Without `--file-root`, scoped file and discovery operations remain unresolved;
+the shared `CloseHandle` export remains available for event handles.
 This path binding is not a process sandbox: guest code and host callbacks execute
 unsandboxed and must be trusted.
 
@@ -338,6 +339,17 @@ the same Mach continuous monotonic clock, converted to nanoseconds for a
 fixed 1 GHz performance-counter frequency and milliseconds for tick count.
 `Sleep(0)` yields, finite sleeps wait on the host, and `Sleep(INFINITE)` does
 not return. Other timing APIs remain unresolved.
+
+The native resolver also exposes unnamed `CreateEventW`, `SetEvent`,
+`ResetEvent`, `WaitForSingleObject`, and `CloseHandle` without a file root.
+Manual- and auto-reset events support zero, finite, and infinite waits; waits
+on file and mapping handles are unsupported. Named events and security
+attributes are rejected. Event handles are
+process-wide and must be closed; this does not provide guest thread creation
+or Windows process initialization. Closing removes the handle immediately,
+but operations that already acquired the event retain it; close does not wake
+waiting threads. Windows itself leaves closing a handle during a wait
+undefined, so this safety rule is not a Windows compatibility guarantee.
 
 With `--execute`, executable and DLL code runs **unsandboxed in the CLI
 process** and can crash, hang or corrupt it. Only pass trusted images with
