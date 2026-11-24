@@ -1,4 +1,6 @@
 //! Narrow macOS compute command path. Unsupported commands poison the list.
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::descriptor::{self, View};
@@ -126,6 +128,64 @@ impl Drop for HeapRef {
     }
 }
 
+const COMMON: u32 = 0;
+const UAV: u32 = 0x8;
+const COPY_DEST: u32 = 0x400;
+const COPY_SOURCE: u32 = 0x800;
+
+fn supported_state(state: u32) -> bool {
+    matches!(state, COMMON | UAV | COPY_DEST | COPY_SOURCE)
+}
+
+/// All lists in one ExecuteCommandLists call share promotions and decay together.
+#[derive(Default)]
+pub(crate) struct Submission {
+    touched: HashMap<usize, ResourceRef>,
+}
+impl Submission {
+    fn access(&mut self, resource: This, required: u32) -> Result<(), String> {
+        let current = crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
+            .ok_or("only committed default-heap buffers are supported")?;
+        if current != COMMON && current != required {
+            return Err(format!(
+                "buffer state {current:#x} does not permit {required:#x}"
+            ));
+        }
+        self.touch(resource);
+        if current == COMMON {
+            crate::resource::metal_buffer_state(resource, |s| s.store(required, Ordering::Relaxed));
+        }
+        Ok(())
+    }
+    fn transition(&mut self, resource: This, before: u32, after: u32) -> Result<(), String> {
+        let current = crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
+            .ok_or("only committed default-heap buffers are supported")?;
+        if current != COMMON && current != before {
+            return Err(format!(
+                "transition expected {before:#x}, found {current:#x}"
+            ));
+        }
+        self.touch(resource);
+        crate::resource::metal_buffer_state(resource, |s| s.store(after, Ordering::Relaxed));
+        Ok(())
+    }
+    fn touch(&mut self, resource: This) {
+        self.touched
+            .entry(resource as usize)
+            .or_insert_with(|| ResourceRef::new(resource));
+    }
+}
+impl Drop for Submission {
+    fn drop(&mut self) {
+        // D3D12 buffers decay to COMMON after the entire submission completes.
+        for resource in self.touched.values() {
+            crate::resource::metal_buffer_state(resource.ptr(), |s| {
+                s.store(COMMON, Ordering::Relaxed)
+            });
+        }
+    }
+}
+
 #[derive(Default)]
 enum Root {
     #[default]
@@ -134,6 +194,11 @@ enum Root {
     Table(u64),
 }
 enum Command {
+    Transition {
+        resource: ResourceRef,
+        before: u32,
+        after: u32,
+    },
     Copy {
         dst: ResourceRef,
         dst_offset: u64,
@@ -159,6 +224,7 @@ pub(crate) struct State {
     pipeline: Option<Arc<Mutex<Prepared>>>,
     heap: Option<Arc<HeapRef>>,
     roots: Vec<Root>,
+    local_states: HashMap<usize, u32>,
     commands: Vec<Command>,
     error: Option<String>,
     closed: bool,
@@ -175,6 +241,61 @@ impl State {
             return false;
         }
         self.error.is_none()
+    }
+    fn use_state(&mut self, resource: This, required: u32) -> Result<(), String> {
+        if crate::resource::metal_buffer_state(resource, |_| ()).is_none() {
+            return Err("only committed default-heap buffers are supported".into());
+        }
+        if required == UAV && !crate::resource::metal_buffer_allows_uav(resource) {
+            return Err("buffer was not created for unordered access".into());
+        }
+        let state = self
+            .local_states
+            .entry(resource as usize)
+            .or_insert(required);
+        if *state != COMMON && *state != required {
+            return Err(format!(
+                "recorded buffer state {:#x} does not permit {required:#x}",
+                *state
+            ));
+        }
+        *state = required;
+        Ok(())
+    }
+    pub(crate) fn transition(&mut self, resource: This, subresource: u32, before: u32, after: u32) {
+        if !self.open() {
+            return;
+        }
+        if subresource != u32::MAX
+            || !supported_state(before)
+            || !supported_state(after)
+            || before == after
+        {
+            self.reject("unsupported buffer transition");
+            return;
+        }
+        if crate::resource::metal_buffer_state(resource, |_| ()).is_none() {
+            self.reject("transitions support only committed default-heap buffers");
+            return;
+        }
+        if (before == UAV || after == UAV) && !crate::resource::metal_buffer_allows_uav(resource) {
+            self.reject("buffer was not created for unordered access");
+            return;
+        }
+        if self
+            .local_states
+            .get(&(resource as usize))
+            .is_some_and(|state| *state != COMMON && *state != before)
+        {
+            self.reject("transition before-state does not match earlier commands");
+            return;
+        }
+        self.local_states.insert(resource as usize, after);
+        self.commands.push(Command::Transition {
+            resource: ResourceRef::new(resource),
+            before,
+            after,
+        });
     }
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         if !self.open() {
@@ -252,6 +373,13 @@ impl State {
             self.reject(&error);
             return;
         }
+        if let Err(error) = self
+            .use_state(src, COPY_SOURCE)
+            .and_then(|()| self.use_state(dst, COPY_DEST))
+        {
+            self.reject(&error);
+            return;
+        }
         self.commands.push(Command::Copy {
             dst: ResourceRef::new(dst),
             dst_offset,
@@ -264,8 +392,11 @@ impl State {
         if !self.open() {
             return;
         }
-        if !resource.is_null() && crate::resource::buffer_bytes(resource).is_none() {
-            self.reject("UAV barriers support only buffers");
+        if !resource.is_null()
+            && (crate::resource::metal_buffer_state(resource, |_| ()).is_none()
+                || !crate::resource::metal_buffer_allows_uav(resource))
+        {
+            self.reject("UAV barriers support only committed default-heap UAV buffers");
             return;
         }
         self.commands.push(Command::Barrier {
@@ -313,12 +444,14 @@ impl State {
                 _ => return Err("missing or unsupported root argument".into()),
             };
         }
+        let handle = *handle;
+        self.use_state(resource, UAV)?;
         let resource = ResourceRef::new(resource);
         drop(p);
         self.commands.push(Command::Dispatch {
             pipeline,
             _heap: bound_heap,
-            handle: *handle,
+            handle,
             resource,
             constants,
             groups,
@@ -335,7 +468,7 @@ impl State {
             None => Ok(()),
         }
     }
-    pub(crate) fn execute(&mut self) -> Result<(), String> {
+    pub(crate) fn execute(&mut self, submission: &mut Submission) -> Result<(), String> {
         if !self.closed {
             return Err("command list is open".into());
         }
@@ -344,6 +477,13 @@ impl State {
         }
         for command in &mut self.commands {
             match command {
+                Command::Transition {
+                    resource,
+                    before,
+                    after,
+                } => {
+                    submission.transition(resource.ptr(), *before, *after)?;
+                }
                 Command::Copy {
                     dst,
                     dst_offset,
@@ -351,6 +491,8 @@ impl State {
                     src_offset,
                     len,
                 } => {
+                    submission.access(src.ptr(), COPY_SOURCE)?;
+                    submission.access(dst.ptr(), COPY_DEST)?;
                     let (to, from, len) =
                         copy_ranges(dst.ptr(), *dst_offset, src.ptr(), *src_offset, *len)?;
                     // SAFETY: checked ranges are live and non-overlapping; submission is synchronous.
@@ -370,6 +512,7 @@ impl State {
                     {
                         return Err("UAV descriptor changed after recording".into());
                     }
+                    submission.access(resource.ptr(), UAV)?;
                     let (ptr, len) = crate::resource::buffer_bytes(resource.ptr())
                         .ok_or("UAV resource no longer valid")?;
                     let len = usize::try_from(len).map_err(|_| "UAV buffer is too large")?;

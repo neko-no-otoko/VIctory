@@ -746,6 +746,8 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
+    #[cfg(target_os = "macos")]
+    state: std::sync::atomic::AtomicU32,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
@@ -895,6 +897,25 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Tracked console state for committed default-heap buffers in the Metal path.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_buffer_state<T>(
+    this: This,
+    f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T,
+) -> Option<T> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension == BUFFER && r.heap.kind == 1 && matches!(r.backing, Backing::Committed(_)))
+        .then(|| f(&r.state))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_buffer_allows_uav(this: This) -> bool {
+    !this.is_null() && resource(this).desc.flags & 4 != 0
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {
@@ -939,6 +960,8 @@ fn hand_out_resource(
         heap,
         heap_flags,
         backing,
+        #[cfg(target_os = "macos")]
+        state: state.into(),
         #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));

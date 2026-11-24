@@ -103,16 +103,26 @@ compute path: a recorded console compute dispatch translates the native
 shader, loads it through Apple's converter, and executes it on Metal when
 its command list is submitted. It supports a single shader-visible view
 heap, a whole-buffer UAV at descriptor index zero, root constants, recorded
-buffer-to-buffer region copies, and unsplit UAV barriers for buffers (or all
-UAVs). Copies use the buffers' host memory at submission; each dispatch is
-waited for before the next command, so GPU writes are visible to later copies
-and UAV barriers are satisfied by that synchronous ordering. Copy ranges must
-be in bounds and must not overlap, and source and destination must be distinct
-resources. Commands retain their resources until the list is reset or released.
-Other shader bindings, descriptor changes after recording, root-signature
-commands, graphics, transition and split barriers, texture copies, waits and
-presentation are not implemented. Unsupported list commands reject the list;
-a submission failure latches the queue and prevents later fence signals.
+buffer-to-buffer region copies, unsplit UAV barriers, and whole-buffer
+transitions among `COMMON`, `COPY_SOURCE`, `COPY_DEST` and
+`UNORDERED_ACCESS`. Only committed default-heap buffers on matching direct or
+compute queues and lists are supported; UAV access requires the resource's
+unordered-access flag. The path validates command use and transition
+before-states in list order and again at submission. Buffers can be promoted
+from `COMMON` on use; a transition from `COMMON` may also name a supported
+promotable before-state. Buffers decay to `COMMON` after the entire
+`ExecuteCommandLists` batch, not between lists, following the
+[D3D12 promotion and decay rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12#implicit-state-transitions).
+
+Copies use host memory at submission; dispatches finish before the next command,
+so GPU writes are visible to later copies and barriers. Copy ranges must be in
+bounds and non-overlapping, and source and destination must be distinct.
+Commands retain their resources until the list is reset or released. Placed or
+aliased resources, other heap types and state combinations, individual
+subresources, split or aliasing barriers, textures, other shader bindings,
+descriptor changes after recording, root-signature commands, graphics, waits
+and presentation are not implemented. Unsupported list commands reject the
+list; submission failures latch the queue and prevent later fence signals.
 The caller must not access a mapped buffer concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
@@ -124,10 +134,9 @@ VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
   cargo test -p victory-gpu console_compute_records_and_submits_on_metal -- --ignored
 ```
 
-It records an offset buffer copy, dispatches a translated shader that reads the
-copied word, then copies the result to a different offset. It checks unchanged
-pre-submit data, post-submit value 42 and untouched surrounding bytes, resource
-lifetimes, rejected copy ranges and barriers, and queue failure signalling.
+It records copy → transition → compute → transition → copy and checks unchanged
+pre-submit data, the post-submit value 42, surrounding bytes, resource lifetimes,
+batch-wide state tracking and decay, invalid transitions and queue failure.
 
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle

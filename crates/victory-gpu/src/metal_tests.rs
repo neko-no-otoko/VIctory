@@ -36,6 +36,7 @@ struct HeapProperties {
     visible_nodes: u32,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ResourceDesc {
     dimension: u32,
     alignment: u64,
@@ -350,7 +351,17 @@ fn console_compute_records_and_submits_on_metal() {
         resource,
         reserved: [0; 2],
     };
+    let transition = |resource, before: u32, after: u32, subresource: u32| Barrier {
+        kind: 0,
+        flags: 0,
+        resource,
+        reserved: [
+            u64::from(subresource) | (u64::from(before) << 32),
+            u64::from(after),
+        ],
+    };
     copy(list, resource, 4, source, 8, 16);
+    barrier(list, 1, &transition(resource, 0x400, 8, u32::MAX));
     constants(list, 0, 4, [8, 0, 0, 0].as_ptr(), 0);
     dispatch(list, 1, 1, 1);
     assert_eq!(barrier(list, 1, &uav_barrier), 0);
@@ -358,13 +369,14 @@ fn console_compute_records_and_submits_on_metal() {
     constants(list, 0, 4, [41, 0, 0, 0].as_ptr(), 0);
     dispatch(list, 1, 1, 1);
     assert_eq!(barrier(list, 1, &uav_barrier), 0);
+    barrier(list, 1, &transition(resource, 8, 0x800, u32::MAX));
     copy(list, target, 12, resource, 0, 20);
     let closed = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
     assert_eq!(
         closed,
         S_OK,
         "list error: {:?}",
-        crate::list::metal_execute(list)
+        crate::list::metal_execute(list, 2, &mut Default::default())
     );
     // SAFETY: list holds the resource alive through submission.
     assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 0x12345678);
@@ -377,7 +389,7 @@ fn console_compute_records_and_submits_on_metal() {
     unsafe { input.add(8).cast::<u32>().write_unaligned(1) };
     assert_eq!(release(source), 1);
     assert_eq!(release(target), 1);
-    assert_eq!(release(resource), 6);
+    assert_eq!(release(resource), 8);
     assert_eq!(release(heap), 1);
     assert_eq!(release(pipeline), 0);
     let queue_iid = iid(
@@ -430,6 +442,31 @@ fn console_compute_records_and_submits_on_metal() {
     let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
     assert_eq!(signal(queue, fence, 7), S_OK);
     assert_eq!(completed(fence), 7);
+    // The resource decayed to COMMON after the first submission. Two lists in one
+    // submission share state and must not decay between lists.
+    let mut lists = [null; 2];
+    for (idx, (before, after)) in [(0, 0x400), (0x400, 0x800)].into_iter().enumerate() {
+        assert_eq!(
+            slot::<extern "system" fn(This, u32, u32, This, This, *const Iid, *mut This) -> HRESULT>(
+                dev, 0x60
+            )(dev, 0, 2, allocator, null, &list_iid, &mut lists[idx]),
+            S_OK
+        );
+        barrier(
+            lists[idx],
+            1,
+            &transition(resource, before, after, u32::MAX),
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(lists[idx], 0x48)(lists[idx]),
+            S_OK
+        );
+    }
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 2, lists.as_ptr());
+    assert_eq!(signal(queue, fence, 7), S_OK);
+    for list in lists {
+        assert_eq!(release(list), 0);
+    }
     // Changing an already-recorded descriptor must not silently use the old buffer.
     slot::<extern "system" fn(This, This, This, *const [u32; 10], u64)>(dev, 0x98)(
         dev,
@@ -455,14 +492,15 @@ fn console_compute_records_and_submits_on_metal() {
     );
     let mut a = null;
     let mut b = null;
-    for out in [&mut a, &mut b] {
+    let no_uav = ResourceDesc { flags: 0, ..desc };
+    for (out, initial, description) in [(&mut a, 0x400, &desc), (&mut b, 0, &no_uav)] {
         assert_eq!(
             make_resource(
                 dev,
                 (&raw const props).cast(),
                 0,
-                (&raw const desc).cast(),
-                0,
+                (description as *const ResourceDesc).cast(),
+                initial,
                 null.cast(),
                 &resource_iid,
                 out
@@ -479,6 +517,24 @@ fn console_compute_records_and_submits_on_metal() {
         assert_eq!(close(list), object::E_NOTIMPL);
         assert_eq!(reset(list, allocator, null), S_OK);
     }
+    for invalid in [
+        transition(a, 0, 8, 0),
+        transition(a, 0, 0, u32::MAX),
+        transition(a, 0, 0x408, u32::MAX),
+        transition(b, 0, 8, u32::MAX),
+    ] {
+        barrier(list, 1, &invalid);
+        assert_eq!(close(list), object::E_NOTIMPL);
+        assert_eq!(reset(list, allocator, null), S_OK);
+    }
+    copy(list, a, 0, b, 0, 4);
+    barrier(list, 1, &transition(a, 8, 0x800, u32::MAX));
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    copy(list, a, 0, b, 0, 4);
+    copy(list, b, 4, a, 4, 4); // Missing COPY_DEST -> COPY_SOURCE transition.
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
     let split = Barrier {
         kind: 2,
         flags: 1,
@@ -487,6 +543,32 @@ fn console_compute_records_and_submits_on_metal() {
     };
     barrier(list, 1, &split);
     assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    // The first transition is checked against the actual creation state at submission.
+    barrier(list, 1, &transition(a, 0x800, 8, u32::MAX));
+    assert_eq!(close(list), S_OK);
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    assert_eq!(signal(queue, fence, 8), object::E_NOTIMPL);
+    assert_eq!(completed(fence), 7);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    assert_eq!(release(queue), 0);
+    queue = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x40
+        )(dev, (&raw const queue_desc).cast(), &queue_iid, &mut queue),
+        S_OK
+    );
+    barrier(list, 1, &transition(a, 0x400, 8, u32::MAX));
+    assert_eq!(close(list), S_OK);
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    assert_eq!(signal(queue, fence, 7), S_OK);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    // A COMMON buffer permits a promotable before-state in a transition.
+    barrier(list, 1, &transition(a, 0x800, 8, u32::MAX));
+    assert_eq!(close(list), S_OK);
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    assert_eq!(signal(queue, fence, 7), S_OK);
     assert_eq!(reset(list, allocator, null), S_OK);
     assert_eq!(release(a), 0);
     assert_eq!(release(b), 0);

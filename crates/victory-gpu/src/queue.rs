@@ -136,10 +136,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         if q.failed.load(Ordering::Acquire) {
             return;
         }
+        if !matches!(q.kind, 0 | 2) {
+            q.failed.store(true, Ordering::Release);
+            return;
+        }
         // SAFETY: caller supplies count live command-list pointers.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let mut submission = crate::metal::Submission::default();
         for &list in lists {
-            if let Err(error) = crate::list::metal_execute(list) {
+            if let Err(error) = crate::list::metal_execute(list, q.kind, &mut submission) {
                 tracing::error!(%error, "Metal command submission failed");
                 q.failed.store(true, Ordering::Release);
                 break;

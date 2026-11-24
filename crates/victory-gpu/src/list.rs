@@ -156,13 +156,23 @@ fn with_metal(this: This, f: impl FnOnce(&mut crate::metal::State)) {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn metal_execute(this: This) -> Result<(), String> {
+pub(crate) fn metal_execute(
+    this: This,
+    kind: u32,
+    submission: &mut crate::metal::Submission,
+) -> Result<(), String> {
     if this.is_null() {
         return Err("null command list".into());
     }
     // SAFETY: the queue receives one of our live command lists.
     let state = unsafe { &(*this.cast::<List>()).metal };
-    state.lock().unwrap_or_else(|e| e.into_inner()).execute()
+    if unsafe { (*this.cast::<List>()).kind } != kind {
+        return Err("command list type does not match its queue".into());
+    }
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .execute(submission)
 }
 macro_rules! reject_metal {
     ($this:expr, $reason:literal) => {
@@ -441,11 +451,25 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
             with_metal(this, |s| {
                 for barrier in barriers {
-                    if barrier.kind != 2 || barrier.flags != 0 {
-                        s.reject("only unsplit UAV buffer barriers are supported on Metal");
+                    if barrier.flags != 0 {
+                        s.reject("split barriers are unsupported on Metal");
                         break;
                     }
-                    s.uav_barrier(barrier.first);
+                    match barrier.kind {
+                        0 => s.transition(
+                            barrier.first,
+                            barrier.second as u32,
+                            (barrier.second >> 32) as u32,
+                            barrier.last as u32,
+                        ),
+                        2 => s.uav_barrier(barrier.first),
+                        _ => {
+                            s.reject(
+                                "only buffer transition and UAV barriers are supported on Metal",
+                            );
+                            break;
+                        }
+                    }
                 }
             });
         }
