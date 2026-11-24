@@ -8,9 +8,7 @@ mod census;
 mod inspect;
 #[cfg(windows)]
 mod run;
-#[cfg(windows)]
 mod shader;
-#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -28,7 +26,7 @@ use clap::{Parser, Subcommand};
 )]
 #[cfg_attr(
     not(windows),
-    command(about = "Inspect PE images and COFF import libraries offline")
+    command(about = "Inspect PE images and analyze shaders offline")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -67,7 +65,6 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
-    #[cfg(windows)]
     /// Find shader containers in files or directories (also inside engine
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
@@ -79,10 +76,10 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
-    #[cfg(windows)]
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     Translate {
+        /// Search configured game and test-title directories when omitted.
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
         /// else the newest Windows SDK's).
@@ -160,13 +157,11 @@ fn main() -> Result<()> {
             missing,
         } => census::run(paths, strict, missing),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
-        #[cfg(windows)]
         Command::ShaderInfo {
             paths,
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
-        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -220,7 +215,6 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 /// Paths given on the command line, or the configured game + test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     if !paths.is_empty() {

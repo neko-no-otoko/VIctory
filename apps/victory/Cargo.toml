@@ -9,21 +9,23 @@ publish.workspace = true
 
 [dependencies]
 victory-pe.workspace = true
+victory-core.workspace = true
+victory-game.workspace = true
+victory-shader.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-victory-core.workspace = true
-victory-loader.workspace = true
-victory-hle.workspace = true
-victory-shader = { workspace = true, features = ["host"] }
-victory-game.workspace = true
 memchr.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+victory-loader.workspace = true
+victory-hle.workspace = true
+victory-shader = { workspace = true, features = ["host"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+miniz_oxide.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

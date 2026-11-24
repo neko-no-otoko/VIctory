@@ -46,17 +46,26 @@ What each part does today and what it still needs:
 
 ## Offline inspection on macOS
 
-The native macOS build supports read-only PE32+ x86-64 image and COFF import
-library inspection. It does not load or execute titles, provide Xbox runtime
-services, or implement a Metal renderer. These commands also work on Windows.
+The native macOS CLI supports read-only PE32+ x86-64 and COFF inspection,
+shader-container analysis and GFX10 disassembly, and offline translation
+to DXIL. It does not load or execute titles, provide Xbox runtime services,
+or implement a Metal renderer. These commands also work on Windows.
 Use the pinned Rust toolchain and build only the CLI package:
 
 ```sh
 cargo build -p victory
 target/debug/victory inspect /path/to/title.exe --imports --exports
 target/debug/victory lib-exports /path/to/import.lib --list
+target/debug/victory shader-info /path/to/shaders --disasm
+target/debug/victory translate /path/to/shaders --list
 cargo test -p victory -p victory-pe
 ```
+
+Translation reports whether DXIL was emitted; this does not validate the
+output or establish that it can run on macOS. `--validate`, `--pipelines`,
+and `VICTORY_PAIRS` require Windows. Shader inputs may be raw DXBC containers
+or SGD5 packed records, including those found inside otherwise uncompressed
+files. Compressed or encrypted archives are not generally unpacked.
 
 Input files are supplied by the user; see [the asset policy](docs/asset-policy.md).
 

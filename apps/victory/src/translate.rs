@@ -7,8 +7,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -140,6 +143,7 @@ impl Tally {
     }
 }
 
+#[cfg(windows)]
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
@@ -147,8 +151,11 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
+    #[cfg(windows)]
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
@@ -160,7 +167,14 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    #[cfg(not(windows))]
+    anyhow::ensure!(
+        !validate && !pipelines,
+        "--validate and --pipelines require Windows"
+    );
+    #[cfg(windows)]
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -169,15 +183,25 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    #[cfg(windows)]
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    #[cfg(windows)]
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    #[cfg(not(windows))]
+    anyhow::ensure!(
+        std::env::var("VICTORY_PAIRS")
+            .unwrap_or_default()
+            .is_empty(),
+        "VICTORY_PAIRS requires Windows D3D12"
+    );
+    #[cfg(windows)]
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -204,10 +228,13 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
+                            #[cfg(windows)]
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            #[cfg(windows)]
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
@@ -270,6 +297,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -411,12 +439,8 @@ fn translate(
 }
 
 /// Validates an emitted shader if asked to.
-fn check(
-    mut shader: emit::HostShader,
-    t: &mut Tally,
-    checks: &mut Checks,
-    label: impl Fn() -> String,
-) {
+fn check(shader: emit::HostShader, t: &mut Tally, checks: &mut Checks, label: impl Fn() -> String) {
+    #[cfg(windows)]
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
@@ -433,6 +457,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -450,9 +475,13 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
+    #[cfg(windows)]
+    let mut shader = shader;
+    #[cfg(windows)]
     let Some(v) = checks.validator.as_mut() else {
         return;
     };
+    #[cfg(windows)]
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
@@ -487,6 +516,8 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+    #[cfg(not(windows))]
+    let _ = (shader, checks);
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
