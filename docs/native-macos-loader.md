@@ -74,11 +74,22 @@ With a trusted Apple Metal Shader Converter dylib, LLVM-MinGW and a Metal GPU:
 export VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
 ulimit -c 0
 cargo test -p victory --target x86_64-apple-darwin --test native_compute -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_cbv -- --ignored
 ```
 
 The synthetic test invokes the PE through the CLI, dispatches its own console
 shader through VIctory's translation and Metal backend, verifies readback 42,
 and checks an unsupported device slot terminates the child process.
+The compute path also accepts one root CBV set with
+`SetComputeRootConstantBufferView`, alongside the existing index-zero UAV table.
+The root address must be 16-byte aligned and refer to a live committed
+default-heap buffer; the readable range is bounded by the allocation and 64 KiB.
+Only static-offset scalar loads using the validated unbounded console buffer
+descriptor (high address bits `0x100000`, words `0xffffffff, 0x11014fac`) are
+supported. The command retains the resource and reads its current contents
+at submission. Missing, misaligned, aliased or undersized bindings are rejected;
+root SRV/UAV and graphics CBV bindings remain unsupported. The synthetic PE
+tests readback, an offset binding, lifetime, late writes, and invalid inputs.
 
 The native graphics fixture exercises a restricted vertex/pixel pipeline,
 render-target clear, two triangle draws with different root constants, and a

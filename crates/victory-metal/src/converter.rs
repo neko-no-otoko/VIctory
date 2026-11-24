@@ -67,7 +67,7 @@ impl Drop for Handle {
 /// Loading the supplied dynamic library executes its initializers; callers must
 /// supply a trusted Apple Metal Shader Converter library.
 pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, stage, None, false)
+    convert_impl(library, dxil, stage, None, false, None).map(|(data, _)| data)
 }
 
 /// Convert a fragment shader after verifying its automatic resource layout.
@@ -82,7 +82,8 @@ pub fn convert_fragment_with_b0(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false, None)
+        .map(|(data, _)| data)
 }
 
 /// Convert a sampled fragment shader using the same checked automatic b0 ABI.
@@ -95,7 +96,25 @@ pub fn convert_sampled_fragment(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true, None)
+        .map(|(data, _)| data)
+}
+
+/// Convert a compute shader and return its reflected root-CBV argument offset.
+///
+/// The only explicit resources may be b0 space0 (at offset zero) and the
+/// requested b register in space1. Directly indexed UAV heaps are implicit.
+/// `library` must be a trusted Metal Shader Converter library.
+pub fn convert_compute_with_root_cbv(
+    library: &Path,
+    dxil: &[u8],
+    root_slot: u8,
+) -> Result<(Vec<u8>, usize), String> {
+    if root_slot > 63 {
+        return Err("root CBV slot must be in 0..64".into());
+    }
+    let (data, offset) = convert_impl(library, dxil, Stage::Compute, None, false, Some(root_slot))?;
+    Ok((data, offset.ok_or("missing reflected root CBV")?))
 }
 
 fn convert_impl(
@@ -104,7 +123,8 @@ fn convert_impl(
     stage: Stage,
     expected_b0: Option<bool>,
     force_texture_array: bool,
-) -> Result<Vec<u8>, String> {
+    root_cbv: Option<u8>,
+) -> Result<(Vec<u8>, Option<usize>), String> {
     // SAFETY: the caller supplies the path to a trusted converter library.
     let lib = unsafe { libloading::Library::new(library) }
         .map_err(|error| format!("loading converter {}: {error}", library.display()))?;
@@ -181,7 +201,8 @@ fn convert_impl(
         let result = result.ok_or_else(|| {
             "Metal Shader Converter could not create converted object".to_string()
         })?;
-        if let Some(expected_b0) = expected_b0 {
+        let mut cbv_offset = None;
+        if expected_b0.is_some() || root_cbv.is_some() {
             let reflection_create = api!(
                 "IRShaderReflectionCreate",
                 unsafe extern "C" fn() -> Pointer
@@ -201,36 +222,62 @@ fn convert_impl(
             );
             let reflection =
                 Handle::new(reflection_create(), reflection_destroy, "shader reflection")?;
-            if !reflect(result.ptr, Stage::Fragment.raw(), reflection.ptr) {
-                return Err("converter could not reflect fragment shader".into());
+            if !reflect(result.ptr, stage.raw(), reflection.ptr) {
+                return Err("converter could not reflect shader".into());
             }
             let count = resource_count(reflection.ptr);
-            if count != usize::from(expected_b0) {
-                return Err(format!(
-                    "unsupported fragment resource layout: expected {} resources, found {count}",
-                    usize::from(expected_b0)
-                ));
-            }
-            if expected_b0 {
-                let mut location = ResourceLocation::default();
-                resource_locations(reflection.ptr, &mut location);
-                if (
-                    location.kind,
-                    location.space,
-                    location.slot,
-                    location.offset,
-                    location.size,
-                ) != (2, 0, 0, 0, 24)
-                {
+            if let Some(expected_b0) = expected_b0 {
+                if count != usize::from(expected_b0) {
                     return Err(format!(
-                        "unsupported fragment resource layout: kind {}, space {}, slot {}, offset {}, size {}",
+                        "unsupported fragment resource layout: expected {} resources, found {count}",
+                        usize::from(expected_b0)
+                    ));
+                }
+                if expected_b0 {
+                    let mut location = ResourceLocation::default();
+                    resource_locations(reflection.ptr, &mut location);
+                    if (
                         location.kind,
                         location.space,
                         location.slot,
                         location.offset,
-                        location.size
-                    ));
+                        location.size,
+                    ) != (2, 0, 0, 0, 24)
+                    {
+                        return Err(format!(
+                            "unsupported fragment resource layout: kind {}, space {}, slot {}, offset {}, size {}",
+                            location.kind,
+                            location.space,
+                            location.slot,
+                            location.offset,
+                            location.size
+                        ));
+                    }
                 }
+            } else if let Some(slot) = root_cbv {
+                if !(1..=2).contains(&count) {
+                    return Err(format!("unsupported compute resource count: {count}"));
+                }
+                let mut locations = [ResourceLocation::default(), ResourceLocation::default()];
+                resource_locations(reflection.ptr, locations.as_mut_ptr());
+                let mut b0 = false;
+                for location in &locations[..count] {
+                    if location.kind != 2 || location.size != 24 || location.offset % 8 != 0 {
+                        return Err("unsupported compute resource descriptor".into());
+                    }
+                    match (location.space, location.slot) {
+                        (0, 0) if !b0 && location.offset == 0 => b0 = true,
+                        (1, s) if s == u32::from(slot) && cbv_offset.is_none() => {
+                            cbv_offset = Some(location.offset as usize);
+                        }
+                        _ => return Err("unexpected compute resource binding".into()),
+                    }
+                }
+                let offset = cbv_offset.ok_or("missing reflected root CBV")?;
+                if b0 && offset < 24 {
+                    return Err("overlapping compute resource descriptors".into());
+                }
+                offset.checked_add(24).ok_or("compute argument offset overflow")?;
             }
         }
         let binary = Handle::new(binary_create(), binary_destroy, "Metal library")?;
@@ -245,6 +292,6 @@ fn convert_impl(
         if binary_copy(binary.ptr, data.as_mut_ptr()) != size {
             return Err("converter returned an incomplete Metal library".into());
         }
-        Ok(data)
+        Ok((data, cbv_offset))
     }
 }

@@ -1341,6 +1341,9 @@ mod state {
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_metal(this, |s| s.set_table(slot, handle));
     }
+    pub(super) extern "system" fn compute_cbv(this: This, slot: u32, address: u64) {
+        with_metal(this, |s| s.set_compute_cbv(slot, address));
+    }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
         with_metal(this, |s| s.set_graphics_table(slot, handle));
     }
@@ -1877,6 +1880,9 @@ mod native {
     extern "win64" fn table_native(this: This, slot: u32, handle: u64) {
         state::compute_table(this, slot, handle)
     }
+    extern "win64" fn compute_cbv_native(this: This, slot: u32, address: u64) {
+        state::compute_cbv(this, slot, address)
+    }
     extern "win64" fn constant_native(this: This, slot: u32, value: u32, offset: u32) {
         state::compute_constant(this, slot, value, offset)
     }
@@ -1927,6 +1933,7 @@ mod native {
         f[38] = graphics_constant_native as *const ();
         f[39] = constants_native as *const ();
         f[40] = graphics_constants_native as *const ();
+        f[41] = compute_cbv_native as *const ();
         f[47] = index_native as *const ();
         f[48] = vertices_native as *const ();
         f[50] = targets_native as *const ();

@@ -14,6 +14,7 @@ pub(crate) struct Prepared {
     user_data: Vec<emit::UserData>,
     dwords: usize,
     table_slot: u8,
+    root_cbv: Option<(u8, u64, usize)>,
     threads: [u32; 3],
 }
 
@@ -29,30 +30,23 @@ impl Prepared {
         let native::StageIo::Cs(io) = &p.io else {
             return Err("missing compute metadata".into());
         };
-        if p.used.len() != 1
-            || p.used[0].kind != ResourceType::Uav
-            || p.used[0].root != RootType::Table
-            || p.used[0].stride != 0
-            || p.used[0].table_offset_dwords != 0
-            || p.used[0].dwords != 4
+        let mut uavs = p.used.iter().filter(|u| u.kind == ResourceType::Uav);
+        let uav = uavs.next().ok_or("missing UAV descriptor")?;
+        if uavs.next().is_some() || uav.root != RootType::Table || uav.stride != 0
+            || uav.table_offset_dwords != 0 || uav.dwords != 4
+            || p.used.iter().any(|u| u.kind != ResourceType::Uav
+                && !(u.kind == ResourceType::Cbv && u.root == RootType::Descriptor))
         {
-            return Err("only one raw UAV in a descriptor table is supported".into());
+            return Err("only one raw UAV table and an optional root CBV are supported".into());
         }
         let program = ir::build(&p.code, p.wave64, p.vgprs).map_err(|e| e.to_string())?;
         let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
-        let Some(descriptor) = traced.descriptors.first() else {
-            return Err("expected a UAV descriptor access".into());
-        };
-        let resource::Source::Loaded { load, first: 0 } = descriptor.source else {
-            return Err("only loaded UAV descriptors are supported".into());
-        };
-        if traced.scalar.len() != 1
-            || traced
-                .descriptors
-                .iter()
-                .any(|d| d.role != resource::Role::Resource || d.source != descriptor.source)
-        {
-            return Err("only accesses to the same UAV descriptor are supported".into());
+        let descriptor = traced.descriptors.iter()
+            .find(|d| matches!(d.source, resource::Source::Loaded { first: 0, .. }))
+            .ok_or("expected a UAV descriptor access")?;
+        let resource::Source::Loaded { load, first: 0 } = descriptor.source else { unreachable!() };
+        if traced.scalar.len() != 1 {
+            return Err("unsupported scalar memory access".into());
         }
         let Some((_, addr)) = traced.scalar.iter().find(|(site, _)| *site == load) else {
             return Err("missing UAV load".into());
@@ -63,14 +57,61 @@ impl Prepared {
         if addr.offset != 0
             || addr.dynamic.is_some()
             || root.root != RootType::Table
-            || root.slot != p.used[0].slot
-            || root.user_data != p.used[0].user_data
+            || root.slot != uav.slot
+            || root.user_data != uav.user_data
         {
             return Err("only descriptor index zero is supported".into());
         }
+        let mut cbv_slot = None;
+        let mut cbv_required = 0u64;
+        for d in &traced.descriptors {
+            if d.role != resource::Role::Resource {
+                return Err("unsupported compute descriptor role".into());
+            }
+            if d.source == descriptor.source {
+                continue;
+            }
+            let resource::Source::Built { address, bits: 0x100000, words: [u32::MAX, 0x11014fac] } = &d.source else {
+                return Err("unsupported compute buffer descriptor".into());
+            };
+            let cbv_root = p.layout.get(address.param).ok_or("missing root CBV layout")?;
+            if cbv_root.root != RootType::Descriptor || cbv_root.sgprs != 2
+                || cbv_root.slot >= 64 || cbv_root.slot == root.slot
+                || address.dynamic.is_some()
+                || cbv_slot.is_some_and(|slot| slot != cbv_root.slot)
+                || !p.used.iter().any(|u| u.kind == ResourceType::Cbv
+                    && u.root == RootType::Descriptor && u.slot == cbv_root.slot
+                    && u.user_data == cbv_root.user_data)
+            {
+                return Err("unsupported root CBV layout".into());
+            }
+            let inst = program.blocks.get(d.site.0).and_then(|b| b.insts.get(d.site.1))
+                .ok_or("invalid root CBV access")?;
+            let count = match inst.name() {
+                "s_buffer_load_dword" => 1u64,
+                "s_buffer_load_dwordx2" => 2,
+                "s_buffer_load_dwordx4" => 4,
+                "s_buffer_load_dwordx8" => 8,
+                "s_buffer_load_dwordx16" => 16,
+                _ => return Err("only scalar root CBV loads are supported".into()),
+            };
+            let victory_shader::gfx10::Fields::Smem { offset, soffset, .. } = &inst.fields else {
+                return Err("invalid root CBV instruction".into());
+            };
+            if !matches!(soffset, victory_shader::gfx10::Operand::Scalar { code, .. } if *code == victory_shader::gfx10::NULL) {
+                return Err("dynamic root CBV offsets are unsupported".into());
+            }
+            let start = u64::from(address.offset).checked_add(u64::from(*offset as u32)).ok_or("CBV offset overflow")?;
+            let end = start.checked_add(count * 4).and_then(|n| n.checked_next_multiple_of(16)).ok_or("CBV range overflow")?;
+            if start % 4 != 0 || end > 65536 {
+                return Err("root CBV load is out of range".into());
+            }
+            cbv_required = cbv_required.max(end);
+            cbv_slot = Some(cbv_root.slot);
+        }
         let host = emit::translate(container).map_err(|e| e.to_string())?;
         if !host.samplers.is_empty()
-            || !host.root_cbvs.is_empty()
+            || host.root_cbvs.as_slice() != cbv_slot.as_slice()
             || !host.root_srvs.is_empty()
             || host.user_data.iter().any(|u| {
                 !matches!(u.root, RootType::Constants | RootType::Table)
@@ -81,17 +122,22 @@ impl Prepared {
         }
         let path =
             std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
-        let metallib = victory_metal::converter::convert(
-            std::path::Path::new(&path),
-            &host.dxil,
-            victory_metal::converter::Stage::Compute,
-        )?;
+        let (metallib, root_cbv) = if let Some(slot) = cbv_slot {
+            let (metallib, offset) = victory_metal::converter::convert_compute_with_root_cbv(
+                std::path::Path::new(&path), &host.dxil, slot)?;
+            (metallib, Some((slot, cbv_required, offset)))
+        } else {
+            (victory_metal::converter::convert(
+                std::path::Path::new(&path), &host.dxil,
+                victory_metal::converter::Stage::Compute)?, None)
+        };
         let compute = victory_metal::compute::Compute::new(&metallib, "main")?;
         Ok(Self {
             compute,
             dwords: (host.user_data_dwords() as usize).max(4),
             user_data: host.user_data,
             table_slot: root.slot,
+            root_cbv,
             threads: io.threads,
         })
     }
@@ -337,6 +383,7 @@ enum Root {
     None,
     Constants(Vec<Option<u32>>),
     Table(u64),
+    Cbv { resource: ResourceRef, offset: u64, size: u64 },
 }
 enum Command {
     ClearTarget {
@@ -389,6 +436,7 @@ enum Command {
         _heap: Arc<HeapRef>,
         handle: u64,
         resource: ResourceRef,
+        cbv: Option<(ResourceRef, u64, u64)>,
         constants: Vec<u32>,
         groups: [u32; 3],
     },
@@ -1023,6 +1071,30 @@ impl State {
         }
         self.roots[slot as usize] = Root::Table(handle);
     }
+    pub(crate) fn set_compute_cbv(&mut self, slot: u32, address: u64) {
+        if !self.open() {
+            return;
+        }
+        if slot >= 64 || address % 16 != 0 {
+            self.reject("invalid root CBV slot or alignment");
+            return;
+        }
+        let Some((resource, offset)) = crate::resource::metal_buffer_at(address, 16) else {
+            self.reject("root CBV address is not a live committed buffer");
+            return;
+        };
+        let resource = ResourceRef(resource as usize);
+        let Some((_, size)) = crate::resource::buffer_bytes(resource.ptr()) else {
+            self.reject("invalid root CBV buffer");
+            return;
+        };
+        if self.roots.len() <= slot as usize {
+            self.roots.resize_with(slot as usize + 1, Root::default);
+        }
+        self.roots[slot as usize] = Root::Cbv {
+            resource, offset, size: (size - offset).min(65536),
+        };
+    }
     pub(crate) fn set_graphics_table(&mut self, slot: u32, handle: u64) {
         if !self.open() {
             return;
@@ -1127,6 +1199,17 @@ impl State {
         if resource.is_null() || crate::resource::buffer_bytes(resource).is_none() {
             return Err("UAV is not a buffer".into());
         }
+        let cbv = if let Some((slot, required, _)) = p.root_cbv {
+            let Some(Root::Cbv { resource: cbv, offset, size }) = self.roots.get(slot as usize) else {
+                return Err("missing compute root CBV".into());
+            };
+            if *size < required || cbv.ptr() == resource {
+                return Err("root CBV range is too small or aliases the UAV".into());
+            }
+            Some((ResourceRef::new(cbv.ptr()), *offset, required))
+        } else {
+            None
+        };
         let mut constants = vec![0; p.dwords];
         for u in &p.user_data {
             constants[u.index as usize] = match (u.root, self.roots.get(u.slot as usize)) {
@@ -1141,6 +1224,9 @@ impl State {
         }
         let handle = *handle;
         self.use_state(resource, UAV)?;
+        if let Some((cbv, _, _)) = &cbv {
+            self.use_state(cbv.ptr(), VERTEX_BUFFER)?;
+        }
         let resource = ResourceRef::new(resource);
         drop(p);
         self.commands.push(Command::Dispatch {
@@ -1148,6 +1234,7 @@ impl State {
             _heap: bound_heap,
             handle,
             resource,
+            cbv,
             constants,
             groups,
         });
@@ -1414,6 +1501,7 @@ impl State {
                     _heap: _,
                     handle,
                     resource,
+                    cbv,
                     constants,
                     groups,
                 } => {
@@ -1422,6 +1510,9 @@ impl State {
                         return Err("UAV descriptor changed after recording".into());
                     }
                     submission.access(resource.ptr(), UAV)?;
+                    if let Some((cbv, _, _)) = cbv.as_ref() {
+                        submission.access(cbv.ptr(), VERTEX_BUFFER)?;
+                    }
                     let (ptr, len) = crate::resource::buffer_bytes(resource.ptr())
                         .ok_or("UAV resource no longer valid")?;
                     let len = usize::try_from(len).map_err(|_| "UAV buffer is too large")?;
@@ -1430,7 +1521,19 @@ impl State {
                     let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                     let mut p = pipeline.lock().unwrap_or_else(|e| e.into_inner());
                     let threads = p.threads;
-                    p.compute.dispatch(buffer, constants, *groups, threads)?;
+                    if let Some((cbv, offset, size)) = cbv.as_ref() {
+                        let (data, available) = crate::resource::buffer_bytes(cbv.ptr())
+                            .ok_or("root CBV resource no longer valid")?;
+                        if offset.checked_add(*size).is_none_or(|end| end > available) {
+                            return Err("root CBV range changed".into());
+                        }
+                        let (_, _, argument_offset) = p.root_cbv.ok_or("missing reflected root CBV")?;
+                        // SAFETY: retained CBV is distinct from the writable UAV and the range is checked.
+                        let data = unsafe { std::slice::from_raw_parts(data.add(*offset as usize), *size as usize) };
+                        p.compute.dispatch_with_root_cbv(buffer, constants, *groups, threads, data, argument_offset)?;
+                    } else {
+                        p.compute.dispatch(buffer, constants, *groups, threads)?;
+                    }
                 }
             }
         }

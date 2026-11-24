@@ -1,7 +1,8 @@
 //! Synchronous compute dispatch for shaders produced by Metal Shader Converter.
 //!
-//! The shader must use a writable raw buffer at resource heap index 0 and a
-//! b0 constant buffer at offset 0 of the automatic linear argument buffer.
+//! The shader uses a writable raw buffer at resource heap index 0. The
+//! automatic linear argument buffer contains b0 at offset 0 when used;
+//! an optional root CBV uses the offset returned by converter reflection.
 //! Callers are responsible for checking the converted shader's binding layout.
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -21,6 +22,9 @@ unsafe extern "C" {
         buffer_len: usize,
         constants: *const u32,
         constant_bytes: usize,
+        cbv: *const u8,
+        cbv_len: usize,
+        cbv_offset: usize,
         groups: *const u32,
         threads: *const u32,
         error: *mut c_char,
@@ -77,6 +81,38 @@ impl Compute {
         groups: [u32; 3],
         threads: [u32; 3],
     ) -> Result<(), String> {
+        self.dispatch_impl(buffer, constants, groups, threads, None)
+    }
+
+    /// Dispatches with a root CBV at the argument offset returned by
+    /// `converter::convert_compute_with_root_cbv`. The CBV bytes are uploaded
+    /// for this synchronous dispatch and may contain at most 64 KiB.
+    pub fn dispatch_with_root_cbv(
+        &mut self,
+        buffer: &mut [u8],
+        constants: &[u32],
+        groups: [u32; 3],
+        threads: [u32; 3],
+        cbv: &[u8],
+        cbv_offset: usize,
+    ) -> Result<(), String> {
+        if cbv.is_empty() || cbv.len() > 65536 {
+            return Err("root CBV size must be in 1..=65536 bytes".into());
+        }
+        if cbv_offset % 8 != 0 || cbv_offset.checked_add(24).is_none() {
+            return Err("invalid root CBV argument offset".into());
+        }
+        self.dispatch_impl(buffer, constants, groups, threads, Some((cbv, cbv_offset)))
+    }
+
+    fn dispatch_impl(
+        &mut self,
+        buffer: &mut [u8],
+        constants: &[u32],
+        groups: [u32; 3],
+        threads: [u32; 3],
+        cbv: Option<(&[u8], usize)>,
+    ) -> Result<(), String> {
         if buffer.is_empty() || buffer.len() > u32::MAX as usize {
             return Err("buffer size must be nonzero and fit in 32 bits".into());
         }
@@ -90,6 +126,10 @@ impl Compute {
             return Err("group and thread dimensions must be nonzero".into());
         }
         let mut error = [0 as c_char; 1024];
+        let (cbv_ptr, cbv_len, cbv_offset) = match cbv {
+            Some((bytes, offset)) => (bytes.as_ptr(), bytes.len(), offset),
+            None => (std::ptr::null(), 0, 0),
+        };
         // All pointers remain valid until the native synchronous dispatch returns.
         let ok = unsafe {
             victory_metal_compute_dispatch(
@@ -98,6 +138,9 @@ impl Compute {
                 buffer.len(),
                 constants.as_ptr(),
                 constants.len() * 4,
+                cbv_ptr,
+                cbv_len,
+                cbv_offset,
                 groups.as_ptr(),
                 threads.as_ptr(),
                 error.as_mut_ptr(),
