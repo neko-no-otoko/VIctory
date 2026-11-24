@@ -7,11 +7,11 @@
 use std::ffi::{c_char, c_void};
 
 pub use victory_runtime::user::{LOCAL_ID, USER_NOT_FOUND, XUID};
-use victory_runtime::user::{GAMERTAG, find_id, find_local_id};
+use victory_runtime::user::{find_id, find_local_id, write_gamertag};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
 };
 
 /// The user provider.
@@ -159,7 +159,8 @@ extern "system" fn get_gamertag(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    put_string(GAMERTAG, size, buffer, used)
+    // SAFETY: the title supplies the output buffer and optional length pointer.
+    unsafe { write_gamertag(size, buffer, used) }
 }
 /// Granted; deny reason 0 (none).
 extern "system" fn check_privilege(

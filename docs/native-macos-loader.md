@@ -40,12 +40,16 @@ It checks texture decisions, null-pointer errors, a texture-computer layout,
 tile/detile round trip, an unsupported slot, and reference-counted release
 through PE imports under Rosetta, without game data.
 
-Separately, `victory_runtime::NativeResolver` exposes only
-`xgameruntime.dll!QueryApiImpl` for the two upstream XSystem interface IDs.
-The returned Windows-ABI object supports the upstream offline console ID,
-sandbox ID and device ID string methods. Other provider/interface pairs and
-all other imports remain unsupported. Its strings and buffer-error behavior
-are shared with the Windows implementation; this is not the full runtime.
+Separately, `victory_runtime::NativeResolver` exposes
+`xgameruntime.dll!QueryApiImpl` for the upstream XSystem interfaces and a
+restricted offline XUser provider. XSystem supplies console, sandbox and
+device ID strings. XUser supports synchronous local identity lookup, handle
+duplication and close, comparison, state, guest status and gamertag. These
+share offline identity values with the Windows implementation. Other XUser
+HRESULT operations return `E_NOTIMPL`; the unsupported boolean unregister
+slot aborts rather than masquerading as success. No online or asynchronous
+user services are provided. Other provider/interface pairs and imports remain
+unsupported; this is not the full runtime.
 Run its synthetic PE test with
 `cargo test -p victory-runtime --target x86_64-apple-darwin --test native_guest`.
 

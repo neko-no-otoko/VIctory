@@ -91,16 +91,18 @@ typedef void (*Close)(void *, void *);
 typedef int (*Compare)(void *, void *, void *);
 typedef long (*Unsupported)(void *);
 typedef unsigned (*Release)(void *);
+int marker = 7; int *volatile relocated_marker = &marker;
 unsigned entry(void) {
     void *object=0, *user=0, *duplicate=0, *missing=(void *)1;
     unsigned long long id=0, used=0;
     char name[7]={0}, small[6]={'x','x','x','x','x','x'};
+    if (*relocated_marker != 7) return 13;
     if (QueryApiImpl(&provider,&iid,&object) || !object) return 1;
     void **v=*(void ***)object;
     if (((Find)v[12])(object,0x9000000000001ULL,&user) || !user) return 2;
     if (((GetId)v[9])(object,user,&id) || id!=1) return 3;
     if (((GetId)v[11])(object,user,&id) || id!=0x9000000000001ULL) return 4;
-    if ((unsigned long)((Find)v[10])(object,2,&missing)!=0x89245104UL || missing) return 5;
+    if ((unsigned long)((Find)v[10])(object,2,&missing)!=0x89245104UL || missing!=(void *)1) return 5;
     if (((GetGamertag)v[15])(object,user,0,sizeof(name),name,&used) || used!=7 ||
         name[0]!='P' || name[1]!='l' || name[2]!='a' || name[3]!='y' ||
         name[4]!='e' || name[5]!='r' || name[6]) return 6;

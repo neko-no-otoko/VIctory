@@ -13,3 +13,24 @@ pub fn find_id(id: u64) -> bool {
 pub fn find_local_id(id: u64) -> bool {
     id == LOCAL_ID
 }
+
+/// Copies the gamertag and its NUL terminator into the caller's buffer.
+///
+/// # Safety
+/// If non-null and large enough, `buffer` must be writable for `size` bytes.
+/// If non-null, `used` must be writable for a `usize`.
+pub unsafe fn write_gamertag(size: usize, buffer: *mut u8, used: *mut usize) -> i32 {
+    let len = GAMERTAG.len() + 1;
+    if buffer.is_null() || size < len {
+        return 0x8007_007a_u32 as i32;
+    }
+    // SAFETY: the caller guarantees valid output pointers.
+    unsafe {
+        buffer.copy_from_nonoverlapping(GAMERTAG.as_ptr(), GAMERTAG.len());
+        buffer.add(GAMERTAG.len()).write(0);
+        if !used.is_null() {
+            used.write(len);
+        }
+    }
+    0
+}
