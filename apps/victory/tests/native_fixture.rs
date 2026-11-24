@@ -74,6 +74,59 @@ unsigned entry(void) {
 }
 
 #[test]
+fn native_fixture_queries_offline_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("runtime.def"), "LIBRARY xgameruntime.dll\nEXPORTS\nQueryApiImpl\n").unwrap();
+    std::fs::write(root.join("user.c"), r#"
+struct Guid { unsigned a; unsigned short b,c; unsigned char d[8]; };
+__declspec(dllimport) long QueryApiImpl(const struct Guid *, const struct Guid *, void **);
+static const struct Guid provider = {0x01acd177,0x91f9,0x4763,{0xa3,0x8e,0xcc,0xbb,0x55,0xce,0x32,0xe0}};
+static const struct Guid iid = {0xeb9bf948,0x18dc,0x4d82,{0xbb,0xcc,0x40,0xe0,0xa8,0x09,0xc4,0xc0}};
+typedef long (*Find)(void *, unsigned long long, void **);
+typedef long (*GetId)(void *, void *, unsigned long long *);
+typedef long (*GetGamertag)(void *, void *, unsigned, unsigned long long, char *, unsigned long long *);
+typedef long (*Duplicate)(void *, void *, void **);
+typedef void (*Close)(void *, void *);
+typedef int (*Compare)(void *, void *, void *);
+typedef long (*Unsupported)(void *);
+typedef unsigned (*Release)(void *);
+unsigned entry(void) {
+    void *object=0, *user=0, *duplicate=0, *missing=(void *)1;
+    unsigned long long id=0, used=0;
+    char name[7]={0}, small[6]={'x','x','x','x','x','x'};
+    if (QueryApiImpl(&provider,&iid,&object) || !object) return 1;
+    void **v=*(void ***)object;
+    if (((Find)v[12])(object,0x9000000000001ULL,&user) || !user) return 2;
+    if (((GetId)v[9])(object,user,&id) || id!=1) return 3;
+    if (((GetId)v[11])(object,user,&id) || id!=0x9000000000001ULL) return 4;
+    if ((unsigned long)((Find)v[10])(object,2,&missing)!=0x89245104UL || missing) return 5;
+    if (((GetGamertag)v[15])(object,user,0,sizeof(name),name,&used) || used!=7 ||
+        name[0]!='P' || name[1]!='l' || name[2]!='a' || name[3]!='y' ||
+        name[4]!='e' || name[5]!='r' || name[6]) return 6;
+    used=99;
+    if ((unsigned long)((GetGamertag)v[15])(object,user,0,sizeof(small),small,&used)!=0x8007007aUL ||
+        used!=99 || small[0]!='x' || small[5]!='x') return 7;
+    if (((Duplicate)v[3])(object,user,&duplicate) || !duplicate) return 8;
+    if (((Compare)v[5])(object,user,duplicate)!=0) return 9;
+    ((Close)v[4])(object,duplicate);
+    if (((GetId)v[11])(object,user,&id) || id!=0x9000000000001ULL) return 10;
+    if ((unsigned long)((Unsupported)v[6])(object)!=0x80004001UL) return 11;
+    ((Close)v[4])(object,user);
+    if (((Release)v[2])(object)!=1) return 12;
+    return 42;
+}
+"#).unwrap();
+    tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "runtime.def", "-l", "runtime.lib"]);
+    tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "user.c", "-o", "user.obj"]);
+    tool(root, "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:user.exe", "user.obj", "runtime.lib"]);
+    let exe = root.join("user.exe");
+    let executed = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--execute".as_ref()]);
+    assert!(executed.status.success(), "{}", String::from_utf8_lossy(&executed.stderr));
+    assert!(String::from_utf8_lossy(&executed.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&executed.stdout));
+}
+
+#[test]
 fn explicit_dll_dependencies_attach_in_order_and_reject_errors() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
