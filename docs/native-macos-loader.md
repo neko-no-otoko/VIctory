@@ -119,6 +119,14 @@ other blend operations are rejected. When blending is disabled, inactive
 factors are ignored; with independent blending disabled, RT1–RT7 are ignored.
 The synthetic blend fixture verifies translucent draw ordering, alpha and
 channel masks, retained pipeline state, and unsupported-state rejection.
+Translated vertex and pixel stages can also share one matched 32-bit
+`TEXCOORD0.xy` varying with perspective-center interpolation, from vertex
+output register 1 to pixel input register 0. The vertex input remains a single
+`POSITION0` float4; shaders may derive the varying from it. Other register
+layouts, varying semantics, masks, flat or packed interpolation, and
+mismatched stage signatures are rejected. The varying fixture samples a
+texture at several pixels using different clip-space w values, checks the
+perspective-correct result, and exercises rejection paths.
 With the same prerequisites, run:
 
 ```sh
@@ -127,6 +135,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_indexed -- --ig
 cargo test -p victory --target x86_64-apple-darwin --test native_viewport -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_depth -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_blend -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_varying -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

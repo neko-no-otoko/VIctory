@@ -26,8 +26,14 @@ unsafe impl Send for Prepared {}
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
-        let (vertex, _, _, _, _) = convert(vertex, HwStage::Vs)?;
-        let (pixel, user_data, dwords, texture_slot, sampler_slot) = convert(pixel, HwStage::Ps)?;
+        let varying = varying_signatures(vertex, pixel)?;
+        let (vertex_host, _, _) = validate(vertex, HwStage::Vs, varying.map(|v| v.0))?;
+        let (pixel_host, texture_slot, sampler_slot) =
+            validate(pixel, HwStage::Ps, varying.map(|v| v.1))?;
+        let vertex = convert(&vertex_host, HwStage::Vs, false)?;
+        let pixel = convert(&pixel_host, HwStage::Ps, texture_slot.is_some())?;
+        let dwords = pixel_host.user_data_dwords() as usize;
+        let user_data = pixel_host.user_data;
         Ok(Self {
             vertex,
             pixel,
@@ -95,53 +101,86 @@ fn word(data: &[u8], at: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-// Signature records are the standard 32-byte ISG1/OSG1 layout. Requiring a
-// single full register prevents silently dropping interpolants or outputs.
+// Rows are local to each stage; semantic names must match independently.
 fn signature(
     container: &Container<'_>,
     part: FourCC,
-    expected: Option<(&[u8], u32)>,
-) -> Result<(), String> {
+    required: Option<(&[u8], u32)>,
+    optional_position: bool,
+    allow_varying: bool,
+) -> Result<Option<u8>, String> {
     let Some(data) = container.part(part).map(|p| p.data) else {
-        return if expected.is_none() {
-            Ok(())
-        } else {
-            Err(format!("missing {part} signature"))
-        };
+        return if required.is_none() { Ok(None) } else { Err(format!("missing {part} signature")) };
     };
-    let count = word(data, 0)?;
-    if expected.is_none() && count == 0 {
-        return Ok(());
+    let count = word(data, 0)? as usize;
+    if count > 2 {
+        return Err(format!("unsupported {part} signature element count"));
     }
-    let (name, system) = expected.ok_or_else(|| format!("unexpected {part} signature"))?;
-    if count != 1 {
-        return Err(format!("{part} must have exactly one element"));
+    let base = if count == 0 { 0 } else { word(data, 4)? as usize };
+    let mut found_required = false;
+    let mut position = false;
+    let mut varying = None;
+    for i in 0..count {
+        let at = base.checked_add(i * 32).ok_or("signature offset overflow")?;
+        let name_at = word(data, at + 4)? as usize;
+        let bytes = data.get(name_at..).ok_or("signature name out of bounds")?;
+        let end = bytes.iter().position(|&b| b == 0).ok_or("unterminated signature name")?;
+        let name = &bytes[..end];
+        let row = word(data, at + 20)?;
+        let mask = *data.get(at + 24).ok_or("truncated signature")?;
+        if word(data, at)? != 0 || word(data, at + 8)? != 0
+            || word(data, at + 16)? != 3 || word(data, at + 28)? != 0
+        {
+            return Err(format!("unsupported {part} signature metadata"));
+        }
+        let expected = required.filter(|(expected, _)| name.eq_ignore_ascii_case(expected));
+        if expected.is_some() || (optional_position && name.eq_ignore_ascii_case(b"SV_Position")) {
+            let system = expected.map_or(1, |(_, system)| system);
+            if position || word(data, at + 12)? != system || row != 0 || mask != 15 {
+                return Err(format!("unsupported {part} system signature"));
+            }
+            position = true;
+            found_required = expected.is_some();
+        } else if allow_varying && name.eq_ignore_ascii_case(b"TEXCOORD")
+            && word(data, at + 12)? == 0 && mask == 3 && row <= u8::MAX as u32
+            && data.get(at + 26..at + 28) == Some(&[0, 0])
+            && varying.is_none()
+        {
+            varying = Some(row as u8);
+        } else {
+            return Err(format!("unsupported {part} signature element"));
+        }
     }
-    let at = word(data, 4)? as usize;
-    let name_at = word(data, at + 4)? as usize;
-    let bytes = data.get(name_at..).ok_or("signature name out of bounds")?;
-    let end = bytes
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or("unterminated signature name")?;
-    if !bytes[..end].eq_ignore_ascii_case(name)
-        || word(data, at)? != 0
-        || word(data, at + 8)? != 0
-        || word(data, at + 12)? != system
-        || word(data, at + 16)? != 3
-        || word(data, at + 20)? != 0
-        || data.get(at + 24) != Some(&15)
-        || word(data, at + 28)? != 0
-    {
-        return Err(format!("unsupported {part} signature"));
+    if required.is_some() && !found_required {
+        return Err(format!("missing required {part} signature element"));
     }
-    Ok(())
+    if position && varying == Some(0) {
+        return Err(format!("overlapping {part} signature rows"));
+    }
+    Ok(varying)
 }
 
-fn convert(
+fn varying_signatures(vertex: &[u8], pixel: &[u8]) -> Result<Option<(u8, u8)>, String> {
+    let vs = Container::parse(vertex).map_err(|e| e.to_string())?;
+    let ps = Container::parse(pixel).map_err(|e| e.to_string())?;
+    signature(&vs, FourCC::ISG1, Some((b"POSITION", 0)), false, false)?;
+    let output = signature(&vs, FourCC::OSG1, Some((b"SV_Position", 1)), false, true)?;
+    let input = signature(&ps, FourCC::ISG1, None, true, true)?;
+    signature(&ps, FourCC::OSG1, Some((b"SV_Target", 64)), false, false)?;
+    match (output, input) {
+        (None, None) => Ok(None),
+        // This converter path is verified for VS output register 1 linked to
+        // PS input register 0; reject unverified register layouts explicitly.
+        (Some(1), Some(0)) => Ok(Some((1, 0))),
+        _ => Err("vertex and pixel TEXCOORD0 signatures do not match".into()),
+    }
+}
+
+fn validate(
     bytes: &[u8],
     stage: HwStage,
-) -> Result<(Vec<u8>, Vec<emit::UserData>, usize, Option<u8>, Option<u8>), String> {
+    varying: Option<u8>,
+) -> Result<(emit::HostShader, Option<u8>, Option<u8>), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
     let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
@@ -233,27 +272,28 @@ fn convert(
             return Err("missing or ambiguous descriptor table".into());
         }
     }
-    match (&p.io, stage) {
-        (native::StageIo::Vs { inputs, outputs }, HwStage::Vs)
+    match (&p.io, stage, varying) {
+        (native::StageIo::Vs { inputs, outputs }, HwStage::Vs, row)
             if inputs.len() == 1
                 && inputs[0].usage == native::Usage::Generic
                 && inputs[0].row == 0
                 && inputs[0].mask == 15
-                && outputs.is_empty() =>
-        {
-            signature(&c, FourCC::ISG1, Some((b"POSITION", 0)))?;
-            signature(&c, FourCC::OSG1, Some((b"SV_Position", 1)))?;
-        }
-        (native::StageIo::Ps { inputs, .. }, HwStage::Ps) if inputs.is_empty() => {
-            // Position may be declared without being used by the pixel shader.
-            let ps_input = c.part(FourCC::ISG1).map(|p| p.data);
-            if ps_input.map(|d| word(d, 0)).transpose()?.unwrap_or(0) == 0 {
-                signature(&c, FourCC::ISG1, None)?;
-            } else {
-                signature(&c, FourCC::ISG1, Some((b"SV_Position", 1)))?;
-            }
-            signature(&c, FourCC::OSG1, Some((b"SV_Target", 64)))?;
-        }
+                && match row {
+                    None => outputs.is_empty(),
+                    Some(row) => outputs.len() == 1
+                        && outputs[0].usage == native::Usage::Generic
+                        && outputs[0].row == row
+                        && !outputs[0].fp16 && !outputs[0].pack2,
+                } => {}
+        (native::StageIo::Ps { inputs, input_addr, .. }, HwStage::Ps, row)
+            if match row {
+                None => inputs.is_empty(),
+                Some(row) => inputs.len() == 1
+                    && inputs[0].usage == native::Usage::Generic
+                    && inputs[0].row == row && inputs[0].mask == 3
+                    && !inputs[0].flat && !inputs[0].fp16 && !inputs[0].pack2
+                    && input_addr & 2 != 0 && input_addr & !0xf02 == 0,
+            } => {}
         _ => return Err("unsupported native stage inputs or outputs".into()),
     }
     let program = ir::build(&p.patched_code(), p.wave64, p.vgprs).map_err(|e| e.to_string())?;
@@ -334,27 +374,69 @@ fn convert(
     let raised = io::raise(&program, p).map_err(|e| e.to_string())?;
     if raised.inputs.iter().any(|(_, input)| match stage {
         HwStage::Vs => !matches!(input, io::Input::Attribute { row: 0, .. }),
-        HwStage::Ps => !matches!(input, io::Input::Position(_)),
+        HwStage::Ps => !matches!(input, io::Input::Position(_))
+            && !(varying.is_some() && matches!(input, io::Input::Barycentric {
+                kind: io::Barycentric::PerspectiveCenter, index: 0 | 1
+            })),
         _ => true,
     }) {
         return Err("unsupported shader system inputs".into());
     }
-    let valid_target = |t| match stage {
-        HwStage::Vs => matches!(
-            t,
-            io::Target::Position(0) | io::Target::Unread | io::Target::Null
-        ),
-        HwStage::Ps => matches!(t, io::Target::Color(0) | io::Target::Null),
-        _ => false,
-    };
-    if !raised.interps.is_empty()
-        || raised.exports.iter().any(|e| !valid_target(e.target))
+    let mut channels = 0u8;
+    for (site, interp) in &raised.interps {
+        let io::Interp::Interpolated { attribute, barycentric, first } = interp else {
+            return Err("flat interpolation is unsupported".into());
+        };
+        if stage != HwStage::Ps || Some(attribute.row) != varying
+            || attribute.usage != native::Usage::Generic || attribute.channel > 1
+            || attribute.high || *barycentric != io::Barycentric::PerspectiveCenter
+            || first.is_empty() || program.blocks[site.0].insts[site.1].name() != "v_interp_p2_f32"
+            || first.iter().any(|&(b, i)| program.blocks[b].insts[i].name() != "v_interp_p1_f32")
+        {
+            return Err("unsupported TEXCOORD0 interpolation".into());
+        }
+        channels |= 1 << attribute.channel;
+    }
+    if (stage == HwStage::Ps && varying.is_some() && channels != 3)
+        || (varying.is_none() && !raised.interps.is_empty())
+    {
+        return Err("missing TEXCOORD0 interpolation channels".into());
+    }
+    for (b, block) in program.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name().starts_with("v_interp_")
+                && !raised.interps.iter().any(|(site, interp)| {
+                    *site == (b, i) || matches!(interp, io::Interp::Interpolated { first, .. } if first.contains(&(b, i)))
+                })
+            {
+                return Err("unpaired or unsupported interpolation instruction".into());
+            }
+        }
+    }
+    let mut param_export = false;
+    for export in &raised.exports {
+        let valid = match (stage, export.target) {
+            (HwStage::Vs, io::Target::Position(0) | io::Target::Null) => true,
+            (HwStage::Vs, io::Target::Unread) => varying.is_none(),
+            (HwStage::Vs, io::Target::Param { usage: native::Usage::Generic, row })
+                if Some(row) == varying => {
+                    param_export = true;
+                    !export.compressed && export.values[0].is_some()
+                        && export.values[1].is_some() && export.values[2].is_none()
+                        && export.values[3].is_none()
+                }
+            (HwStage::Ps, io::Target::Color(0) | io::Target::Null) => true,
+            _ => false,
+        };
+        if !valid { return Err("unsupported shader export".into()); }
+    }
+    if (stage == HwStage::Vs && varying.is_some() && !param_export)
         || !raised.exports.iter().any(|e| match stage {
             HwStage::Vs => matches!(e.target, io::Target::Position(0)),
             _ => matches!(e.target, io::Target::Color(0)),
         })
     {
-        return Err("unsupported shader exports or interpolation".into());
+        return Err("missing shader export".into());
     }
     let host = emit::translate(bytes).map_err(|e| e.to_string())?;
     if host.stage != stage
@@ -381,37 +463,35 @@ fn convert(
     {
         return Err("translated shader has unsupported bindings".into());
     }
-    let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
     let dwords = host.user_data_dwords() as usize;
     if dwords > 64 {
         return Err("fragment user-data buffer is too large".into());
     }
-    let metallib = if stage == HwStage::Vs {
+    Ok((host, texture.map(|u| u.slot), sampler.map(|u| u.slot)))
+}
+
+fn convert(host: &emit::HostShader, stage: HwStage, sampled: bool) -> Result<Vec<u8>, String> {
+    let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
+    let dwords = host.user_data_dwords() as usize;
+    if stage == HwStage::Vs {
         victory_metal::converter::convert(
             std::path::Path::new(&path),
             &host.dxil,
             victory_metal::converter::Stage::Vertex,
-        )?
-    } else if texture.is_some() {
+        )
+    } else if sampled {
         victory_metal::converter::convert_sampled_fragment(
             std::path::Path::new(&path),
             &host.dxil,
             dwords != 0,
-        )?
+        )
     } else {
         victory_metal::converter::convert_fragment_with_b0(
             std::path::Path::new(&path),
             &host.dxil,
             dwords != 0,
-        )?
-    };
-    Ok((
-        metallib,
-        host.user_data,
-        dwords,
-        texture.map(|u| u.slot),
-        sampler.map(|u| u.slot),
-    ))
+        )
+    }
 }
 
 #[derive(Default)]
