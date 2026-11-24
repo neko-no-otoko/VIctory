@@ -180,7 +180,7 @@ bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, ui
 @property(nonatomic) BOOL hasStencil;
 @property(nonatomic) uint32_t stencilReference;
 @property(nonatomic, strong) id<MTLBuffer> readback;
-@property(nonatomic, strong) id<MTLBuffer> vertices;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *vertexBuffers;
 @property(nonatomic, strong) id<MTLBuffer> indices;
 @property(nonatomic, strong) id<MTLBuffer> fragmentConstants;
 @property(nonatomic, strong) id<MTLBuffer> fragmentArguments;
@@ -269,12 +269,25 @@ static MTLStencilDescriptor *stencilFace(const uint32_t *face, uint32_t readMask
 
 
 
+typedef struct {
+    uint32_t index, format, slot, offset, stride;
+    bool per_instance;
+    uint32_t step_rate;
+} VictoryVertexAttribute;
+
+typedef struct {
+    uint32_t slot;
+    const uint8_t *bytes;
+    size_t len, offset;
+} VictoryVertexBuffer;
+
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
                            const uint32_t *stencil, bool blend_enabled, uint8_t write_mask, const uint32_t *blend_factors,
-                           bool vertex_uv, uint32_t format, char *error, size_t error_len) {
+                           const VictoryVertexAttribute *attributes, size_t attribute_count,
+                           uint32_t format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -286,6 +299,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
             || blendOperation(blend_factors[5]) == (MTLBlendOperation)NSUIntegerMax)
             FAIL(@"unsupported blend state");
         VictoryMetalRenderer *r = [VictoryMetalRenderer new];
+        r.vertexBuffers = [NSMutableDictionary dictionary];
         r.device = MTLCreateSystemDefaultDevice();
         if (!r.device) FAIL(@"no Metal device");
         NSError *e = nil;
@@ -299,17 +313,25 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         if (!fragment) FAIL(@"fragment function not found");
         MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
         // Apple's converter reserves attributes 0-10 and vertex buffers 0-5.
-        layout.attributes[11].format = MTLVertexFormatFloat4;
-        layout.attributes[11].offset = 0;
-        layout.attributes[11].bufferIndex = 6;
-        if (vertex_uv) {
-            layout.attributes[12].format = MTLVertexFormatFloat2;
-            layout.attributes[12].offset = 4 * sizeof(float);
-            layout.attributes[12].bufferIndex = 6;
+        for (size_t i = 0; i < attribute_count; ++i) {
+            const VictoryVertexAttribute *a = &attributes[i];
+            MTLVertexFormat vertexFormat;
+            switch (a->format) {
+                case 2: vertexFormat = MTLVertexFormatFloat4; break;
+                case 16: vertexFormat = MTLVertexFormatFloat2; break;
+                case 34: vertexFormat = MTLVertexFormatHalf2; break;
+                case 35: vertexFormat = MTLVertexFormatUShort2Normalized; break;
+                default: FAIL(@"unsupported vertex format");
+            }
+            layout.attributes[a->index].format = vertexFormat;
+            layout.attributes[a->index].offset = a->offset;
+            layout.attributes[a->index].bufferIndex = 6 + a->slot;
+            layout.layouts[6 + a->slot].stride = a->stride;
+            layout.layouts[6 + a->slot].stepFunction = a->per_instance
+                ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
+            layout.layouts[6 + a->slot].stepRate = a->per_instance ? a->step_rate : 1;
         }
-        r.vertexStride = (vertex_uv ? 6 : 4) * sizeof(float);
-        layout.layouts[6].stride = r.vertexStride;
-        layout.layouts[6].stepFunction = MTLVertexStepFunctionPerVertex;
+        r.vertexStride = attribute_count ? attributes[0].stride : 0;
         MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
         desc.vertexFunction = vertex;
         desc.fragmentFunction = fragment;
@@ -628,21 +650,24 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, ui
     }
 }
 
-static bool draw(void *handle, const float *vertices, uint32_t count,
+static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
                  const void *indices, uint32_t index_count, uint32_t index_size,
-                 int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
-                 bool preserve, const double *viewport, const uint32_t *scissor,
-                 char *error, size_t error_len) {
+                 int32_t base_vertex, uint32_t first_vertex, uint32_t count, uint32_t instance_count,
+                 const uint32_t *constants, uint8_t *pixels, bool preserve,
+                 const double *viewport, const uint32_t *scissor, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
-        if ((size_t)count > SIZE_MAX / r.vertexStride)
-            return fail(error, error_len, @"vertex buffer size overflow");
-        size_t size = (size_t)count * r.vertexStride;
-        if (!r.vertices || r.vertices.length < size)
-            r.vertices = [r.device newBufferWithLength:size options:MTLResourceStorageModeShared];
-        if (!r.vertices) return fail(error, error_len, @"vertex buffer allocation failed");
-        memcpy(r.vertices.contents, vertices, size);
+        for (size_t i = 0; i < buffer_count; ++i) {
+            NSNumber *slot = @(buffers[i].slot);
+            id<MTLBuffer> buffer = r.vertexBuffers[slot];
+            if (!buffer || buffer.length < buffers[i].len) {
+                buffer = [r.device newBufferWithLength:buffers[i].len options:MTLResourceStorageModeShared];
+                if (!buffer) return fail(error, error_len, @"vertex buffer allocation failed");
+                r.vertexBuffers[slot] = buffer;
+            }
+            memcpy(buffer.contents, buffers[i].bytes, buffers[i].len);
+        }
         if (indices) {
             if ((index_size != 2 && index_size != 4) || index_count > SIZE_MAX / index_size)
                 return fail(error, error_len, @"invalid index buffer size");
@@ -694,7 +719,8 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
             [render setScissorRect:rect];
         }
         [render setRenderPipelineState:r.pipeline];
-        [render setVertexBuffer:r.vertices offset:0 atIndex:6];
+        for (size_t i = 0; i < buffer_count; ++i)
+            [render setVertexBuffer:r.vertexBuffers[@(buffers[i].slot)] offset:buffers[i].offset atIndex:6 + buffers[i].slot];
         if (r.depthState) [render setDepthStencilState:r.depthState];
         if (r.hasStencil) {
             // D3D's default clockwise front face is measured after its
@@ -718,11 +744,12 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
                                 indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                               indexBuffer:r.indices
                         indexBufferOffset:0
-                            instanceCount:1
+                            instanceCount:instance_count
                                baseVertex:(NSInteger)base_vertex
                              baseInstance:0];
         } else if (rasterize) {
-            [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
+            [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first_vertex vertexCount:count
+                    instanceCount:instance_count baseInstance:0];
         }
         [render endEncoding];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
@@ -746,7 +773,11 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
                         const uint32_t *constants, uint8_t *pixels, bool preserve,
                         const double *viewport, const uint32_t *scissor,
                         char *error, size_t error_len) {
-    return draw(handle, vertices, count, NULL, 0, 0, 0, constants, pixels,
+    VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+    if (r.vertexStride && count > SIZE_MAX / r.vertexStride)
+        return fail(error, error_len, @"vertex buffer size overflow");
+    VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)count * r.vertexStride, 0 };
+    return draw(handle, &buffer, 1, NULL, 0, 0, 0, 0, count, 1, constants, pixels,
                 preserve, viewport, scissor, error, error_len);
 }
 
@@ -755,8 +786,23 @@ bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t ve
                                 int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
                                 const double *viewport, const uint32_t *scissor,
                                 char *error, size_t error_len) {
-    return draw(handle, vertices, vertex_count, indices, index_count, index_size, base_vertex,
+    VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+    if (r.vertexStride && vertex_count > SIZE_MAX / r.vertexStride)
+        return fail(error, error_len, @"vertex buffer size overflow");
+    VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)vertex_count * r.vertexStride, 0 };
+    return draw(handle, &buffer, 1, indices, index_count, index_size, base_vertex, 0, vertex_count, 1,
                 constants, pixels, true, viewport, scissor, error, error_len);
+}
+
+bool victory_metal_draw_buffers(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
+                                const void *indices, uint32_t index_count, uint32_t index_size,
+                                int32_t base_vertex, uint32_t first_vertex, uint32_t vertex_count,
+                                uint32_t instance_count, const uint32_t *constants, uint8_t *pixels,
+                                bool preserve, const double *viewport, const uint32_t *scissor,
+                                char *error, size_t error_len) {
+    return draw(handle, buffers, buffer_count, indices, index_count, index_size, base_vertex,
+                first_vertex, vertex_count, instance_count, constants, pixels, preserve,
+                viewport, scissor, error, error_len);
 }
 
 void victory_metal_destroy(void *handle) {

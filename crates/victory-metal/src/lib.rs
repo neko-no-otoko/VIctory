@@ -106,11 +106,19 @@ unsafe extern "C" {
         blend_enabled: bool,
         write_mask: u8,
         blend_factors: *const u32,
-        vertex_uv: bool,
+        attributes: *const VertexAttribute,
+        attribute_count: usize,
         format: u32,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
+    fn victory_metal_draw_buffers(
+        renderer: *mut c_void, buffers: *const NativeVertexBuffer, buffer_count: usize,
+        indices: *const c_void, index_count: u32, index_size: u32, base_vertex: i32,
+        first_vertex: u32, vertex_count: u32, instance_count: u32,
+        constants: *const u32, pixels: *mut u8, preserve: bool,
+        viewport: *const f64, scissor: *const u32, error: *mut c_char, error_len: usize,
+    ) -> bool;
     fn victory_metal_draw(
         renderer: *mut c_void,
         vertices: *const [f32; 4],
@@ -304,6 +312,34 @@ pub struct BlendState {
 }
 
 
+/// A reflected Metal attribute index and its D3D input-slot layout.
+/// Supported DXGI formats are 2, 16, 34 and 35.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct VertexAttribute {
+    pub index: u32,
+    pub format: u32,
+    pub slot: u32,
+    pub offset: u32,
+    pub stride: u32,
+    pub per_instance: bool,
+    pub step_rate: u32,
+}
+
+/// Bytes bound to a D3D input slot.
+pub struct VertexBuffer<'a> {
+    pub slot: u32,
+    pub bytes: &'a [u8],
+}
+
+#[repr(C)]
+struct NativeVertexBuffer {
+    slot: u32,
+    bytes: *const u8,
+    len: usize,
+    offset: usize,
+}
+
 /// A persistent Metal pipeline and RGBA8/BGRA8 unorm or sRGB offscreen target.
 ///
 /// Both metallibs must be produced by Apple Metal Shader Converter. Metal
@@ -323,6 +359,7 @@ pub struct Renderer {
     depth_enabled: bool,
     stencil_enabled: bool,
     vertex_uv: bool,
+    attributes: Option<Vec<VertexAttribute>>,
     width: u32,
     height: u32,
     viewport: [f64; 6],
@@ -411,12 +448,66 @@ impl Renderer {
                                    depth, blend, true, format)
     }
 
+    /// Create a pipeline using reflected Metal attribute indices and D3D slot layouts.
+    /// Slot `n` is bound at Metal buffer index `6 + n`. Instance step rate zero
+    /// is unsupported. The shader must not consume SV_InstanceID: D3D's
+    /// start-instance fetch offset is implemented by shifting instance buffers.
+    pub fn new_configured_layout(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
+        format: ColorFormat, attributes: &[VertexAttribute],
+    ) -> Result<Self, RenderError> {
+        Self::create_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+            width, height, fragment_constant_dwords, fragment_texture, depth, blend, false,
+            format, Some(attributes))
+    }
+
     fn new_configured_inner(
         vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, vertex_uv: bool,
         format: ColorFormat,
     ) -> Result<Self, RenderError> {
+        Self::create_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+            width, height, fragment_constant_dwords, fragment_texture, depth, blend, vertex_uv,
+            format, None)
+    }
+
+    fn create_configured(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, vertex_uv: bool,
+        format: ColorFormat, attributes: Option<&[VertexAttribute]>,
+    ) -> Result<Self, RenderError> {
+        let legacy = [
+            VertexAttribute { index: 11, format: 2, slot: 0, offset: 0,
+                stride: if vertex_uv { 24 } else { 16 }, per_instance: false, step_rate: 1 },
+            VertexAttribute { index: 12, format: 16, slot: 0, offset: 16,
+                stride: 24, per_instance: false, step_rate: 1 },
+        ];
+        let layout = attributes.unwrap_or(&legacy[..if vertex_uv { 2 } else { 1 }]);
+        if layout.len() > 21 {
+            return Err(RenderError("too many vertex attributes".into()));
+        }
+        for (i, a) in layout.iter().enumerate() {
+            let size = match a.format { 2 => 16, 16 => 8, 34 | 35 => 4,
+                _ => return Err(RenderError("unsupported vertex format".into())) };
+            if !(11..31).contains(&a.index) || a.slot >= 25 || a.stride == 0
+                || a.offset.checked_add(size).is_none()
+                || (a.per_instance && a.step_rate == 0)
+            {
+                return Err(RenderError("invalid vertex attribute".into()));
+            }
+            for b in &layout[..i] {
+                if a.index == b.index || (a.slot == b.slot &&
+                    (a.stride != b.stride || a.per_instance != b.per_instance ||
+                     (a.per_instance && a.step_rate != b.step_rate)))
+                {
+                    return Err(RenderError("conflicting vertex attributes".into()));
+                }
+            }
+        }
         if depth.is_some_and(|state| !(1..=8).contains(&state.compare)) {
             return Err(RenderError("invalid depth comparison".into()));
         }
@@ -467,7 +558,8 @@ impl Renderer {
                 blend.enabled,
                 blend.write_mask,
                 blend.factors.as_ptr(),
-                vertex_uv,
+                layout.as_ptr(),
+                layout.len(),
                 format.native_value(),
                 error.as_mut_ptr(),
                 error.len(),
@@ -483,6 +575,7 @@ impl Renderer {
             depth_enabled: depth.is_some(),
             stencil_enabled: stencil.is_some(),
             vertex_uv,
+            attributes: attributes.map(<[VertexAttribute]>::to_vec),
             width,
             height,
             viewport: [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
@@ -672,6 +765,9 @@ impl Renderer {
         fragment_constants: &[u32],
         pixels: &mut [u8],
     ) -> Result<(), RenderError> {
+        if self.attributes.is_some() {
+            return Err(RenderError("use draw_buffers for a custom vertex layout".into()));
+        }
         if self.vertex_uv {
             return Err(RenderError("renderer requires position and UV vertices".into()));
         }
@@ -728,6 +824,9 @@ impl Renderer {
         constants: &[u32],
         pixels: &mut [u8],
     ) -> Result<(), RenderError> {
+        if self.attributes.is_some() {
+            return Err(RenderError("use draw_buffers for a custom vertex layout".into()));
+        }
         if !self.vertex_uv {
             return Err(RenderError("renderer requires position-only vertices".into()));
         }
@@ -791,6 +890,116 @@ impl Renderer {
         if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
+    /// Draw with direct input-slot buffers, preserving or clearing the color target.
+    /// For indexed draws `vertex_count` is the number of indices consumed from
+    /// the start of the index slice and `first_vertex` must be zero. For
+    /// non-indexed draws it is the vertex count starting at `first_vertex`.
+    /// Instance data uses D3D's `start_instance + instance / step_rate`.
+    pub fn draw_buffers(
+        &mut self, buffers: &[VertexBuffer<'_>], indices: Option<(IndexData<'_>, i32)>,
+        first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
+        constants: &[u32], pixels: &mut [u8], preserve: bool,
+    ) -> Result<(), RenderError> {
+        let layout = self.attributes.as_ref()
+            .ok_or_else(|| RenderError("draw_buffers requires a custom vertex layout".into()))?;
+        if pixels.len() != self.pixel_len || constants.len() != self.fragment_constant_dwords {
+            return Err(RenderError("expected exact-sized constants and output buffers".into()));
+        }
+        if self.fragment_texture && !self.texture_bound {
+            return Err(RenderError("fragment texture has not been bound".into()));
+        }
+        if buffers.len() > 25 {
+            return Err(RenderError("too many vertex buffers".into()));
+        }
+        let mut slots: [Option<&[u8]>; 25] = [None; 25];
+        for buffer in buffers {
+            let slot = slots.get_mut(buffer.slot as usize)
+                .ok_or_else(|| RenderError("invalid vertex buffer slot".into()))?;
+            if slot.replace(buffer.bytes).is_some() {
+                return Err(RenderError("duplicate vertex buffer slot".into()));
+            }
+        }
+        let (index_ptr, index_size, base_vertex, max_vertex) = if let Some((data, base)) = indices {
+            if first_vertex != 0 {
+                return Err(RenderError("first_vertex must be zero for indexed draws".into()));
+            }
+            let count = vertex_count as usize;
+            let mut max = 0u64;
+            let mut check = |index: u32| -> Result<(), RenderError> {
+                let value = i64::from(index) + i64::from(base);
+                if value < 0 || value > i64::from(u32::MAX) {
+                    return Err(RenderError("indexed vertex out of range".into()));
+                }
+                max = max.max(value as u64);
+                Ok(())
+            };
+            let (ptr, size) = match data {
+                IndexData::U16(data) => {
+                    let data = data.get(..count).ok_or_else(|| RenderError("index buffer too short".into()))?;
+                    for &index in data { check(u32::from(index))?; }
+                    (data.as_ptr().cast::<c_void>(), 2)
+                }
+                IndexData::U32(data) => {
+                    let data = data.get(..count).ok_or_else(|| RenderError("index buffer too short".into()))?;
+                    for &index in data { check(index)?; }
+                    (data.as_ptr().cast::<c_void>(), 4)
+                }
+            };
+            (ptr, size, base, max)
+        } else {
+            let last = first_vertex.checked_add(vertex_count.saturating_sub(1))
+                .ok_or_else(|| RenderError("vertex range overflow".into()))?;
+            (std::ptr::null(), 0, 0, u64::from(last))
+        };
+        if vertex_count == 0 || instance_count == 0 {
+            return Ok(());
+        }
+        let mut native: [NativeVertexBuffer; 25] = std::array::from_fn(|_| NativeVertexBuffer {
+            slot: 0, bytes: std::ptr::null(), len: 0, offset: 0,
+        });
+        let mut count = 0;
+        for a in layout {
+            let bytes = slots[a.slot as usize]
+                .ok_or_else(|| RenderError("missing vertex buffer".into()))?;
+            let element = if a.per_instance {
+                u64::from(start_instance) + u64::from((instance_count - 1) / a.step_rate)
+            } else { max_vertex };
+            let size = match a.format { 2 => 16u64, 16 => 8, _ => 4 };
+            let end = element.checked_mul(u64::from(a.stride))
+                .and_then(|n| n.checked_add(u64::from(a.offset)))
+                .and_then(|n| n.checked_add(size))
+                .ok_or_else(|| RenderError("vertex buffer range overflow".into()))?;
+            if end > bytes.len() as u64 {
+                return Err(RenderError("vertex buffer too short".into()));
+            }
+            let offset = if a.per_instance {
+                (start_instance as usize).checked_mul(a.stride as usize)
+                    .ok_or_else(|| RenderError("instance buffer offset overflow".into()))?
+            } else { 0 };
+            if let Some(binding) = native[..count].iter_mut().find(|b| b.slot == a.slot) {
+                binding.len = binding.len.max(end as usize - offset);
+            } else {
+                native[count] = NativeVertexBuffer { slot: a.slot,
+                    bytes: unsafe { bytes.as_ptr().add(offset) }, len: end as usize - offset, offset: 0 };
+                count += 1;
+            }
+        }
+        if preserve && (self.scissor[2] == 0 || self.scissor[3] == 0) {
+            return Ok(());
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: all bound slices and the output remain live throughout the
+        // synchronous call; every fetched vertex and instance was checked.
+        let ok = unsafe {
+            victory_metal_draw_buffers(self.handle.as_ptr(), native.as_ptr(), count,
+                index_ptr, if index_size == 0 { 0 } else { vertex_count }, index_size,
+                base_vertex, first_vertex, vertex_count, instance_count, constants.as_ptr(),
+                pixels.as_mut_ptr(), preserve, self.viewport.as_ptr(), self.scissor.as_ptr(),
+                error.as_mut_ptr(), error.len())
+        };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
     fn draw_inner(
         &mut self,
         vertices: &[[f32; 4]],
@@ -798,6 +1007,9 @@ impl Renderer {
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), RenderError> {
+        if self.attributes.is_some() {
+            return Err(RenderError("use draw_buffers for a custom vertex layout".into()));
+        }
         if self.vertex_uv {
             return Err(RenderError("renderer requires position and UV vertices".into()));
         }
