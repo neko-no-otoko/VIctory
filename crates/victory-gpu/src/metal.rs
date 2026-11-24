@@ -309,6 +309,10 @@ struct Sampled {
     sampler: View,
     texture: ResourceRef,
     filter: victory_metal::TextureFilter,
+    first_mip: u32,
+    mip_count: u32,
+    min_lod: f32,
+    max_lod: f32,
 }
 
 #[derive(Default)]
@@ -831,28 +835,43 @@ impl State {
                 };
                 let texture = *texture as This;
                 let format = crate::resource::metal_color_format(texture).ok_or("unsupported sampled texture format")?;
-                if let Some(desc) = desc {
+                let total_mips = crate::resource::metal_sampled_mip_count(texture)
+                    .ok_or("expected a supported linear RGBA8 or BGRA8 sampled texture")?;
+                let (first_mip, mip_count) = if let Some(desc) = desc {
                     if desc[0] != format || desc[1] != 4 || desc[2] != 0x1688
-                        || desc[4] != 0 || !matches!(desc[5], 1 | u32::MAX)
                         || desc[6] != 0 || desc[7] != 0
                     {
                         return Err("unsupported texture SRV description".into());
                     }
-                }
+                    let first = desc[4];
+                    let remaining = total_mips.checked_sub(first).filter(|&n| n != 0)
+                        .ok_or("texture SRV first mip is out of range")?;
+                    let count = if desc[5] == u32::MAX { remaining } else { desc[5] };
+                    if count == 0 || count > remaining {
+                        return Err("texture SRV mip range is out of bounds".into());
+                    }
+                    (first, count)
+                } else {
+                    (0, total_mips)
+                };
                 let View::Sampler(words) = sampler else {
                     return Err("expected a standard sampler".into());
                 };
-                if words[1..] != [3, 3, 3, 0, 1, 8, 0, 0, 0, 0, 0, 0] {
+                if words[1..11] != [3, 3, 3, 0, 1, 8, 0, 0, 0, 0] {
                     return Err("unsupported sampler settings".into());
+                }
+                let min_lod = f32::from_bits(words[11]);
+                let max_lod = f32::from_bits(words[12]);
+                if !min_lod.is_finite() || !max_lod.is_finite()
+                    || min_lod < 0.0 || min_lod > max_lod
+                {
+                    return Err("unsupported sampler LOD range".into());
                 }
                 let filter = match words[0] {
                     0 => victory_metal::TextureFilter::Nearest,
                     0x15 => victory_metal::TextureFilter::Linear,
                     _ => return Err("unsupported sampler filter".into()),
                 };
-                if crate::resource::metal_sampled_texture(texture).is_none() {
-                    return Err("expected a linear single-mip RGBA8 or BGRA8 texture".into());
-                }
                 Some(Sampled {
                     _view_heap: view_heap,
                     _sampler_heap: sampler_heap,
@@ -862,6 +881,10 @@ impl State {
                     sampler: View::Sampler(words),
                     texture: ResourceRef::new(texture),
                     filter,
+                    first_mip,
+                    mip_count,
+                    min_lod,
+                    max_lod,
                 })
             }
             (None, None) => None,
@@ -1191,33 +1214,40 @@ impl State {
                             return Err("sampled descriptors changed after recording".into());
                         }
                         submission.access(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
-                        let (data, width, height, pitch) =
-                            crate::resource::metal_sampled_texture(sampled.texture.ptr())
-                                .ok_or("invalid sampled texture")?;
-                        let row = (width as usize)
-                            .checked_mul(4)
-                            .ok_or("sampled row overflow")?;
-                        let len = row
-                            .checked_mul(height as usize)
-                            .ok_or("sampled size overflow")?;
-                        self.texture_scratch.resize(len, 0);
-                        for y in 0..height as usize {
-                            // SAFETY: the retained texture's linear row layout was validated.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    data.add(y * pitch),
-                                    self.texture_scratch.as_mut_ptr().add(y * row),
-                                    row,
-                                )
-                            };
+                        let (_, width, height, _) =
+                            crate::resource::metal_sampled_mip(sampled.texture.ptr(), sampled.first_mip)
+                                .ok_or("invalid sampled texture mip")?;
+                        self.texture_scratch.clear();
+                        for mip in sampled.first_mip..sampled.first_mip + sampled.mip_count {
+                            let (data, mip_width, mip_height, pitch) =
+                                crate::resource::metal_sampled_mip(sampled.texture.ptr(), mip)
+                                    .ok_or("invalid sampled texture mip")?;
+                            let row = (mip_width as usize).checked_mul(4).ok_or("sampled row overflow")?;
+                            let len = row.checked_mul(mip_height as usize).ok_or("sampled size overflow")?;
+                            let start = self.texture_scratch.len();
+                            let end = start.checked_add(len).ok_or("sampled chain overflow")?;
+                            self.texture_scratch.resize(end, 0);
+                            for y in 0..mip_height as usize {
+                                // SAFETY: each retained subresource has a checked, padded row layout.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        data.add(y * pitch),
+                                        self.texture_scratch.as_mut_ptr().add(start + y * row),
+                                        row,
+                                    )
+                                };
+                            }
                         }
-                        Some((
+                        Some(crate::metal_graphics::Texture {
                             width,
                             height,
-                            self.texture_scratch.as_slice(),
-                            sampled.filter,
-                            color_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,
-                        ))
+                            levels: sampled.mip_count,
+                            pixels: self.texture_scratch.as_slice(),
+                            filter: sampled.filter,
+                            format: color_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,
+                            min_lod: sampled.min_lod,
+                            max_lod: sampled.max_lod,
+                        })
                     } else {
                         None
                     };

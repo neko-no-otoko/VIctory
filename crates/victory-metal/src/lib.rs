@@ -90,9 +90,12 @@ unsafe extern "C" {
         renderer: *mut c_void,
         width: u32,
         height: u32,
+        levels: u32,
         rgba: *const u8,
         linear_filter: bool,
         bgra: bool,
+        min_lod: f32,
+        max_lod: f32,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -227,7 +230,7 @@ pub struct Renderer {
     scissor: [u32; 4],
 }
 
-/// Texture filtering; address mode is clamp-to-edge and LOD is fixed to zero.
+/// Texture filtering; address mode is clamp-to-edge.
 #[derive(Clone, Copy)]
 pub enum TextureFilter {
     Nearest,
@@ -449,12 +452,40 @@ impl Renderer {
         filter: TextureFilter,
         format: ColorFormat,
     ) -> Result<(), RenderError> {
-        let size = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
-        if !self.fragment_texture || width == 0 || height == 0 || pixels.len() != size {
-            return Err(RenderError("expected enabled texture binding, nonzero dimensions and tightly packed 8-bit texels".into()));
+        self.set_fragment_texture_mips(width, height, 1, pixels, filter, format, 0.0, 0.0)
+    }
+
+    /// Upload a tightly packed mip chain as a 2D-array texture with one slice.
+    /// Levels are consecutive, starting at `width` by `height`.
+    pub fn set_fragment_texture_mips(
+        &mut self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        pixels: &[u8],
+        filter: TextureFilter,
+        format: ColorFormat,
+        min_lod: f32,
+        max_lod: f32,
+    ) -> Result<(), RenderError> {
+        if !self.fragment_texture || width == 0 || height == 0 || levels == 0
+            || levels > u32::BITS - width.max(height).leading_zeros()
+            || !min_lod.is_finite() || !max_lod.is_finite()
+            || min_lod < 0.0 || min_lod > max_lod
+        {
+            return Err(RenderError("invalid texture dimensions, mip count, binding or LOD range".into()));
+        }
+        let (mut w, mut h, mut size) = (width, height, 0usize);
+        for _ in 0..levels {
+            size = (w as usize).checked_mul(h as usize)
+                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| size.checked_add(n))
+                .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        if pixels.len() != size {
+            return Err(RenderError("expected tightly packed 8-bit mip texels".into()));
         }
         let mut error = [0 as c_char; 1024];
         // SAFETY: the renderer and validated input buffer live through the
@@ -464,9 +495,12 @@ impl Renderer {
                 self.handle.as_ptr(),
                 width,
                 height,
+                levels,
                 pixels.as_ptr(),
                 matches!(filter, TextureFilter::Linear),
                 format.is_bgra(),
+                min_lod,
+                max_lod,
                 error.as_mut_ptr(),
                 error.len(),
             )

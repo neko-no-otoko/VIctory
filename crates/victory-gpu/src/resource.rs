@@ -929,7 +929,71 @@ pub(crate) fn metal_depth_texture(this: This) -> Option<(*mut u8, u32, u32, usiz
 
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_sampled_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_linear_texture(this, metal_color_format(this)?, 0)
+    metal_sampled_mip(this, 0)
+}
+
+/// The mapped layout of one mip of a committed linear sampled texture.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_sampled_mip(this: This, mip: u32) -> Option<(*mut u8, u32, u32, usize)> {
+    let count = metal_sampled_mip_count(this)?;
+    if mip >= count {
+        return None;
+    }
+    let r = resource(this);
+    let (offset, width, height, pitch, _) = sampled_mip_layout(&r.desc, mip)?;
+    let Backing::Committed(memory) = &r.backing else { return None };
+    // The complete layout was checked against this allocation at creation.
+    Some((unsafe { memory.ptr.as_ptr().add(offset) }, width, height, pitch))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_sampled_mip_count(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.heap.kind != 1 || !matches!(r.backing, Backing::Committed(_)) || !sampled_desc(&r.desc) {
+        return None;
+    }
+    let count = u32::from(r.desc.mip_levels);
+    let (_, _, _, _, end) = sampled_mip_layout(&r.desc, count.checked_sub(1)?)?;
+    let Backing::Committed(memory) = &r.backing else { return None };
+    (end <= memory.layout.size()).then_some(count)
+}
+
+#[cfg(target_os = "macos")]
+fn sampled_desc(d: &ResourceDesc) -> bool {
+    d.dimension == 3 && matches!(d.format, 28 | 87) && d.depth_or_array_size == 1
+        && d.sample_count == 1 && d.sample_quality == 0 && d.layout == 1 && d.flags == 0
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+fn native_multimip_sampled(d: &ResourceDesc) -> bool {
+    d.dimension != BUFFER && matches!(d.format, 28 | 87) && d.flags == 0 && d.mip_levels > 1
+}
+
+/// Returns the offset, dimensions, pitch and end of a mip, with checked arithmetic.
+#[cfg(target_os = "macos")]
+fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, usize, usize)> {
+    let width = u32::try_from(d.width).ok()?;
+    if width == 0 || d.height == 0 || d.mip_levels == 0
+        || u32::from(d.mip_levels) > u32::BITS - width.max(d.height).leading_zeros()
+        || mip >= u32::from(d.mip_levels)
+    {
+        return None;
+    }
+    let mut end = 0usize;
+    for level in 0..=mip {
+        let offset = end.checked_next_multiple_of(512)?;
+        let w = (width >> level).max(1);
+        let h = (d.height >> level).max(1);
+        let pitch = usize::try_from(w).ok()?.checked_mul(4)?.checked_next_multiple_of(256)?;
+        end = offset.checked_add(pitch.checked_mul(usize::try_from(h).ok()?)?)?;
+        if level == mip {
+            return Some((offset, w, h, pitch, end));
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -1146,12 +1210,39 @@ pub(crate) extern "system" fn create_committed(
         }
         return E_INVALIDARG;
     }
+    #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+    if native_multimip_sampled(&desc) && (heap.kind != 1 || !sampled_desc(&desc)) {
+        if !out.is_null() {
+            unsafe { out.write(std::ptr::null_mut()) };
+        }
+        return E_INVALIDARG;
+    }
+    #[cfg(target_os = "macos")]
+    let sampled_size = if heap.kind == 1 && sampled_desc(&desc) {
+        let Some((_, _, _, _, end)) = u32::from(desc.mip_levels)
+            .checked_sub(1)
+            .and_then(|last| sampled_mip_layout(&desc, last))
+        else {
+            if !out.is_null() {
+                unsafe { out.write(std::ptr::null_mut()) };
+            }
+            return E_INVALIDARG;
+        };
+        Some(end as u64)
+    } else {
+        None
+    };
     let Some(info) = footprint(&desc) else {
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
     };
     #[cfg(target_os = "macos")]
-    let info = if heap.kind == 1
+    let info = if let Some(size) = sampled_size {
+        let Some(size) = size.checked_next_multiple_of(info.alignment) else {
+            return E_INVALIDARG;
+        };
+        AllocationInfo { size: info.size.max(size), ..info }
+    } else if heap.kind == 1
         && desc.dimension == 3
         && ((desc.format == 40 && desc.flags == 2) || (desc.format == 87 && matches!(desc.flags, 0 | 1)))
         && desc.width != 0
@@ -1277,6 +1368,13 @@ pub(crate) extern "system" fn create_at_address(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+    if native_multimip_sampled(&desc) {
+        if !out.is_null() {
+            unsafe { out.write(std::ptr::null_mut()) };
+        }
+        return E_INVALIDARG;
+    }
     if address == 0 {
         return E_INVALIDARG;
     }
@@ -1362,6 +1460,13 @@ pub(crate) extern "system" fn create_placed(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+    if native_multimip_sampled(&desc) {
+        if !out.is_null() {
+            unsafe { out.write(std::ptr::null_mut()) };
+        }
+        return E_INVALIDARG;
+    }
     if heap.is_null() {
         return E_INVALIDARG;
     }
@@ -1425,9 +1530,27 @@ pub(crate) extern "system" fn resource_release(this: This) -> u32 {
         object::release_boxed::<Resource>(this)
     }
 }
-/// Memory is always mapped (subresources are not told apart yet); a null
-/// `out` only asks for residency.
-extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
+/// Memory is always mapped; sampled Metal textures map each mip separately.
+/// A null `out` only asks for residency.
+extern "system" fn map(this: This, sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    if !this.is_null() {
+        let r = resource(this);
+        if r.heap.kind == 1 && matches!(r.backing, Backing::Committed(_)) && sampled_desc(&r.desc) {
+            let Some((data, _, _, _)) = metal_sampled_mip(this, sub) else {
+                if !out.is_null() {
+                    unsafe { out.write(std::ptr::null_mut()) };
+                }
+                return E_INVALIDARG;
+            };
+            if !out.is_null() {
+                unsafe { out.write(data) };
+            }
+            return S_OK;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = sub;
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write(resource(this).data()) };

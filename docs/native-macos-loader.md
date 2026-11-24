@@ -131,14 +131,23 @@ and mismatched signatures are rejected. Synthetic fixtures verify
 perspective-correct sampling, including independent UV input on indexed and
 nonindexed draws, and exercise layout, stride, and linkage rejection.
 The native color path supports committed, linear single-mip RGBA8_UNORM and
-BGRA8_UNORM 2D render targets and sampled textures. Formats must match their
-pipeline, copy footprint and explicit view; default views are also supported.
-Explicit 2D SRVs require identity component mapping and the single mip.
+BGRA8_UNORM 2D render targets, and sampled 2D textures with one or more valid
+mips. Sampled textures use one array slice and sample; each mapped subresource
+has a 256-byte-aligned row pitch and a 512-byte-aligned start in the allocation.
+Formats must match their pipeline, copy footprint and explicit view; default
+views are also supported. Explicit 2D SRVs require identity component mapping,
+zero plane and resource LOD clamp, and a nonempty in-bounds contiguous mip range
+(or all remaining levels). Point and linear clamp samplers use their corresponding
+nearest or linear mip filter, zero bias and finite nonnegative ordered LOD clamps,
+relative to the SRV's first mip. Other texture layouts and sampler modes are rejected.
 Channel masks, blending and clear colors use logical RGBA, while mapped and
 readback memory uses the texture's RGBA or BGRA byte order and padded rows.
 Typeless, sRGB and other unsupported texture formats are rejected. The BGRA
 fixture covers asymmetric colors in both source and target formats, default and
 explicit views, padded readback, clears, blending, masks, and retained resources.
+The mip fixture samples different levels of RGBA8 and BGRA8 textures through
+default and ranged SRVs and sampler LOD clamps, checks mapped subresources and
+retained descriptors, and rejects invalid ranges.
 With the same prerequisites, run:
 
 ```sh
@@ -150,6 +159,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_blend -- --igno
 cargo test -p victory --target x86_64-apple-darwin --test native_varying -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_uv -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_bgra -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_mips -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

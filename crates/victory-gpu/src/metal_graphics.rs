@@ -32,6 +32,17 @@ pub(crate) enum Vertices<'a> {
     PositionUv(&'a [[f32; 6]]),
 }
 
+pub(crate) struct Texture<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub levels: u32,
+    pub pixels: &'a [u8],
+    pub filter: victory_metal::TextureFilter,
+    pub format: victory_metal::ColorFormat,
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
@@ -68,7 +79,7 @@ impl Prepared {
         scissor: [u32; 4],
         mut depth: Option<&mut [f32]>,
         constants: &[u32],
-        texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter, victory_metal::ColorFormat)>,
+        texture: Option<Texture<'_>>,
         pixels: &mut [u8],
     ) -> Result<(), String> {
         if texture.is_some() != self.texture_slot.is_some() {
@@ -94,9 +105,10 @@ impl Prepared {
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
         }
-        if let Some((width, height, texels, filter, format)) = texture {
+        if let Some(texture) = texture {
             renderer
-                .set_fragment_texture_format(width, height, texels, filter, format)
+                .set_fragment_texture_mips(texture.width, texture.height, texture.levels, texture.pixels,
+                    texture.filter, texture.format, texture.min_lod, texture.max_lod)
                 .map_err(|e| e.to_string())?;
         }
         match (vertices, indices) {

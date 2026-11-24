@@ -98,6 +98,8 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
 @property(nonatomic, strong) id<MTLBuffer> samplerHeap;
 @property(nonatomic) BOOL textureEnabled;
 @property(nonatomic) BOOL linearFilter;
+@property(nonatomic) float minLod;
+@property(nonatomic) float maxLod;
 @property(nonatomic) size_t fragmentConstantBytes;
 @property(nonatomic) size_t vertexStride;
 @property(nonatomic) uint32_t width;
@@ -344,16 +346,19 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
     }
 }
 
-bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, const uint8_t *rgba,
-                               bool linear, bool bgra, char *error, size_t error_len) {
+bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, uint32_t levels,
+                               const uint8_t *rgba, bool linear, bool bgra, float min_lod, float max_lod,
+                               char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         if (!r.textureEnabled) return fail(error, error_len, @"texture binding is not enabled");
         id<MTLTexture> texture = r.sampledTexture;
         MTLPixelFormat format = bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
-        if (!texture || texture.width != width || texture.height != height || texture.pixelFormat != format) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
+        if (!texture || texture.width != width || texture.height != height ||
+            texture.pixelFormat != format || texture.mipmapLevelCount != levels) {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:YES];
+            desc.mipmapLevelCount = levels;
             desc.textureType = MTLTextureType2DArray;
             desc.arrayLength = 1;
             desc.storageMode = MTLStorageModeShared;
@@ -362,18 +367,30 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, co
             if (!texture) return fail(error, error_len, @"sampled texture allocation failed");
         }
         id<MTLSamplerState> sampler = r.sampler;
-        if (!sampler || r.linearFilter != linear) {
+        if (!sampler || r.linearFilter != linear || r.minLod != min_lod || r.maxLod != max_lod) {
             MTLSamplerDescriptor *desc = [MTLSamplerDescriptor new];
             desc.minFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
             desc.magFilter = desc.minFilter;
+            desc.mipFilter = linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+            desc.lodMinClamp = min_lod;
+            desc.lodMaxClamp = max_lod;
             desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
             desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
             desc.supportArgumentBuffers = YES;
             sampler = [r.device newSamplerStateWithDescriptor:desc];
             if (!sampler) return fail(error, error_len, @"sampler allocation failed");
         }
-        [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:0
-                     withBytes:rgba bytesPerRow:(size_t)width * 4 bytesPerImage:(size_t)width * height * 4];
+        uint32_t w = width, h = height;
+        const uint8_t *levelPixels = rgba;
+        for (uint32_t level = 0; level < levels; ++level) {
+            size_t rowBytes = (size_t)w * 4;
+            size_t imageBytes = rowBytes * h;
+            [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0
+                         withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:imageBytes];
+            levelPixels += imageBytes;
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+        }
         // IRDescriptorTableEntry: texture uses textureViewID, sampler uses
         // gpuVA; metadata is a zero min-LOD clamp or zero sampler LOD bias.
         uint64_t *tex = r.textureHeap.contents;
@@ -383,6 +400,8 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, co
         r.sampledTexture = texture;
         r.sampler = sampler;
         r.linearFilter = linear;
+        r.minLod = min_lod;
+        r.maxLod = max_lod;
         return true;
     }
 }
