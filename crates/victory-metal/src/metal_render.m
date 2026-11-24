@@ -8,6 +8,69 @@ static bool fail(char *dst, size_t len, NSString *message) {
     if (len) snprintf(dst, len, "%s", message.UTF8String ?: "Metal error");
     return false;
 }
+// The console backend stores texture contents in linear guest memory. Upload,
+// clear on a real Metal texture, and copy back synchronously so that clears,
+// draws and readbacks remain ordered in its existing submission pipeline.
+bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t *pixels,
+                         const uint8_t *color, const uint32_t (*rects)[4], size_t count,
+                         char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        static id<MTLDevice> device;
+        static id<MTLCommandQueue> queue;
+        static id<MTLComputePipelineState> pipeline;
+        static NSString *setupError;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            device = MTLCreateSystemDefaultDevice();
+            if (!device) { setupError = @"no Metal device"; return; }
+            NSError *e = nil;
+            NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void clear_target(texture2d<float, access::write> target [[texture(0)]], "
+                "constant uint4 &rect [[buffer(0)]], constant uchar4 &color [[buffer(1)]], "
+                "uint2 p [[thread_position_in_grid]]) { "
+                "uint2 xy = p + rect.xy; if (xy.x < rect.z && xy.y < rect.w) "
+                "target.write(float4(color) / 255.0f, xy); }";
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&e];
+            id<MTLFunction> function = [library newFunctionWithName:@"clear_target"];
+            if (function) pipeline = [device newComputePipelineStateWithFunction:function error:&e];
+            queue = [device newCommandQueue];
+            if (!pipeline || !queue) setupError = e.localizedDescription ?: @"clear pipeline creation failed";
+        });
+        if (setupError) return fail(error, error_len, setupError);
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                       width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageShaderWrite;
+        id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+        if (!texture) return fail(error, error_len, @"clear texture allocation failed");
+        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+        [texture replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:pitch];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!command || !encoder) return fail(error, error_len, @"clear command creation failed");
+        [encoder setComputePipelineState:pipeline];
+        [encoder setTexture:texture atIndex:0];
+        [encoder setBytes:color length:4 atIndex:1];
+        const uint32_t full[4] = {0, 0, width, height};
+        size_t n = count ? count : 1;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t *rect = count ? rects[i] : full;
+            uint32_t w = rect[2] - rect[0], h = rect[3] - rect[1];
+            if (!w || !h) continue;
+            [encoder setBytes:rect length:4 * sizeof(uint32_t) atIndex:0];
+            [encoder dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        }
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return fail(error, error_len, command.error.localizedDescription ?: @"GPU clear failed");
+        [texture getBytes:pixels bytesPerRow:pitch fromRegion:region mipmapLevel:0];
+        return true;
+    }
+}
+
 
 @interface VictoryMetalRenderer : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;

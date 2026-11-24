@@ -25,6 +25,16 @@ Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
 Converting them ahead of time from files is only a warm-up.
 
+On macOS, the restricted Metal console path supports ordered
+`ClearRenderTargetView` operations on committed, linear, single-sample RGBA8
+render targets in `RENDER_TARGET` state. Clear rectangles are clipped to the
+target; inverted rectangles and unsupported views or states are rejected.
+An empty rectangle list clears the entire target. Color components are clamped
+to UNORM (NaN becomes zero) and rounded to the nearest byte. The current
+implementation uploads the linear backing to a Metal texture, clears it on
+the GPU, and synchronously copies it back so draws and readbacks remain
+ordered; it is not a persistent native texture implementation.
+
 ## Crates
 
 | Crate | Role |

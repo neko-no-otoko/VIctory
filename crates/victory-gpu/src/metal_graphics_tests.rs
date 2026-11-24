@@ -789,3 +789,100 @@ fn console_triangle_draw_preserves_target_and_copies_to_padded_buffer() {
     release(queue);
     release(dev);
 }
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn console_clear_without_graphics_pipeline() {
+    let null: This = std::ptr::null();
+    let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+    let mut dev = null;
+    assert_eq!(crate::device::create(null.cast(), &crate::device::CHECKED_VERSION,
+                                     &crate::device::IID, &mut dev), S_OK);
+    let props = HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 };
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 3, height: 2, depth: 1, mips: 1,
+        format: 28, samples: 1, quality: 0, layout: 1, flags: 1,
+    };
+    let resource_iid = object::guid(0x696442be, 0xa72e, 0x4059,
+                                    [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+    let mut texture = null;
+    assert_eq!(slot::<extern "system" fn(This, *const c_void, u32, *const c_void, u32,
+        *const c_void, *const Iid, *mut This) -> HRESULT>(dev, 0xd8)(
+            dev, (&raw const props).cast(), 0, (&raw const desc).cast(), 4, null.cast(),
+            &resource_iid, &mut texture), S_OK);
+    let mut pixels = std::ptr::null_mut();
+    assert_eq!(slot::<extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT>(
+        texture, 0x40)(texture, 0, null.cast(), &mut pixels), S_OK);
+    assert!(!pixels.is_null());
+    unsafe { std::ptr::write_bytes(pixels, 0x55, 512) };
+    let heap_iid = object::guid(0x8efb471d, 0x616c, 0x4f49,
+                                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+    let heap_desc = HeapDesc { kind: 2, count: 1, flags: 0, nodes: 0, placement: [0; 2] };
+    let mut heap = null;
+    assert_eq!(slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+        dev, 0x70)(dev, (&raw const heap_desc).cast(), &heap_iid, &mut heap), S_OK);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    slot::<extern "system" fn(This, This, *const c_void, u64)>(dev, 0xa0)(
+        dev, texture, null.cast(), handle);
+    let allocator_iid = object::guid(0x6102dee4, 0xaf59, 0x4b09,
+                                     [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+    let list_iid = object::guid(0x7116d91c, 0xe7e4, 0x47ce,
+                                [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5]);
+    let mut allocator = null;
+    assert_eq!(slot::<extern "system" fn(This, u32, *const Iid, *mut This) -> HRESULT>(
+        dev, 0x48)(dev, 0, &allocator_iid, &mut allocator), S_OK);
+    let mut list = null;
+    assert_eq!(slot::<extern "system" fn(This, u32, u32, This, This, *const Iid, *mut This)
+        -> HRESULT>(dev, 0x60)(dev, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+    let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const [i32; 4])>(
+        list, 0x1a0);
+    let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+    let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+    clear(list, handle, null.cast(), 0, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    clear(list, handle, &[1.0; 4], 1, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    clear(list, handle, &[1.0; 4], 1, [[2, 0, 1, 1]].as_ptr());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    let to_copy = Barrier {
+        kind: 0, flags: 0, resource: texture,
+        reserved: [u64::from(u32::MAX) | (4u64 << 32), 0x800],
+    };
+    slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &to_copy);
+    clear(list, handle, &[1.0; 4], 0, null.cast());
+    assert_eq!(close(list), object::E_NOTIMPL);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    clear(list, handle, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
+    clear(list, handle, &[0.0, 1.0, 0.0, 1.0], 1, [[1, 0, 3, 1]].as_ptr());
+    assert_eq!(close(list), S_OK);
+    assert_eq!(unsafe { *pixels }, 0x55, "recording must not execute");
+    assert_eq!(release(texture), 2, "two recorded clears retain the texture");
+    release(heap);
+    let queue_iid = object::guid(0x0ec870a6, 0x5d7e, 0x4c22,
+                                 [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+    let queue_desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+    let mut queue = null;
+    assert_eq!(slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+        dev, 0x40)(dev, (&raw const queue_desc).cast(), &queue_iid, &mut queue), S_OK);
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    let mut fence = null;
+    assert_eq!(slot::<extern "system" fn(This, u64, u32, *const Iid, *mut This) -> HRESULT>(
+        dev, 0x120)(dev, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+    assert_eq!(slot::<extern "system" fn(This, This, u64) -> HRESULT>(queue, 0x70)(
+        queue, fence, 1), S_OK);
+    let pixel = |x: usize, y: usize| unsafe {
+        std::slice::from_raw_parts(pixels.add(y * 256 + x * 4), 4)
+    };
+    assert_eq!(pixel(0, 0), &[255, 0, 0, 255]);
+    assert_eq!(pixel(1, 0), &[0, 255, 0, 255]);
+    assert_eq!(pixel(2, 1), &[255, 0, 0, 255]);
+    assert_eq!(unsafe { *pixels.add(12) }, 0x55);
+    release(fence);
+    release(queue);
+    release(list);
+    release(allocator);
+    release(dev);
+}

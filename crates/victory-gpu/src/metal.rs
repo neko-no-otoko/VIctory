@@ -958,23 +958,16 @@ impl State {
                     let (texture, width, height, pitch) =
                         crate::resource::metal_texture(target.ptr())
                             .ok_or("invalid render target")?;
-                    let full = [[0, 0, width, height]];
-                    let rects = if rects.is_empty() { &full[..] } else { rects };
-                    for &[left, top, right, bottom] in rects.iter() {
-                        let len = (right - left) as usize * 4;
-                        for y in top..bottom {
-                            // SAFETY: rectangles were clipped to the retained linear texture.
-                            let row = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    texture.add(y as usize * pitch + left as usize * 4),
-                                    len,
-                                )
-                            };
-                            for pixel in row.chunks_exact_mut(4) {
-                                pixel.copy_from_slice(color);
-                            }
-                        }
-                    }
+                    let row = (width as usize).checked_mul(4).ok_or("image row overflow")?;
+                    let len = (height as usize - 1)
+                        .checked_mul(pitch)
+                        .and_then(|n| n.checked_add(row))
+                        .ok_or("image size overflow")?;
+                    // SAFETY: the retained linear texture contains all rows of
+                    // its validated RGBA8 layout, including inter-row padding.
+                    let pixels = unsafe { std::slice::from_raw_parts_mut(texture, len) };
+                    victory_metal::clear_rgba8(width, height, pitch, pixels, *color, rects)
+                        .map_err(|e| e.to_string())?;
                 }
                 Command::Draw {
                     pipeline,

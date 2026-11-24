@@ -58,6 +58,17 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
+    fn victory_metal_clear(
+        width: u32,
+        height: u32,
+        pitch: usize,
+        pixels: *mut u8,
+        color: *const u8,
+        rects: *const [u32; 4],
+        count: usize,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> bool;
     fn victory_metal_destroy(renderer: *mut c_void);
 }
 
@@ -70,6 +81,35 @@ fn native_error(error: &[c_char]) -> RenderError {
         message.into_owned()
     })
 }
+/// Clear clipped RGBA8 rectangles on Metal, preserving all other pixels and row padding.
+/// An empty rectangle list clears the entire image.
+pub fn clear_rgba8(
+    width: u32,
+    height: u32,
+    pitch: usize,
+    pixels: &mut [u8],
+    color: [u8; 4],
+    rects: &[[u32; 4]],
+) -> Result<(), RenderError> {
+    let row = (width as usize).checked_mul(4);
+    let len = height.checked_sub(1).and_then(|h| pitch.checked_mul(h as usize))
+        .and_then(|n| row.and_then(|r| n.checked_add(r)));
+    if width == 0 || height == 0 || row.is_none_or(|r| pitch < r)
+        || len.is_none_or(|n| pixels.len() < n)
+        || rects.iter().any(|r| r[0] > r[2] || r[1] > r[3] || r[2] > width || r[3] > height)
+    {
+        return Err(RenderError("invalid RGBA8 clear dimensions or rectangle".into()));
+    }
+    let mut error = [0 as c_char; 1024];
+    // SAFETY: the validated image and rectangle slices remain live throughout
+    // the synchronous operation; the native implementation respects pitch.
+    let ok = unsafe {
+        victory_metal_clear(width, height, pitch, pixels.as_mut_ptr(), color.as_ptr(),
+                            rects.as_ptr(), rects.len(), error.as_mut_ptr(), error.len())
+    };
+    if ok { Ok(()) } else { Err(native_error(&error)) }
+}
+
 
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
 ///

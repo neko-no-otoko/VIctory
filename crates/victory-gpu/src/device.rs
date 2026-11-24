@@ -446,6 +446,12 @@ mod native {
     extern "win64" fn uav(this: This, resource: This, counter: This, desc: *const [u32; 10], handle: u64) {
         descriptor::create_uav(this, resource, counter, desc, handle)
     }
+    extern "win64" fn rtv(this: This, resource: This, desc: *const [u32; 6], handle: u64) {
+        descriptor::create_rtv(this, resource, desc, handle)
+    }
+    extern "win64" fn stream(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
+        pipeline::create_stream(this, desc.cast(), iid, out)
+    }
     extern "win64" fn committed(this: This, heap: *const c_void, flags: u32, desc: *const c_void, state: u32, clear: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
         resource::create_committed(this, heap.cast(), flags, desc.cast(), state, clear, iid, out)
     }
@@ -464,8 +470,10 @@ mod native {
         f[12] = list as *const ();
         f[14] = heap as *const ();
         f[19] = uav as *const ();
+        f[20] = rtv as *const ();
         f[27] = committed as *const ();
         f[36] = fence as *const ();
+        f[86] = stream as *const ();
         Table(f)
     };
 }

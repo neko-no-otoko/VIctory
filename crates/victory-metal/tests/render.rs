@@ -437,3 +437,29 @@ fn translated_stages_render_vertex_buffer() {
         "{pixels:?}"
     );
 }
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn metal_clear_preserves_pixels_and_padding() {
+    let mut pixels = vec![0x55; 3 * 32];
+    victory_metal::clear_rgba8(5, 3, 32, &mut pixels, [10, 20, 30, 40], &[]).unwrap();
+    victory_metal::clear_rgba8(
+        5, 3, 32, &mut pixels, [255, 128, 0, 7],
+        &[[1, 0, 3, 2], [2, 1, 5, 3], [5, 3, 5, 3]],
+    ).unwrap();
+    for y in 0..3 {
+        for x in 0..5 {
+            let expected = if (x >= 1 && x < 3 && y < 2) || (x >= 2 && y >= 1) {
+                [255, 128, 0, 7]
+            } else {
+                [10, 20, 30, 40]
+            };
+            assert_eq!(&pixels[y * 32 + x * 4..][..4], &expected);
+        }
+        assert_eq!(&pixels[y * 32 + 20..y * 32 + 32], &[0x55; 12]);
+    }
+    let before = pixels.clone();
+    assert!(victory_metal::clear_rgba8(5, 3, 19, &mut pixels, [0; 4], &[]).is_err());
+    assert!(victory_metal::clear_rgba8(5, 3, 32, &mut pixels, [0; 4], &[[4, 0, 6, 1]]).is_err());
+    assert_eq!(pixels, before);
+}
