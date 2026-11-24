@@ -11,6 +11,7 @@ victory-loader.workspace = true
 victory-pe.workspace = true
 victory-runtime = { path = "../victory-runtime" }
 victory-xg = { path = "../victory-xg" }
+victory-gpu = { path = "../victory-gpu", features = ["native-guest-abi"] }
 
 [dev-dependencies]
 tempfile.workspace = true

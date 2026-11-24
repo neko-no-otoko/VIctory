@@ -49,13 +49,31 @@ are shared with the Windows implementation; this is not the full runtime.
 Run its synthetic PE test with
 `cargo test -p victory-runtime --target x86_64-apple-darwin --test native_guest`.
 
-`victory_native::NativeResolver` combines these two limited providers for use
-with the native loader. It returns an existing provider's resolution unchanged
-and leaves imports missing when neither supports them. The providers and their
-restrictions above are unchanged; this is not the Windows HLE registry.
+`victory_native::NativeResolver` combines these providers and a restricted
+`d3d12_xs.dll!D3D12XboxCreateDevice` bridge for the native loader. It leaves
+unimplemented imports missing. This is not the Windows HLE registry.
 The synthetic executable integration test imports and calls both providers,
 checks that an unimplemented import fails to load, and runs without game data:
 `cargo test -p victory-native --target x86_64-apple-darwin --test native_executable`.
+
+The D3D12.X bridge uses typed Windows-x64 entry points for a limited compute
+device, descriptor heap, resource, pipeline, allocator, list, queue and fence
+path backed by the existing Metal implementation. Unsupported vtable slots
+abort the process rather than silently succeed or call host-ABI pointers.
+Guest DLL allocation hooks and the Windows runtime page mapper are not
+installed by this native bridge; it uses the GPU implementation's own
+allocation path. This is not complete D3D12.X, Windows startup, or game support.
+With a trusted Apple Metal Shader Converter dylib, LLVM-MinGW and a Metal GPU:
+
+```sh
+export VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
+ulimit -c 0
+cargo test -p victory --target x86_64-apple-darwin --test native_compute -- --ignored
+```
+
+The synthetic test invokes the PE through the CLI, dispatches its own console
+shader through VIctory's translation and Metal backend, verifies readback 42,
+and checks an unsupported device slot terminates the child process.
 
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls

@@ -357,6 +357,19 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table
 }
 
+/// Every unsupported native guest method terminates rather than returning an
+/// incorrectly typed value or silently dropping a graphics command.
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+unsafe extern "win64" fn native_unsupported() -> ! {
+    eprintln!("unsupported native D3D12.X vtable method");
+    std::process::abort()
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+pub(crate) const fn native_table<const N: usize>() -> [*const (); N] {
+    [native_unsupported as *const (); N]
+}
+
 #[cfg(test)]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     // SAFETY: `object` is ours and its table has the slot.
