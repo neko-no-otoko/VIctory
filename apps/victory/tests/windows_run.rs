@@ -22,7 +22,9 @@ fn executes_synthetic_pe_through_cli() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "status: {}\n{stdout}\n{stderr}", output.status);
     assert!(stdout.contains("bound          "), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 hle,"), "{stdout}\n{stderr}");
     assert!(stdout.contains("0 missing"), "{stdout}\n{stderr}");
     assert!(stdout.contains("VIctory synthetic entry executed"), "{stdout}\n{stderr}");
+    assert!(stdout.contains("XGameRuntimeInitialize returned S_OK"), "{stdout}\n{stderr}");
     assert!(stdout.contains("title exited with 42"), "{stdout}\n{stderr}");
 }
