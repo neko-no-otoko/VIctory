@@ -6,6 +6,7 @@ pub(crate) struct GraphicsState {
     depth: Option<victory_metal::DepthState>,
     blend: victory_metal::BlendState,
     input_uv: bool,
+    color_format: victory_metal::ColorFormat,
 }
 
 
@@ -18,6 +19,7 @@ pub(crate) struct Prepared {
     pub(crate) sampler_slot: Option<u8>,
     pub(crate) depth: Option<victory_metal::DepthState>,
     pub(crate) vertex_stride: u32,
+    pub(crate) color_format: victory_metal::ColorFormat,
     blend: victory_metal::BlendState,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
 }
@@ -51,6 +53,7 @@ impl Prepared {
             depth: graphics.depth,
             blend: graphics.blend,
             vertex_stride: if graphics.input_uv { 24 } else { 16 },
+            color_format: graphics.color_format,
             renderer: None,
         })
     }
@@ -65,7 +68,7 @@ impl Prepared {
         scissor: [u32; 4],
         mut depth: Option<&mut [f32]>,
         constants: &[u32],
-        texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter)>,
+        texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter, victory_metal::ColorFormat)>,
         pixels: &mut [u8],
     ) -> Result<(), String> {
         if texture.is_some() != self.texture_slot.is_some() {
@@ -76,13 +79,13 @@ impl Prepared {
         }
         if !matches!(&self.renderer, Some((w, h, _)) if *w == width && *h == height) {
             let create = if self.vertex_stride == 24 {
-                victory_metal::Renderer::new_configured_uv
+                victory_metal::Renderer::new_configured_uv_format
             } else {
-                victory_metal::Renderer::new_configured
+                victory_metal::Renderer::new_configured_format
             };
             let renderer = create(
                 &self.vertex, "main", &self.pixel, "main", width, height,
-                self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
+                self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend, self.color_format,
             ).map_err(|e| e.to_string())?;
             self.renderer = Some((width, height, renderer));
         }
@@ -91,9 +94,9 @@ impl Prepared {
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
         }
-        if let Some((width, height, texels, filter)) = texture {
+        if let Some((width, height, texels, filter, format)) = texture {
             renderer
-                .set_fragment_texture(width, height, texels, filter)
+                .set_fragment_texture_format(width, height, texels, filter, format)
                 .map_err(|e| e.to_string())?;
         }
         match (vertices, indices) {
@@ -524,6 +527,7 @@ pub(crate) struct StreamState {
     depth_format: u32,
     blend: Option<victory_metal::BlendState>,
     input_uv: bool,
+    color_format: Option<victory_metal::ColorFormat>,
 }
 
 impl StreamState {
@@ -593,7 +597,14 @@ impl StreamState {
             },
             13 => get(4) == 0,
             14 => get(4) == 3,
-            15 => get(4) == 28 && (1..8).all(|i| get(4 + i * 4) == 0) && get(36) == 1,
+            15 => {
+                self.color_format = match get(4) {
+                    28 => Some(victory_metal::ColorFormat::Rgba8),
+                    87 => Some(victory_metal::ColorFormat::Bgra8),
+                    _ => None,
+                };
+                self.color_format.is_some() && (1..8).all(|i| get(4 + i * 4) == 0) && get(36) == 1
+            }
             16 => { self.depth_format = get(4); matches!(self.depth_format, 0 | 40) },
             17 => get(4) == 1 && get(8) == 0,
             9 => get(4) == u32::MAX,
@@ -622,6 +633,7 @@ impl StreamState {
         Ok(GraphicsState {
             depth: self.depth,
             input_uv: self.input_uv,
+            color_format: self.color_format.ok_or("missing color format")?,
             blend: self.blend.unwrap_or(victory_metal::BlendState {
                 enabled: false, write_mask: 15, alpha_source: false,
             }),

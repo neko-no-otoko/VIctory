@@ -13,7 +13,7 @@ static bool fail(char *dst, size_t len, NSString *message) {
 // draws and readbacks remain ordered in its existing submission pipeline.
 bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t *pixels,
                          const uint8_t *color, const uint32_t (*rects)[4], size_t count,
-                         char *error, size_t error_len) {
+                         bool bgra, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         static id<MTLDevice> device;
@@ -38,14 +38,17 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
             if (!pipeline || !queue) setupError = e.localizedDescription ?: @"clear pipeline creation failed";
         });
         if (setupError) return fail(error, error_len, setupError);
-        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm
                                                                                        width:width height:height mipmapped:NO];
         desc.storageMode = MTLStorageModeShared;
         desc.usage = MTLTextureUsageShaderWrite;
         id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
         if (!texture) return fail(error, error_len, @"clear texture allocation failed");
-        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
-        [texture replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:pitch];
+        size_t row = (size_t)width * 4;
+        for (uint32_t y = 0; y < height; ++y) {
+            MTLRegion region = MTLRegionMake2D(0, y, width, 1);
+            [texture replaceRegion:region mipmapLevel:0 withBytes:pixels + (size_t)y * pitch bytesPerRow:row];
+        }
         id<MTLCommandBuffer> command = [queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         if (!command || !encoder) return fail(error, error_len, @"clear command creation failed");
@@ -55,7 +58,9 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
         const uint32_t full[4] = {0, 0, width, height};
         size_t n = count ? count : 1;
         for (size_t i = 0; i < n; ++i) {
-            const uint32_t *rect = count ? rects[i] : full;
+            const uint32_t *input = count ? rects[i] : full;
+            const uint32_t rect[4] = { MIN(input[0], width), MIN(input[1], height),
+                                       MIN(input[2], width), MIN(input[3], height) };
             uint32_t w = rect[2] - rect[0], h = rect[3] - rect[1];
             if (!w || !h) continue;
             [encoder setBytes:rect length:4 * sizeof(uint32_t) atIndex:0];
@@ -66,7 +71,10 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted)
             return fail(error, error_len, command.error.localizedDescription ?: @"GPU clear failed");
-        [texture getBytes:pixels bytesPerRow:pitch fromRegion:region mipmapLevel:0];
+        for (uint32_t y = 0; y < height; ++y) {
+            MTLRegion region = MTLRegionMake2D(0, y, width, 1);
+            [texture getBytes:pixels + (size_t)y * pitch bytesPerRow:row fromRegion:region mipmapLevel:0];
+        }
         return true;
     }
 }
@@ -113,7 +121,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
                            bool blend_enabled, uint8_t write_mask, bool alpha_source,
-                           bool vertex_uv, char *error, size_t error_len) {
+                           bool vertex_uv, bool bgra, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -147,7 +155,8 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         desc.vertexFunction = vertex;
         desc.fragmentFunction = fragment;
         desc.vertexDescriptor = layout;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        MTLPixelFormat colorFormat = bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+        desc.colorAttachments[0].pixelFormat = colorFormat;
         MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[0];
         color.writeMask = ((write_mask & 1) ? MTLColorWriteMaskRed : 0)
                         | ((write_mask & 2) ? MTLColorWriteMaskGreen : 0)
@@ -163,7 +172,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");
-        MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+        MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:colorFormat width:width height:height mipmapped:NO];
         texture.storageMode = MTLStorageModePrivate;
         texture.usage = MTLTextureUsageRenderTarget;
         r.texture = [r.device newTextureWithDescriptor:texture];
@@ -336,14 +345,15 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
 }
 
 bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, const uint8_t *rgba,
-                               bool linear, char *error, size_t error_len) {
+                               bool linear, bool bgra, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         if (!r.textureEnabled) return fail(error, error_len, @"texture binding is not enabled");
         id<MTLTexture> texture = r.sampledTexture;
-        if (!texture || texture.width != width || texture.height != height) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+        MTLPixelFormat format = bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+        if (!texture || texture.width != width || texture.height != height || texture.pixelFormat != format) {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
             desc.textureType = MTLTextureType2DArray;
             desc.arrayLength = 1;
             desc.storageMode = MTLStorageModeShared;

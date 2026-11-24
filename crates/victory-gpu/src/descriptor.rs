@@ -208,8 +208,8 @@ const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
     #[cfg(target_os = "macos")]
-    pub(crate) fn metal_rgba8(&self) -> bool {
-        self.described == 0 || self.desc == [28, 4, 0, 0, 0, 0]
+    pub(crate) fn metal_color8(&self, format: u32) -> bool {
+        self.described == 0 || self.desc == [format, 4, 0, 0, 0, 0]
     }
 
     #[cfg(target_os = "macos")]

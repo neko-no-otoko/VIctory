@@ -111,7 +111,7 @@ other depth formats, and DEPTH_READ are rejected. Depth-only clears accept
 finite values in [0, 1], including clipped rectangles. The synthetic depth
 fixture checks all comparisons, write masking, overlapping indexed and
 nonindexed draws, clears, retained resources, and color and mapped-depth values.
-For RGBA8, pipeline blend state supports disabled blending or ADD with
+For RGBA8_UNORM and BGRA8_UNORM, pipeline blend state supports disabled blending or ADD with
 SRC_ALPHA and INV_SRC_ALPHA for RGB, and ONE or SRC_ALPHA with INV_SRC_ALPHA
 for alpha. Each RGBA write-mask bit is supported, including a zero mask.
 Alpha-to-coverage, independent blending, logic operations, other factors and
@@ -130,6 +130,15 @@ offset. Other layouts, varying semantics, masks, flat or packed interpolation,
 and mismatched signatures are rejected. Synthetic fixtures verify
 perspective-correct sampling, including independent UV input on indexed and
 nonindexed draws, and exercise layout, stride, and linkage rejection.
+The native color path supports committed, linear single-mip RGBA8_UNORM and
+BGRA8_UNORM 2D render targets and sampled textures. Formats must match their
+pipeline, copy footprint and explicit view; default views are also supported.
+Explicit 2D SRVs require identity component mapping and the single mip.
+Channel masks, blending and clear colors use logical RGBA, while mapped and
+readback memory uses the texture's RGBA or BGRA byte order and padded rows.
+Typeless, sRGB and other unsupported texture formats are rejected. The BGRA
+fixture covers asymmetric colors in both source and target formats, default and
+explicit views, padded readback, clears, blending, masks, and retained resources.
 With the same prerequisites, run:
 
 ```sh
@@ -140,6 +149,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_depth -- --igno
 cargo test -p victory --target x86_64-apple-darwin --test native_blend -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_varying -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_uv -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_bgra -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

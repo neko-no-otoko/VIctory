@@ -138,6 +138,14 @@ const UAV: u32 = 0x8;
 const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
 
+fn color_format(resource: This) -> Option<victory_metal::ColorFormat> {
+    match crate::resource::metal_color_format(resource)? {
+        28 => Some(victory_metal::ColorFormat::Rgba8),
+        87 => Some(victory_metal::ColorFormat::Bgra8),
+        _ => None,
+    }
+}
+
 fn state_of(resource: This) -> Result<(bool, u32), String> {
     if let Some(state) =
         crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
@@ -589,8 +597,11 @@ impl State {
             self.reject("invalid render-target descriptor");
             return;
         };
-        if !rtv.metal_rgba8() || crate::resource::metal_texture(rtv.resource).is_none() {
-            self.reject("expected a linear RGBA8 render target");
+        let Some(format) = crate::resource::metal_color_format(rtv.resource) else {
+            return self.reject("expected an RGBA8 or BGRA8 render target");
+        };
+        if !rtv.metal_color8(format) || crate::resource::metal_texture(rtv.resource).is_none() {
+            self.reject("invalid color render-target view");
             return;
         }
         let depth = if let Some(handle) = depth_handle {
@@ -622,9 +633,10 @@ impl State {
         rects: &[Scissor],
     ) -> Result<(), String> {
         let rtv = descriptor::rtv_record(handle).ok_or("invalid render-target descriptor")?;
+        let format = crate::resource::metal_color_format(rtv.resource).ok_or("unsupported color format")?;
         let (_, width, height, _) = crate::resource::metal_texture(rtv.resource)
-            .filter(|_| rtv.metal_rgba8())
-            .ok_or("expected a linear RGBA8 render target")?;
+            .filter(|_| rtv.metal_color8(format))
+            .ok_or("invalid color render-target view")?;
         if rects.iter().any(|r| r.left > r.right || r.top > r.bottom) {
             return Err("invalid render-target clear rectangle".into());
         }
@@ -757,6 +769,9 @@ impl State {
             f64::from(viewport.min), f64::from(viewport.max),
         ];
         let prepared = pipeline.lock().unwrap_or_else(|e| e.into_inner());
+        if color_format(target.ptr()) != Some(prepared.color_format) {
+            return Err("pipeline color format does not match render target".into());
+        }
         if let Some(bound) = &self.depth_target {
             let (_, dw, dh, _) = crate::resource::metal_depth_texture(bound.ptr())
                 .ok_or("invalid depth target")?;
@@ -811,9 +826,19 @@ impl State {
                 let view = descriptor::view(view_handle).ok_or("missing SRV descriptor")?;
                 let sampler =
                     descriptor::view(sampler_handle).ok_or("missing sampler descriptor")?;
-                let View::Shader(texture, None) = view else {
-                    return Err("expected a default texture SRV".into());
+                let View::Shader(texture, desc) = &view else {
+                    return Err("expected a texture SRV".into());
                 };
+                let texture = *texture as This;
+                let format = crate::resource::metal_color_format(texture).ok_or("unsupported sampled texture format")?;
+                if let Some(desc) = desc {
+                    if desc[0] != format || desc[1] != 4 || desc[2] != 0x1688
+                        || desc[4] != 0 || !matches!(desc[5], 1 | u32::MAX)
+                        || desc[6] != 0 || desc[7] != 0
+                    {
+                        return Err("unsupported texture SRV description".into());
+                    }
+                }
                 let View::Sampler(words) = sampler else {
                     return Err("expected a standard sampler".into());
                 };
@@ -825,16 +850,15 @@ impl State {
                     0x15 => victory_metal::TextureFilter::Linear,
                     _ => return Err("unsupported sampler filter".into()),
                 };
-                let texture = texture as This;
                 if crate::resource::metal_sampled_texture(texture).is_none() {
-                    return Err("expected a linear single-mip RGBA8 texture".into());
+                    return Err("expected a linear single-mip RGBA8 or BGRA8 texture".into());
                 }
                 Some(Sampled {
                     _view_heap: view_heap,
                     _sampler_heap: sampler_heap,
                     view_handle,
                     sampler_handle,
-                    view: View::Shader(texture as usize, None),
+                    view,
                     sampler: View::Sampler(words),
                     texture: ResourceRef::new(texture),
                     filter,
@@ -888,7 +912,7 @@ impl State {
             .checked_mul(u64::from(height.saturating_sub(1)))
             .and_then(|n| n.checked_add(u64::from(width) * 4));
         let size = crate::resource::buffer_bytes(buffer).map(|(_, size)| size);
-        if footprint.format != 28
+        if Some(footprint.format) != crate::resource::metal_color_format(target)
             || footprint.width != width
             || footprint.height != height
             || footprint.depth != 1
@@ -1129,7 +1153,7 @@ impl State {
                     // SAFETY: the retained linear texture contains all rows of
                     // its validated RGBA8 layout, including inter-row padding.
                     let pixels = unsafe { std::slice::from_raw_parts_mut(texture, len) };
-                    victory_metal::clear_rgba8(width, height, pitch, pixels, *color, rects)
+                    victory_metal::clear_color8(color_format(target.ptr()).ok_or("invalid color format")?, width, height, pitch, pixels, *color, rects)
                         .map_err(|e| e.to_string())?;
                 }
                 Command::ClearDepth { target, depth, rects } => {
@@ -1192,6 +1216,7 @@ impl State {
                             height,
                             self.texture_scratch.as_slice(),
                             sampled.filter,
+                            color_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,
                         ))
                     } else {
                         None

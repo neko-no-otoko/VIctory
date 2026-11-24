@@ -916,10 +916,10 @@ pub(crate) fn metal_buffer_allows_uav(this: This) -> bool {
     !this.is_null() && resource(this).desc.flags & 4 != 0
 }
 
-/// Only linear single-sample RGBA8 targets have a defined CPU-visible layout.
+/// Linear single-sample RGBA8 and BGRA8 targets have CPU-visible rows.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_linear_texture(this, 28, 1)
+    metal_linear_texture(this, metal_color_format(this)?, 1)
 }
 
 #[cfg(target_os = "macos")]
@@ -929,7 +929,16 @@ pub(crate) fn metal_depth_texture(this: This) -> Option<(*mut u8, u32, u32, usiz
 
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_sampled_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_linear_texture(this, 28, 0)
+    metal_linear_texture(this, metal_color_format(this)?, 0)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_color_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    let format = resource(this).desc.format;
+    matches!(format, 28 | 87).then_some(format)
 }
 
 #[cfg(target_os = "macos")]
@@ -1129,6 +1138,14 @@ pub(crate) extern "system" fn create_committed(
     let (Some(&heap), Some(&desc)) = (unsafe { (heap.as_ref(), desc.as_ref()) }) else {
         return E_INVALIDARG;
     };
+    #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+    if desc.dimension != 1 && !matches!(desc.format, 28 | 40 | 87) {
+        // Unsupported texture formats must not produce a usable native guest resource.
+        if !out.is_null() {
+            unsafe { out.write(std::ptr::null_mut()) };
+        }
+        return E_INVALIDARG;
+    }
     let Some(info) = footprint(&desc) else {
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
@@ -1136,7 +1153,7 @@ pub(crate) extern "system" fn create_committed(
     #[cfg(target_os = "macos")]
     let info = if heap.kind == 1
         && desc.dimension == 3
-        && desc.format == 40
+        && ((desc.format == 40 && desc.flags == 2) || (desc.format == 87 && matches!(desc.flags, 0 | 1)))
         && desc.width != 0
         && desc.height != 0
         && desc.depth_or_array_size == 1
@@ -1144,7 +1161,6 @@ pub(crate) extern "system" fn create_committed(
         && desc.sample_count == 1
         && desc.sample_quality == 0
         && desc.layout == 1
-        && desc.flags == 2
     {
         let Some(size) = desc.width.checked_mul(4)
             .and_then(|row| row.checked_next_multiple_of(256))

@@ -23,6 +23,19 @@ impl fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
+/// Byte layout of an unorm color image; shader values remain logical RGBA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorFormat {
+    Rgba8,
+    Bgra8,
+}
+
+impl ColorFormat {
+    fn is_bgra(self) -> bool {
+        matches!(self, Self::Bgra8)
+    }
+}
+
 
 unsafe extern "C" {
     fn victory_metal_create(
@@ -42,6 +55,7 @@ unsafe extern "C" {
         write_mask: u8,
         alpha_source: bool,
         vertex_uv: bool,
+        bgra: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -78,6 +92,7 @@ unsafe extern "C" {
         height: u32,
         rgba: *const u8,
         linear_filter: bool,
+        bgra: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -89,6 +104,7 @@ unsafe extern "C" {
         color: *const u8,
         rects: *const [u32; 4],
         count: usize,
+        bgra: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -119,6 +135,21 @@ pub fn clear_rgba8(
     color: [u8; 4],
     rects: &[[u32; 4]],
 ) -> Result<(), RenderError> {
+    clear_color8(ColorFormat::Rgba8, width, height, pitch, pixels, color, rects)
+}
+
+/// Clear clipped rectangles on a Metal color texture, preserving other pixels
+/// and row padding. `color` is logical RGBA regardless of the byte layout.
+/// An empty rectangle list clears the entire image.
+pub fn clear_color8(
+    format: ColorFormat,
+    width: u32,
+    height: u32,
+    pitch: usize,
+    pixels: &mut [u8],
+    color: [u8; 4],
+    rects: &[[u32; 4]],
+) -> Result<(), RenderError> {
     let row = (width as usize).checked_mul(4);
     let len = height.checked_sub(1).and_then(|h| pitch.checked_mul(h as usize))
         .and_then(|n| row.and_then(|r| n.checked_add(r)));
@@ -133,7 +164,7 @@ pub fn clear_rgba8(
     // the synchronous operation; the native implementation respects pitch.
     let ok = unsafe {
         victory_metal_clear(width, height, pitch, pixels.as_mut_ptr(), color.as_ptr(),
-                            rects.as_ptr(), rects.len(), error.as_mut_ptr(), error.len())
+                            rects.as_ptr(), rects.len(), format.is_bgra(), error.as_mut_ptr(), error.len())
     };
     if ok { Ok(()) } else { Err(native_error(&error)) }
 }
@@ -172,7 +203,7 @@ pub struct BlendState {
 }
 
 
-/// A persistent Metal pipeline and RGBA8Unorm offscreen target.
+/// A persistent Metal pipeline and RGBA8Unorm or BGRA8Unorm offscreen target.
 ///
 /// Both metallibs must be produced by Apple Metal Shader Converter. Metal
 /// attribute 11 is a per-vertex float4 at buffer slot 6, offset 0. The UV
@@ -181,7 +212,7 @@ pub struct BlendState {
 /// at offset 0 in the converter's automatic linear argument buffer, and
 /// texture and sampler heap index 0. The caller must verify those layouts via
 /// converter reflection and translated shader metadata.
-/// The output is tightly packed RGBA8, top row first.
+/// The output is tightly packed in the configured color format, top row first.
 pub struct Renderer {
     handle: NonNull<c_void>,
     pixel_len: usize,
@@ -240,9 +271,20 @@ impl Renderer {
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
     ) -> Result<Self, RenderError> {
+        Self::new_configured_format(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                                    width, height, fragment_constant_dwords, fragment_texture,
+                                    depth, blend, ColorFormat::Rgba8)
+    }
+
+    /// Create a position-only pipeline with the specified color target format.
+    pub fn new_configured_format(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, format: ColorFormat,
+    ) -> Result<Self, RenderError> {
         Self::new_configured_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                                    width, height, fragment_constant_dwords, fragment_texture,
-                                   depth, blend, false)
+                                   depth, blend, false, format)
     }
 
     /// Create a pipeline with float4 position and independent float2 UV vertices.
@@ -251,15 +293,27 @@ impl Renderer {
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, depth: Option<DepthState>, blend: BlendState,
     ) -> Result<Self, RenderError> {
+        Self::new_configured_uv_format(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                                       width, height, fragment_constant_dwords, fragment_texture,
+                                       depth, blend, ColorFormat::Rgba8)
+    }
+
+    /// Create a position/UV pipeline with the specified color target format.
+    pub fn new_configured_uv_format(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, format: ColorFormat,
+    ) -> Result<Self, RenderError> {
         Self::new_configured_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
                                    width, height, fragment_constant_dwords, fragment_texture,
-                                   depth, blend, true)
+                                   depth, blend, true, format)
     }
 
     fn new_configured_inner(
         vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
         fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, vertex_uv: bool,
+        format: ColorFormat,
     ) -> Result<Self, RenderError> {
         if depth.is_some_and(|state| !(1..=8).contains(&state.compare)) {
             return Err(RenderError("invalid depth comparison".into()));
@@ -306,6 +360,7 @@ impl Renderer {
                 blend.write_mask,
                 blend.alpha_source,
                 vertex_uv,
+                format.is_bgra(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -382,12 +437,24 @@ impl Renderer {
         rgba: &[u8],
         filter: TextureFilter,
     ) -> Result<(), RenderError> {
+        self.set_fragment_texture_format(width, height, rgba, filter, ColorFormat::Rgba8)
+    }
+
+    /// Upload tightly packed texels in the specified byte layout.
+    pub fn set_fragment_texture_format(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        filter: TextureFilter,
+        format: ColorFormat,
+    ) -> Result<(), RenderError> {
         let size = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
-        if !self.fragment_texture || width == 0 || height == 0 || rgba.len() != size {
-            return Err(RenderError("expected enabled texture binding, nonzero dimensions and tightly packed RGBA8 texels".into()));
+        if !self.fragment_texture || width == 0 || height == 0 || pixels.len() != size {
+            return Err(RenderError("expected enabled texture binding, nonzero dimensions and tightly packed 8-bit texels".into()));
         }
         let mut error = [0 as c_char; 1024];
         // SAFETY: the renderer and validated input buffer live through the
@@ -397,8 +464,9 @@ impl Renderer {
                 self.handle.as_ptr(),
                 width,
                 height,
-                rgba.as_ptr(),
+                pixels.as_ptr(),
                 matches!(filter, TextureFilter::Linear),
+                format.is_bgra(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -423,7 +491,7 @@ impl Renderer {
         self.draw_inner(vertices, fragment_constants, pixels, false)
     }
 
-    /// Draw a triangle list over the existing tightly packed RGBA8 pixels.
+    /// Draw a triangle list over existing tightly packed pixels in the configured format.
     /// Pixels not covered by the triangles retain their original values.
     pub fn draw_preserving(
         &mut self,
@@ -434,7 +502,7 @@ impl Renderer {
         self.draw_inner(vertices, fragment_constants, pixels, true)
     }
 
-    /// Draw indexed triangles over the existing tightly packed RGBA8 pixels.
+    /// Draw indexed triangles over existing tightly packed pixels in the configured format.
     /// Each index plus `base_vertex` must identify an element of `vertices`.
     pub fn draw_indexed_preserving(
         &mut self,
