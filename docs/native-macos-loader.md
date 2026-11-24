@@ -388,6 +388,29 @@ and is not a decoder. For example, the byte sequence
 `add`, but the matcher sees its nine-byte GS pattern at offset 2, inside the
 `movabs` immediate. Applying that rewrite to arbitrary code can corrupt it.
 
+The same rewrite is not generic TLS support for the Windows/Wine loader
+either. In an isolated Wine 11.0 experiment, an LLVM-MinGW x86-64 PE used
+compiler-generated `_Thread_local` access and also inspected the TLS array
+using `mov %gs:(%rcx), %rcx` with `rcx = 0x58`. When Wine launched that PE
+normally, slot 0 contained the variable's template block and the guest
+returned 42. When VIctory mapped the same EXE as a DLL, the log reported
+`static TLS redirected index=1 patched=1`; the compiler-generated access
+still read its initialized value, but the alternate GS access saw the host
+slot instead. The guest reported the mismatch and returned 3 (the CLI itself
+returned 0). This is a concrete counterexample, not a general assessment of
+all compiler-generated images.
+
+For a prepared DLL, Wine assigns its TLS index and maintains thread blocks.
+The EXE rewrite changes the image's assigned index to zero. Wine 11's
+[TLS unload implementation](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/ntdll/loader.c#L1411-L1424)
+uses that index to select its registration, so this change also creates a
+teardown hazard; the comparison above did not test that hazard. VIctory's
+manual thread notifications and mapping lifetime also need coherent
+serialization for reentrant callbacks and concurrent detach. A generic
+solution needs the guest to be the actual Wine process EXE or an execution
+environment that virtualizes all guest/host transitions; PE TLS metadata
+alone does not identify every possible machine-code access to the TLS array.
+
 In isolated child-process experiments on an Apple M3 Max running macOS 27.3
 under Rosetta, `gs:[0x58]` read zero, and both `rdgsbase` and `wrgsbase`
 raised SIGILL; CPUID did not advertise FSGSBASE. Reading Mach's translated
