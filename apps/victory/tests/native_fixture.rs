@@ -228,6 +228,15 @@ fn native_fixture_reads_scoped_files() {
     std::fs::write(root.join("café.bin"), b"0123456789").unwrap();
     std::fs::write(dir.path().join("outside.bin"), b"outside").unwrap();
     std::os::unix::fs::symlink(dir.path().join("outside.bin"), root.join("link")).unwrap();
+    std::fs::create_dir(root.join("MixedDir")).unwrap();
+    std::fs::write(root.join("MixedDir").join("Data.bin"), b"drive").unwrap();
+    std::os::unix::fs::symlink(dir.path(), root.join("dirlink")).unwrap();
+    std::fs::write(root.join("Collision"), b"one").unwrap();
+    let case_distinct = match std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("collision")) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => panic!("creating case-distinct fixture: {error}"),
+    };
     std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateFileW\nReadFile\nSetFilePointerEx\nGetFileSizeEx\nCloseHandle\nGetLastError\n").unwrap();
     std::fs::write(dir.path().join("files.c"), r#"
 typedef void *HANDLE;
@@ -249,6 +258,16 @@ static const WCHAR name[] = {'c','a','f',0xe9,'.','b','i','n',0};
 static const WCHAR missing[] = {'m','i','s','s','i','n','g',0};
 static const WCHAR traversal[] = {'.','.','/','o','u','t','s','i','d','e','.','b','i','n',0};
 static const WCHAR link[] = {'l','i','n','k',0};
+static const WCHAR drive[] = {'Z',':','\\','m','I','x','E','d','D','i','R','\\','d','A','t','A','.','B','I','N',0};
+static const WCHAR relative[] = {'m','I','x','E','d','D','i','R','/','d','A','t','A','.','B','I','N',0};
+static const WCHAR drive_traversal[] = {'C',':','\\','M','i','x','e','d','D','i','r','\\','.','.','\\','c','a','f',0xe9,'.','b','i','n',0};
+static const WCHAR drive_link[] = {'C',':','\\','d','i','r','l','i','n','k','\\','o','u','t','s','i','d','e','.','b','i','n',0};
+static const WCHAR drive_relative[] = {'C',':','c','a','f',0xe9,'.','b','i','n',0};
+static const WCHAR unc[] = {'\\','\\','s','e','r','v','e','r','\\','s','h','a','r','e',0};
+#ifdef CASE_COLLISIONS
+static const WCHAR collision_exact[] = {'C','o','l','l','i','s','i','o','n',0};
+static const WCHAR collision_folded[] = {'C','O','L','L','I','S','I','O','N',0};
+#endif
 int marker = 7; int *volatile relocated_marker = &marker;
 unsigned entry(void) {
     HANDLE h, bad;
@@ -295,11 +314,39 @@ unsigned entry(void) {
     if (bad != INVALID || GetLastError() != 50) return 22;
     bad = CreateFileW(link, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
     if (bad != INVALID || GetLastError() != 5) return 23;
+    h = CreateFileW(drive, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (h == INVALID || !h) return 24;
+    n = 0;
+    if (!ReadFile(h, buf, 5, &n, 0) || n != 5 ||
+        buf[0] != 'd' || buf[1] != 'r' || buf[2] != 'i' || buf[3] != 'v' || buf[4] != 'e') return 25;
+    if (!CloseHandle(h)) return 26;
+    h = CreateFileW(relative, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (h == INVALID || !h) return 27;
+    n = 0;
+    if (!ReadFile(h, buf, 5, &n, 0) || n != 5 ||
+        buf[0] != 'd' || buf[1] != 'r' || buf[2] != 'i' || buf[3] != 'v' || buf[4] != 'e') return 28;
+    if (!CloseHandle(h)) return 29;
+    bad = CreateFileW(drive_traversal, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 30;
+    bad = CreateFileW(drive_link, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 31;
+    bad = CreateFileW(drive_relative, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 32;
+    bad = CreateFileW(unc, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 5) return 33;
+#ifdef CASE_COLLISIONS
+    bad = CreateFileW(collision_exact, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 52) return 34;
+    bad = CreateFileW(collision_folded, READ, 1, 0, OPEN_EXISTING, NORMAL, 0);
+    if (bad != INVALID || GetLastError() != 52) return 35;
+#endif
     return 42;
 }
 "#).unwrap();
     tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
-    tool(dir.path(), "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "files.c", "-o", "files.obj"]);
+    let mut compile_args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "files.c", "-o", "files.obj"];
+    if case_distinct { compile_args.push("-DCASE_COLLISIONS"); }
+    tool(dir.path(), "x86_64-w64-mingw32-clang", &compile_args);
     tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:files.exe", "files.obj", "kernel32.lib"]);
     let exe = dir.path().join("files.exe");
     let no_root = cli(&["native-fixture".as_ref(), exe.as_os_str()]);

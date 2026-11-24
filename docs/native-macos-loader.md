@@ -180,9 +180,16 @@ reverse order; cycles, forwarded exports, unsupported images and missing
 imports are rejected. DLLs are not searched for or loaded dynamically.
 
 Passing `--file-root /path/to/directory` enables a restricted synchronous
-read-only `kernel32.dll` file API for the executing thread. It accepts relative
-UTF-16 paths within that directory and rejects absolute paths, traversal and
-symlink components; file handles are closed when the execution scope ends.
+read-only `kernel32.dll` file API for the executing thread. Relative paths
+and absolute DOS drive paths such as `G:\data\file` resolve under that one
+root; all ASCII drive letters are aliases, not separate mounts. Drive-relative,
+rooted, UNC and device-namespace paths, traversal and symlink components are
+rejected. Each component uses ASCII case-insensitive matching; non-ASCII bytes
+are not case folded. If multiple directory entries match, lookup fails with
+`ERROR_DUP_NAME`, even for an exact spelling. Lookup uses directory-relative
+`openat` with no-follow; concurrent directory mutations can race the ambiguity
+check, but cannot make it follow a symlink. File handles are closed when the
+execution scope ends.
 The API provides `CreateFileW`, `ReadFile`, `SetFilePointerEx`, `GetFileSizeEx`,
 `CloseHandle`, `GetLastError`, and `SetLastError`. Only regular files opened
 for reading with `OPEN_EXISTING` and `FILE_SHARE_READ` are supported; other

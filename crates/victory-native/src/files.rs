@@ -5,7 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::{CString, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
@@ -24,6 +24,7 @@ const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_INVALID_DATA: u32 = 13;
 const ERROR_NOT_SUPPORTED: u32 = 50;
+const ERROR_DUP_NAME: u32 = 52;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_NAME: u32 = 123;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
@@ -124,10 +125,60 @@ unsafe fn guest_path(path: *const u16) -> Result<String, u32> {
     String::from_utf16(units).map_err(|_| ERROR_INVALID_NAME)
 }
 
+// Read from an independent directory description: dup() would share its
+// seek position with the directory subsequently used for openat().
+fn find_component(parent: &File, wanted: &str, intermediate: bool) -> Result<CString, u32> {
+    // SAFETY: parent is an open directory and "." is NUL terminated.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(error_code(&io::Error::last_os_error(), intermediate)); }
+    // SAFETY: fd is owned and fdopendir takes ownership on success.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error_code(&error, intermediate));
+    }
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) { unsafe { libc::closedir(self.0); } }
+    }
+    let dir = Directory(dir);
+    let mut selected = None;
+    loop {
+        // SAFETY: errno is thread-local and dir remains live in this loop.
+        unsafe { *libc::__error() = 0; }
+        let entry = unsafe { libc::readdir(dir.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) { return Err(error_code(&error, intermediate)); }
+            break;
+        }
+        // SAFETY: readdir supplies a NUL-terminated name until the next call.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        consider_component(&mut selected, wanted.as_bytes(), name)?;
+    }
+    selected.ok_or(if intermediate { ERROR_PATH_NOT_FOUND } else { ERROR_FILE_NOT_FOUND })
+}
+
+fn consider_component(selected: &mut Option<CString>, wanted: &[u8], name: &CStr) -> Result<(), u32> {
+    if name.to_bytes().eq_ignore_ascii_case(wanted) {
+        if selected.is_some() { return Err(ERROR_DUP_NAME); }
+        *selected = Some(name.to_owned());
+    }
+    Ok(())
+}
+
 fn open_relative(root: &File, path: &str) -> Result<File, u32> {
     if path.is_empty() { return Err(ERROR_INVALID_NAME); }
-    // Reject rooted, drive, device and traversal paths rather than normalize
-    // them. Both Windows separators are recognized on the Unix host.
+    // Every absolute DOS drive is an alias of the explicitly supplied root.
+    // Drive-relative, rooted, UNC and device namespace paths are not mapped.
+    let bytes = path.as_bytes();
+    let path = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        if bytes.get(2).is_none_or(|b| *b != b'/' && *b != b'\\') {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        &path[3..]
+    } else { path };
     if path.starts_with(['/', '\\']) || path.contains(':') {
         return Err(ERROR_ACCESS_DENIED);
     }
@@ -137,14 +188,25 @@ fn open_relative(root: &File, path: &str) -> Result<File, u32> {
         if part.is_empty() || part == "." || part == ".." {
             return Err(ERROR_ACCESS_DENIED);
         }
-        let name = CString::new(part).map_err(|_| ERROR_INVALID_NAME)?;
         let intermediate = parts.peek().is_some();
         let parent = directory.as_ref().unwrap_or(root);
+        let name = find_component(parent, part, intermediate)?;
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
             | if intermediate { libc::O_DIRECTORY } else { libc::O_NONBLOCK };
         // SAFETY: parent is an open directory and name is a NUL-terminated component.
         let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 { return Err(error_code(&io::Error::last_os_error(), intermediate)); }
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if intermediate && error.raw_os_error() == Some(libc::ENOTDIR) {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: parent/name are live; lstat does not follow the link.
+                let rc = unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+                if rc == 0 && unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    return Err(ERROR_ACCESS_DENIED);
+                }
+            }
+            return Err(error_code(&error, intermediate));
+        }
         // SAFETY: openat returned a new, owned file descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
         if intermediate {
@@ -335,10 +397,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file"), b"data").unwrap();
         symlink("file", dir.path().join("link")).unwrap();
+        symlink(dir.path(), dir.path().join("dirlink")).unwrap();
         let _scope = FileScope::enter(dir.path()).unwrap();
         // SAFETY: test pointers refer to live buffers.
         unsafe {
-            for path in ["../file", "/file", "C:\\file", "link"] {
+            for path in ["../file", "/file", "C:file", "\\\\server\\file", "G:\\..\\file", "link", "G:\\dirlink\\file"] {
                 assert_eq!(open(path), INVALID_HANDLE);
                 assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
             }
@@ -353,5 +416,15 @@ mod tests {
             assert_eq!(read_file(handle, null_mut(), 1, &mut read, null_mut()), 0);
             assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
         }
+    }
+
+    #[test]
+    fn rejects_case_collisions_even_for_exact_match() {
+        let mut selected = None;
+        consider_component(&mut selected, b"File", c"File").unwrap();
+        assert_eq!(consider_component(&mut selected, b"File", c"FILE"), Err(ERROR_DUP_NAME));
+        let mut selected = None;
+        consider_component(&mut selected, "É".as_bytes(), c"é").unwrap();
+        assert!(selected.is_none(), "non-ASCII bytes are not case folded");
     }
 }
