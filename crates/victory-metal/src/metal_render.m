@@ -77,6 +77,8 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLRenderPipelineState> pipeline;
 @property(nonatomic, strong) id<MTLTexture> texture;
+@property(nonatomic, strong) id<MTLTexture> depthTexture;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic, strong) id<MTLBuffer> readback;
 @property(nonatomic, strong) id<MTLBuffer> vertices;
 @property(nonatomic, strong) id<MTLBuffer> indices;
@@ -108,7 +110,8 @@ static id<MTLLibrary> loadLibrary(id<MTLDevice> device, const uint8_t *bytes,
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
-                           bool texture_enabled, char *error, size_t error_len) {
+                           bool texture_enabled, uint32_t depth_compare, bool depth_write,
+                           char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
@@ -136,6 +139,7 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         desc.fragmentFunction = fragment;
         desc.vertexDescriptor = layout;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        if (depth_compare) desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");
         MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
@@ -143,12 +147,39 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         texture.usage = MTLTextureUsageRenderTarget;
         r.texture = [r.device newTextureWithDescriptor:texture];
         if (!r.texture) FAIL(@"texture allocation failed");
+        if (depth_compare) {
+            if (depth_compare > 8) FAIL(@"invalid depth comparison");
+            MTLDepthStencilDescriptor *depth = [MTLDepthStencilDescriptor new];
+            depth.depthCompareFunction = (MTLCompareFunction)(depth_compare - 1);
+            depth.depthWriteEnabled = depth_write;
+            r.depthState = [r.device newDepthStencilStateWithDescriptor:depth];
+            MTLTextureDescriptor *depthTexture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:width height:height mipmapped:NO];
+            depthTexture.storageMode = MTLStorageModePrivate;
+            depthTexture.usage = MTLTextureUsageRenderTarget;
+            r.depthTexture = [r.device newTextureWithDescriptor:depthTexture];
+            if (!r.depthState || !r.depthTexture) FAIL(@"depth attachment allocation failed");
+        }
         size_t row = (size_t)width * 4;
         r.stride = (row + 255) & ~(size_t)255;
         if (r.stride > SIZE_MAX / height) FAIL(@"readback dimensions overflow");
         r.readback = [r.device newBufferWithLength:r.stride * height options:MTLResourceStorageModeShared];
         r.queue = [r.device newCommandQueue];
         if (!r.readback || !r.queue) FAIL(@"readback or queue allocation failed");
+        if (r.depthTexture) {
+            id<MTLCommandBuffer> command = [r.queue commandBuffer];
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.depthAttachment.texture = r.depthTexture;
+            pass.depthAttachment.loadAction = MTLLoadActionClear;
+            pass.depthAttachment.clearDepth = 1.0;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+            if (!command || !encoder) FAIL(@"depth initialization command failed");
+            [encoder endEncoding];
+            [command commit];
+            [command waitUntilCompleted];
+            if (command.status != MTLCommandBufferStatusCompleted)
+                FAIL(command.error.localizedDescription ?: @"depth initialization failed");
+        }
         if (constant_dwords) {
             r.fragmentConstantBytes = (size_t)constant_dwords * sizeof(uint32_t);
             r.fragmentConstants = [r.device newBufferWithLength:r.fragmentConstantBytes options:MTLResourceStorageModeShared];
@@ -173,6 +204,113 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         r.height = height;
 #undef FAIL
         return (__bridge_retained void *)r;
+    }
+}
+
+static bool depthTransfer(id<MTLCommandQueue> queue, id<MTLTexture> texture, id<MTLBuffer> buffer,
+                          size_t stride, uint8_t *pixels, size_t pitch, bool upload,
+                          char *error, size_t error_len) {
+    size_t row = texture.width * sizeof(float);
+    if (upload) for (NSUInteger y = 0; y < texture.height; ++y)
+        memcpy((uint8_t *)buffer.contents + y * stride, pixels + y * pitch, row);
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (!command || !blit) return fail(error, error_len, @"depth transfer command failed");
+    MTLSize size = MTLSizeMake(texture.width, texture.height, 1);
+    if (upload)
+        [blit copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:stride
+         sourceBytesPerImage:stride * texture.height sourceSize:size toTexture:texture
+         destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    else
+        [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+         sourceSize:size toBuffer:buffer destinationOffset:0 destinationBytesPerRow:stride
+         destinationBytesPerImage:stride * texture.height];
+    [blit endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status != MTLCommandBufferStatusCompleted)
+        return fail(error, error_len, command.error.localizedDescription ?: @"depth transfer failed");
+    if (!upload) for (NSUInteger y = 0; y < texture.height; ++y)
+        memcpy(pixels + y * pitch, (const uint8_t *)buffer.contents + y * stride, row);
+    return true;
+}
+
+bool victory_metal_depth_pixels(void *handle, float *pixels, bool upload, char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+        if (!r.depthTexture) return fail(error, error_len, @"depth attachment is not enabled");
+        return depthTransfer(r.queue, r.depthTexture, r.readback, r.stride, (uint8_t *)pixels,
+                             (size_t)r.width * sizeof(float), upload, error, error_len);
+    }
+}
+
+bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, uint8_t *pixels,
+                               float value, const uint32_t (*rects)[4], size_t count,
+                               char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        static id<MTLDevice> device;
+        static id<MTLCommandQueue> queue;
+        static id<MTLRenderPipelineState> pipeline;
+        static id<MTLDepthStencilState> state;
+        static NSString *setupError;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            device = MTLCreateSystemDefaultDevice();
+            if (!device) { setupError = @"no Metal device"; return; }
+            NSError *e = nil;
+            NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                "vertex float4 depth_vertex(uint i [[vertex_id]], constant float &z [[buffer(0)]]) {"
+                " float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)};"
+                " return float4(p[i], z, 1); }";
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&e];
+            MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
+            desc.vertexFunction = [library newFunctionWithName:@"depth_vertex"];
+            desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+            if (desc.vertexFunction) pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&e];
+            MTLDepthStencilDescriptor *depth = [MTLDepthStencilDescriptor new];
+            depth.depthCompareFunction = MTLCompareFunctionAlways;
+            depth.depthWriteEnabled = YES;
+            state = [device newDepthStencilStateWithDescriptor:depth];
+            queue = [device newCommandQueue];
+            if (!pipeline || !state || !queue) setupError = e.localizedDescription ?: @"depth clear pipeline creation failed";
+        });
+        if (setupError) return fail(error, error_len, setupError);
+        size_t row = (size_t)width * 4;
+        if (row > SIZE_MAX - 255) return fail(error, error_len, @"depth dimensions overflow");
+        size_t stride = (row + 255) & ~(size_t)255;
+        if (stride > SIZE_MAX / height) return fail(error, error_len, @"depth dimensions overflow");
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModePrivate;
+        desc.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+        id<MTLBuffer> buffer = [device newBufferWithLength:stride * height options:MTLResourceStorageModeShared];
+        if (!texture || !buffer) return fail(error, error_len, @"depth clear allocation failed");
+        if (!depthTransfer(queue, texture, buffer, stride, pixels, pitch, true, error, error_len)) return false;
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.depthAttachment.texture = texture;
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+        if (!command || !encoder) return fail(error, error_len, @"depth clear command failed");
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setDepthStencilState:state];
+        [encoder setVertexBytes:&value length:sizeof(value) atIndex:0];
+        const uint32_t full[4] = {0, 0, width, height};
+        for (size_t i = 0; i < (count ? count : 1); ++i) {
+            const uint32_t *r = count ? rects[i] : full;
+            if (r[0] == r[2] || r[1] == r[3]) continue;
+            [encoder setScissorRect:(MTLScissorRect){r[0], r[1], r[2] - r[0], r[3] - r[1]}];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return fail(error, error_len, command.error.localizedDescription ?: @"depth clear failed");
+        return depthTransfer(queue, texture, buffer, stride, pixels, pitch, false, error, error_len);
     }
 }
 
@@ -263,6 +401,11 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
         pass.colorAttachments[0].loadAction = preserve ? MTLLoadActionLoad : MTLLoadActionClear;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (r.depthTexture) {
+            pass.depthAttachment.texture = r.depthTexture;
+            pass.depthAttachment.loadAction = MTLLoadActionLoad;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+        }
         id<MTLRenderCommandEncoder> render = [command renderCommandEncoderWithDescriptor:pass];
         if (!command || !render) return fail(error, error_len, @"render command creation failed");
         bool rasterize = scissor[2] != 0 && scissor[3] != 0;
@@ -275,6 +418,7 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
         }
         [render setRenderPipelineState:r.pipeline];
         [render setVertexBuffer:r.vertices offset:0 atIndex:6];
+        if (r.depthState) [render setDepthStencilState:r.depthState];
         if (r.fragmentConstants) {
             [render setFragmentBuffer:r.fragmentArguments offset:0 atIndex:2];
             [render useResource:r.fragmentConstants usage:MTLResourceUsageRead stages:MTLRenderStageFragment];

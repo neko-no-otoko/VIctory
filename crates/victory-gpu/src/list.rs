@@ -909,7 +909,19 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
-    reject_metal!(this, "depth clear is unsupported on Metal");
+    #[cfg(target_os = "macos")]
+    {
+        if count != 0 && rects.is_null() {
+            return with_metal(this, |s| s.reject("null depth-clear rectangles"));
+        }
+        let rects = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller supplies count RECTs, matching Scissor's C layout.
+            unsafe { std::slice::from_raw_parts(rects.cast::<crate::metal::Scissor>(), count as usize) }
+        };
+        with_metal(this, |s| s.clear_depth(handle, flags, depth, rects));
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1431,11 +1443,11 @@ mod state {
         _one_range: i32,
         depth: *const u64,
     ) {
-        if count != 1 || handles.is_null() || !depth.is_null() {
-            return with_metal(this, |s| s.reject("expected one color target and no depth"));
+        if count != 1 || handles.is_null() {
+            return with_metal(this, |s| s.reject("expected one color target"));
         }
-        // SAFETY: caller supplies one handle.
-        with_metal(this, |s| s.set_target(unsafe { *handles }));
+        // SAFETY: the caller supplies one color handle and an optional depth handle.
+        with_metal(this, |s| s.set_target(unsafe { *handles }, unsafe { depth.as_ref().copied() }));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -1831,6 +1843,9 @@ mod native {
     extern "win64" fn clear_rtv_native(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
         clear_rtv(this, handle, color, count, rects)
     }
+    extern "win64" fn clear_dsv_native(this: This, handle: u64, flags: u32, depth: f32, stencil: u8, count: u32, rects: *const Rect) {
+        clear_dsv(this, handle, flags, depth, stencil, count, rects)
+    }
     extern "win64" fn graphics_table_native(this: This, slot: u32, handle: u64) {
         state::graphics_table(this, slot, handle)
     }
@@ -1915,6 +1930,7 @@ mod native {
         f[47] = index_native as *const ();
         f[48] = vertices_native as *const ();
         f[50] = targets_native as *const ();
+        f[51] = clear_dsv_native as *const ();
         f[52] = clear_rtv_native as *const ();
         f[if newer { newer_slot(78) } else { 78 }] = dispatch_x_native as *const ();
         f[if newer { newer_slot(83) } else { 83 }] = copy_texture_x_native as *const ();

@@ -168,7 +168,7 @@ struct Pipeline {
     #[cfg(windows)]
     host: Arc<make::Pending>,
     #[cfg(target_os = "macos")]
-    graphics: Result<(), String>,
+    graphics: Result<Option<victory_metal::DepthState>, String>,
     #[cfg(target_os = "macos")]
     metal_graphics: OnceLock<Result<Arc<Mutex<crate::metal_graphics::Prepared>>, String>>,
 }
@@ -233,7 +233,7 @@ pub(crate) fn metal_graphics(
         return Err("no graphics pipeline bound".into());
     }
     let p = pipeline(this);
-    p.graphics.as_ref().map_err(Clone::clone)?;
+    let depth = *p.graphics.as_ref().map_err(Clone::clone)?;
     if p.shaders.len() != 2 {
         return Err("expected exactly vertex and pixel shaders".into());
     }
@@ -249,7 +249,7 @@ pub(crate) fn metal_graphics(
         .ok_or("missing pixel shader")?;
     p.metal_graphics
         .get_or_init(|| {
-            crate::metal_graphics::Prepared::new(&vertex.container, &pixel.container)
+            crate::metal_graphics::Prepared::new(&vertex.container, &pixel.container, depth)
                 .map(|prepared| Arc::new(Mutex::new(prepared)))
         })
         .clone()
@@ -369,7 +369,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
-    #[cfg(target_os = "macos")] graphics: Result<(), String>,
+    #[cfg(target_os = "macos")] graphics: Result<Option<victory_metal::DepthState>, String>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {

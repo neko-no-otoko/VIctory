@@ -212,6 +212,15 @@ impl RtvRecord {
         self.described == 0 || self.desc == [28, 4, 0, 0, 0, 0]
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_depth32(&self) -> bool {
+        self.described == 0
+            || (self.desc[0] == 40
+                && self.desc[1] == 3
+                && self.desc[2] == 0
+                && self.desc[3] == 0)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

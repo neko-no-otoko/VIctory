@@ -36,6 +36,8 @@ unsafe extern "C" {
         height: u32,
         fragment_constant_dwords: u32,
         fragment_texture: bool,
+        depth_compare: u32,
+        depth_write: bool,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
@@ -86,6 +88,11 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
+    fn victory_metal_depth_pixels(renderer: *mut c_void, pixels: *mut f32, upload: bool,
+                                  error: *mut c_char, error_len: usize) -> bool;
+    fn victory_metal_clear_depth(width: u32, height: u32, pitch: usize, pixels: *mut u8,
+                                value: f32, rects: *const [u32; 4], count: usize,
+                                error: *mut c_char, error_len: usize) -> bool;
     fn victory_metal_destroy(renderer: *mut c_void);
 }
 
@@ -126,6 +133,31 @@ pub fn clear_rgba8(
     };
     if ok { Ok(()) } else { Err(native_error(&error)) }
 }
+/// Clear a Depth32Float image on the GPU, preserving pixels outside the rectangles and padding.
+pub fn clear_depth32(width: u32, height: u32, pitch: usize, pixels: &mut [u8],
+                     value: f32, rects: &[[u32; 4]]) -> Result<(), RenderError> {
+    let row = (width as usize).checked_mul(4);
+    let len = height.checked_sub(1).and_then(|h| pitch.checked_mul(h as usize))
+        .and_then(|n| row.and_then(|r| n.checked_add(r)));
+    if width == 0 || height == 0 || row.is_none_or(|r| pitch < r)
+        || len.is_none_or(|n| pixels.len() < n) || !value.is_finite() || !(0.0..=1.0).contains(&value)
+        || rects.iter().any(|r| r[0] > r[2] || r[1] > r[3] || r[2] > width || r[3] > height)
+    {
+        return Err(RenderError("invalid depth clear dimensions, value or rectangle".into()));
+    }
+    let mut error = [0 as c_char; 1024];
+    // SAFETY: validated buffers remain live for the synchronous operation.
+    let ok = unsafe { victory_metal_clear_depth(width, height, pitch, pixels.as_mut_ptr(), value,
+                                                rects.as_ptr(), rects.len(), error.as_mut_ptr(), error.len()) };
+    if ok { Ok(()) } else { Err(native_error(&error)) }
+}
+
+/// D3D12 depth comparison (1 through 8) and depth-write enable.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthState {
+    pub write: bool,
+    pub compare: u32,
+}
 
 
 /// A persistent Metal pipeline and RGBA8Unorm offscreen target.
@@ -142,6 +174,7 @@ pub struct Renderer {
     fragment_constant_dwords: usize,
     fragment_texture: bool,
     texture_bound: bool,
+    depth_enabled: bool,
     width: u32,
     height: u32,
     viewport: [f64; 6],
@@ -171,6 +204,27 @@ impl Renderer {
         height: u32,
         fragment_constant_dwords: u32,
         fragment_texture: bool,
+    ) -> Result<Self, RenderError> {
+        Self::new_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                        width, height, fragment_constant_dwords, fragment_texture, None)
+    }
+
+    pub fn new_depth(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, state: DepthState,
+    ) -> Result<Self, RenderError> {
+        if !(1..=8).contains(&state.compare) {
+            return Err(RenderError("invalid depth comparison".into()));
+        }
+        Self::new_inner(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
+                        width, height, fragment_constant_dwords, fragment_texture, Some(state))
+    }
+
+    fn new_inner(
+        vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
+        fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
+        fragment_texture: bool, depth: Option<DepthState>,
     ) -> Result<Self, RenderError> {
         if width == 0 || height == 0 || vertex_metallib.is_empty() || fragment_metallib.is_empty() {
             return Err(RenderError(
@@ -205,6 +259,8 @@ impl Renderer {
                 height,
                 fragment_constant_dwords,
                 fragment_texture,
+                depth.map_or(0, |s| s.compare),
+                depth.is_some_and(|s| s.write),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -216,11 +272,36 @@ impl Renderer {
             fragment_constant_dwords: fragment_constant_dwords as usize,
             fragment_texture,
             texture_bound: false,
+            depth_enabled: depth.is_some(),
             width,
             height,
             viewport: [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
             scissor: [0, 0, width, height],
         })
+    }
+
+    /// Upload tightly packed depth values to the persistent attachment.
+    pub fn set_depth_pixels(&mut self, pixels: &[f32]) -> Result<(), RenderError> {
+        if !self.depth_enabled || pixels.len() != self.pixel_len / 4 {
+            return Err(RenderError("expected an enabled depth attachment and exact-sized pixels".into()));
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: native upload only reads the exact-sized slice synchronously.
+        let ok = unsafe { victory_metal_depth_pixels(self.handle.as_ptr(), pixels.as_ptr().cast_mut(), true,
+                                                     error.as_mut_ptr(), error.len()) };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
+    /// Download the persistent depth attachment into tightly packed pixels.
+    pub fn read_depth_pixels(&mut self, pixels: &mut [f32]) -> Result<(), RenderError> {
+        if !self.depth_enabled || pixels.len() != self.pixel_len / 4 {
+            return Err(RenderError("expected an enabled depth attachment and exact-sized pixels".into()));
+        }
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: native download writes exactly the checked slice synchronously.
+        let ok = unsafe { victory_metal_depth_pixels(self.handle.as_ptr(), pixels.as_mut_ptr(), false,
+                                                     error.as_mut_ptr(), error.len()) };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
     /// Set the viewport and target-clipped scissor used by subsequent draws.

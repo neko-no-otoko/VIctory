@@ -919,23 +919,28 @@ pub(crate) fn metal_buffer_allows_uav(this: This) -> bool {
 /// Only linear single-sample RGBA8 targets have a defined CPU-visible layout.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_linear_texture(this, 1)
+    metal_linear_texture(this, 28, 1)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_depth_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
+    metal_linear_texture(this, 40, 2)
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_sampled_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
-    metal_linear_texture(this, 0)
+    metal_linear_texture(this, 28, 0)
 }
 
 #[cfg(target_os = "macos")]
-fn metal_linear_texture(this: This, flags: u32) -> Option<(*mut u8, u32, u32, usize)> {
+fn metal_linear_texture(this: This, format: u32, flags: u32) -> Option<(*mut u8, u32, u32, usize)> {
     if this.is_null() {
         return None;
     }
     let r = resource(this);
     let d = r.desc;
     if d.dimension != 3
-        || d.format != 28
+        || d.format != format
         || d.width == 0
         || d.height == 0
         || d.depth_or_array_size != 1
@@ -959,7 +964,10 @@ pub(crate) fn metal_texture_state<T>(
     this: This,
     f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T,
 ) -> Option<T> {
-    if metal_texture(this).is_none() && metal_sampled_texture(this).is_none() {
+    if metal_texture(this).is_none()
+        && metal_sampled_texture(this).is_none()
+        && metal_depth_texture(this).is_none()
+    {
         return None;
     }
     Some(f(&resource(this).state))
@@ -1124,6 +1132,30 @@ pub(crate) extern "system" fn create_committed(
     let Some(info) = footprint(&desc) else {
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
+    };
+    #[cfg(target_os = "macos")]
+    let info = if heap.kind == 1
+        && desc.dimension == 3
+        && desc.format == 40
+        && desc.width != 0
+        && desc.height != 0
+        && desc.depth_or_array_size == 1
+        && desc.mip_levels == 1
+        && desc.sample_count == 1
+        && desc.sample_quality == 0
+        && desc.layout == 1
+        && desc.flags == 2
+    {
+        let Some(size) = desc.width.checked_mul(4)
+            .and_then(|row| row.checked_next_multiple_of(256))
+            .and_then(|pitch| pitch.checked_mul(u64::from(desc.height)))
+            .and_then(|size| size.checked_next_multiple_of(info.alignment))
+        else {
+            return E_INVALIDARG;
+        };
+        AllocationInfo { size: info.size.max(size), ..info }
+    } else {
+        info
     };
     tracing::debug!(
         dimension = desc.dimension,

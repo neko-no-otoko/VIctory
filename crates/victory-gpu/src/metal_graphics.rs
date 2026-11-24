@@ -9,6 +9,7 @@ pub(crate) struct Prepared {
     pub(crate) dwords: usize,
     pub(crate) texture_slot: Option<u8>,
     pub(crate) sampler_slot: Option<u8>,
+    pub(crate) depth: Option<victory_metal::DepthState>,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
 }
 
@@ -17,7 +18,7 @@ pub(crate) struct Prepared {
 unsafe impl Send for Prepared {}
 
 impl Prepared {
-    pub(crate) fn new(vertex: &[u8], pixel: &[u8]) -> Result<Self, String> {
+    pub(crate) fn new(vertex: &[u8], pixel: &[u8], depth: Option<victory_metal::DepthState>) -> Result<Self, String> {
         let (vertex, _, _, _, _) = convert(vertex, HwStage::Vs)?;
         let (pixel, user_data, dwords, texture_slot, sampler_slot) = convert(pixel, HwStage::Ps)?;
         Ok(Self {
@@ -27,6 +28,7 @@ impl Prepared {
             dwords,
             texture_slot,
             sampler_slot,
+            depth,
             renderer: None,
         })
     }
@@ -39,6 +41,7 @@ impl Prepared {
         indices: Option<(victory_metal::IndexData<'_>, i32)>,
         viewport: [f64; 6],
         scissor: [u32; 4],
+        mut depth: Option<&mut [f32]>,
         constants: &[u32],
         texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter)>,
         pixels: &mut [u8],
@@ -46,22 +49,28 @@ impl Prepared {
         if texture.is_some() != self.texture_slot.is_some() {
             return Err("texture binding does not match pixel shader".into());
         }
+        if depth.is_some() != self.depth.is_some() {
+            return Err("depth attachment does not match pipeline".into());
+        }
         if !matches!(&self.renderer, Some((w, h, _)) if *w == width && *h == height) {
-            let renderer = victory_metal::Renderer::new(
-                &self.vertex,
-                "main",
-                &self.pixel,
-                "main",
-                width,
-                height,
-                self.dwords as u32,
-                self.texture_slot.is_some(),
-            )
-            .map_err(|e| e.to_string())?;
+            let renderer = if let Some(state) = self.depth {
+                victory_metal::Renderer::new_depth(
+                    &self.vertex, "main", &self.pixel, "main", width, height,
+                    self.dwords as u32, self.texture_slot.is_some(), state,
+                )
+            } else {
+                victory_metal::Renderer::new(
+                    &self.vertex, "main", &self.pixel, "main", width, height,
+                    self.dwords as u32, self.texture_slot.is_some(),
+                )
+            }.map_err(|e| e.to_string())?;
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
         renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
+        if let Some(pixels) = depth.as_deref() {
+            renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
+        }
         if let Some((width, height, texels, filter)) = texture {
             renderer
                 .set_fragment_texture(width, height, texels, filter)
@@ -70,7 +79,11 @@ impl Prepared {
         match indices {
             Some((indices, base)) => renderer.draw_indexed_preserving(vertices, indices, base, constants, pixels),
             None => renderer.draw_preserving(vertices, constants, pixels),
-        }.map_err(|e| e.to_string())
+        }.map_err(|e| e.to_string())?;
+        if let Some(pixels) = depth.as_deref_mut() {
+            renderer.read_depth_pixels(pixels).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -404,6 +417,8 @@ fn convert(
 pub(crate) struct StreamState {
     seen: u32,
     error: Option<String>,
+    depth: Option<victory_metal::DepthState>,
+    depth_format: u32,
 }
 
 impl StreamState {
@@ -439,13 +454,21 @@ impl StreamState {
                     && get(40) == 0
                     && get(44) == 0
             }
-            // Depth and stencil disabled; other fields are inactive.
-            11 => get(4) == 0 && get(16) == 0,
+            // Depth enable, write mask and comparison; stencil is unsupported.
+            11 => {
+                let (enabled, write, compare, stencil) = (get(4), get(8), get(12), get(16));
+                if enabled == 1 && write <= 1 && (1..=8).contains(&compare) && stencil == 0 {
+                    self.depth = Some(victory_metal::DepthState { write: write == 1, compare });
+                    true
+                } else {
+                    enabled == 0 && stencil == 0
+                }
+            }
             12 => unsafe { input_layout(data) },
             13 => get(4) == 0,
             14 => get(4) == 3,
             15 => get(4) == 28 && (1..8).all(|i| get(4 + i * 4) == 0) && get(36) == 1,
-            16 => get(4) == 0,
+            16 => { self.depth_format = get(4); matches!(self.depth_format, 0 | 40) },
             17 => get(4) == 1 && get(8) == 0,
             9 => get(4) == u32::MAX,
             _ => false,
@@ -455,7 +478,7 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<(), String> {
+    pub(crate) fn finish(self) -> Result<Option<victory_metal::DepthState>, String> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -465,7 +488,12 @@ impl StreamState {
         if self.seen & required != required {
             return Err("graphics stream lacks required shader, rasterizer, depth, input, topology or target state".into());
         }
-        Ok(())
+        if (self.depth.is_some() && self.depth_format != 40)
+            || (self.depth.is_none() && self.depth_format != 0)
+        {
+            return Err("depth format does not match depth state".into());
+        }
+        Ok(self.depth)
     }
 }
 

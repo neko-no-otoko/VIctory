@@ -100,7 +100,7 @@ fn synthetic_textured_graphics_through_native_cli() {
     let output = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("texture.exe")).arg("--execute").output().unwrap();
     assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    let trap = source.replace("    D3D12_VERTEX_BUFFER_VIEW view=", "    ((void (*)(void))(*(void ***)dev)[21])();\n    D3D12_VERTEX_BUFFER_VIEW view=");
+    let trap = source.replace("    D3D12_VERTEX_BUFFER_VIEW view=", "    ((void (*)(void))(*(void ***)dev)[17])();\n    D3D12_VERTEX_BUFFER_VIEW view=");
     std::fs::write(root.join("trap.c"), trap).unwrap();
     tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "trap.c", "-o", "trap.obj"]);
     tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:trap.exe", "trap.obj", "d3d.lib"]);

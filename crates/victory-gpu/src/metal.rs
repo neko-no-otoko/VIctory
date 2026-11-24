@@ -132,6 +132,7 @@ const COMMON: u32 = 0;
 const VERTEX_BUFFER: u32 = 1;
 const INDEX_BUFFER: u32 = 2;
 const RENDER_TARGET: u32 = 4;
+const DEPTH_WRITE: u32 = 0x10;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const UAV: u32 = 0x8;
 const COPY_DEST: u32 = 0x400;
@@ -157,7 +158,7 @@ fn supports_state(texture: bool, state: u32) -> bool {
     if texture {
         matches!(
             state,
-            COMMON | RENDER_TARGET | COPY_SOURCE | PIXEL_SHADER_RESOURCE
+            COMMON | RENDER_TARGET | DEPTH_WRITE | COPY_SOURCE | PIXEL_SHADER_RESOURCE
         )
     } else {
         matches!(
@@ -314,12 +315,18 @@ enum Command {
         color: [u8; 4],
         rects: Vec<[u32; 4]>,
     },
+    ClearDepth {
+        target: ResourceRef,
+        depth: f32,
+        rects: Vec<[u32; 4]>,
+    },
     Draw {
         pipeline: Arc<Mutex<crate::metal_graphics::Prepared>>,
         vertex: ResourceRef,
         vertex_offset: u64,
         vertices: u32,
         target: ResourceRef,
+        depth: Option<ResourceRef>,
         indexed: Option<IndexedDraw>,
         sampled: Option<Sampled>,
         constants: Vec<u32>,
@@ -364,11 +371,13 @@ pub(crate) struct State {
     vertex: Option<VertexBuffer>,
     index: Option<IndexBuffer>,
     target: Option<ResourceRef>,
+    depth_target: Option<ResourceRef>,
     viewport: Option<Viewport>,
     scissor: Option<Scissor>,
     triangle_list: bool,
     scratch: Vec<u8>,
     texture_scratch: Vec<u8>,
+    depth_scratch: Vec<f32>,
     heap: Option<Arc<HeapRef>>,
     sampler_heap: Option<Arc<HeapRef>>,
     roots: Vec<Root>,
@@ -438,7 +447,9 @@ impl State {
             && ((before == RENDER_TARGET || after == RENDER_TARGET)
                 && crate::resource::metal_texture(resource).is_none()
                 || (before == PIXEL_SHADER_RESOURCE || after == PIXEL_SHADER_RESOURCE)
-                    && crate::resource::metal_sampled_texture(resource).is_none())
+                    && crate::resource::metal_sampled_texture(resource).is_none()
+                || (before == DEPTH_WRITE || after == DEPTH_WRITE)
+                    && crate::resource::metal_depth_texture(resource).is_none())
         {
             self.reject("texture usage does not match its creation flags");
             return;
@@ -567,7 +578,7 @@ impl State {
             element_size,
         });
     }
-    pub(crate) fn set_target(&mut self, handle: u64) {
+    pub(crate) fn set_target(&mut self, handle: u64, depth_handle: Option<u64>) {
         if !self.open() {
             return;
         }
@@ -579,7 +590,19 @@ impl State {
             self.reject("expected a linear RGBA8 render target");
             return;
         }
+        let depth = if let Some(handle) = depth_handle {
+            let Some(dsv) = descriptor::dsv_record(handle) else {
+                return self.reject("invalid depth descriptor");
+            };
+            if !dsv.metal_depth32() || crate::resource::metal_depth_texture(dsv.resource).is_none() {
+                return self.reject("expected a D32_FLOAT depth target");
+            }
+            Some(ResourceRef::new(dsv.resource))
+        } else {
+            None
+        };
         self.target = Some(ResourceRef::new(rtv.resource));
+        self.depth_target = depth;
     }
     pub(crate) fn clear_target(&mut self, handle: u64, color: [f32; 4], rects: &[Scissor]) {
         if !self.open() {
@@ -626,6 +649,33 @@ impl State {
             color,
             rects,
         });
+        Ok(())
+    }
+    pub(crate) fn clear_depth(&mut self, handle: u64, flags: u32, depth: f32, rects: &[Scissor]) {
+        if !self.open() {
+            return;
+        }
+        if let Err(error) = self.record_clear_depth(handle, flags, depth, rects) {
+            self.reject(&error);
+        }
+    }
+    fn record_clear_depth(&mut self, handle: u64, flags: u32, depth: f32, rects: &[Scissor]) -> Result<(), String> {
+        if flags != 1 || !depth.is_finite() || !(0.0..=1.0).contains(&depth) {
+            return Err("only finite depth-only clears in [0,1] are supported".into());
+        }
+        let dsv = descriptor::dsv_record(handle).ok_or("invalid depth descriptor")?;
+        let (_, width, height, _) = crate::resource::metal_depth_texture(dsv.resource)
+            .filter(|_| dsv.metal_depth32()).ok_or("expected a D32_FLOAT depth target")?;
+        if rects.iter().any(|r| r.left > r.right || r.top > r.bottom) {
+            return Err("invalid depth clear rectangle".into());
+        }
+        let clip = |v: i32, limit: u32| (v.max(0) as u32).min(limit);
+        let rects = rects.iter().map(|r| [
+            clip(r.left, width), clip(r.top, height),
+            clip(r.right, width), clip(r.bottom, height),
+        ]).collect();
+        self.use_state(dsv.resource, DEPTH_WRITE)?;
+        self.commands.push(Command::ClearDepth { target: ResourceRef::new(dsv.resource), depth, rects });
         Ok(())
     }
     pub(crate) fn draw(&mut self, count: u32, instances: u32, first: u32, first_instance: u32) {
@@ -700,6 +750,18 @@ impl State {
             f64::from(viewport.min), f64::from(viewport.max),
         ];
         let prepared = pipeline.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bound) = &self.depth_target {
+            let (_, dw, dh, _) = crate::resource::metal_depth_texture(bound.ptr())
+                .ok_or("invalid depth target")?;
+            if (dw, dh) != (width, height) {
+                return Err("depth and color target sizes differ".into());
+            }
+        }
+        let depth = if prepared.depth.is_some() {
+            Some(ResourceRef::new(self.depth_target.as_ref().ok_or("missing depth target")?.ptr()))
+        } else {
+            None
+        };
         if self.graphics_roots.iter().enumerate().any(|(index, root)| {
             !matches!(root, Root::None)
                 && !prepared
@@ -780,6 +842,9 @@ impl State {
             self.use_state(indexed.resource.ptr(), INDEX_BUFFER)?;
         }
         self.use_state(target.ptr(), RENDER_TARGET)?;
+        if let Some(depth) = &depth {
+            self.use_state(depth.ptr(), DEPTH_WRITE)?;
+        }
         if let Some(sampled) = &sampled {
             self.use_state(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
         }
@@ -793,6 +858,7 @@ impl State {
             sampled,
             viewport,
             scissor,
+            depth,
             target,
         });
         Ok(())
@@ -1058,6 +1124,18 @@ impl State {
                     victory_metal::clear_rgba8(width, height, pitch, pixels, *color, rects)
                         .map_err(|e| e.to_string())?;
                 }
+                Command::ClearDepth { target, depth, rects } => {
+                    submission.access(target.ptr(), DEPTH_WRITE)?;
+                    let (texture, width, height, pitch) =
+                        crate::resource::metal_depth_texture(target.ptr()).ok_or("invalid depth target")?;
+                    let row = (width as usize).checked_mul(4).ok_or("depth row overflow")?;
+                    let len = (height as usize - 1).checked_mul(pitch)
+                        .and_then(|n| n.checked_add(row)).ok_or("depth size overflow")?;
+                    // SAFETY: retained depth allocation includes each validated padded row.
+                    let pixels = unsafe { std::slice::from_raw_parts_mut(texture, len) };
+                    victory_metal::clear_depth32(width, height, pitch, pixels, *depth, rects)
+                        .map_err(|e| e.to_string())?;
+                }
                 Command::Draw {
                     pipeline,
                     vertex,
@@ -1068,6 +1146,7 @@ impl State {
                     sampled,
                     viewport,
                     scissor,
+                    depth,
                     target,
                 } => {
                     submission.access(vertex.ptr(), VERTEX_BUFFER)?;
@@ -1165,6 +1244,24 @@ impl State {
                     } else {
                         None
                     };
+                    let depth_layout = if let Some(depth) = depth {
+                        submission.access(depth.ptr(), DEPTH_WRITE)?;
+                        let (data, dw, dh, depth_pitch) = crate::resource::metal_depth_texture(depth.ptr())
+                            .ok_or("invalid depth target")?;
+                        if (dw, dh) != (width, height) {
+                            return Err("depth and color target sizes differ".into());
+                        }
+                        self.depth_scratch.resize(len / 4, 0.0);
+                        for y in 0..height as usize {
+                            // SAFETY: both the retained padded texture and tight staging buffer contain this row.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(data.add(y * depth_pitch), self.depth_scratch.as_mut_ptr().cast::<u8>().add(y * row), row);
+                            }
+                        }
+                        Some((data, depth_pitch))
+                    } else {
+                        None
+                    };
                     pipeline.lock().unwrap_or_else(|e| e.into_inner()).draw(
                         width,
                         height,
@@ -1172,10 +1269,19 @@ impl State {
                         indices,
                         *viewport,
                         *scissor,
+                        depth_layout.map(|_| self.depth_scratch.as_mut_slice()),
                         constants,
                         binding,
                         &mut self.scratch,
                     )?;
+                    if let Some((data, depth_pitch)) = depth_layout {
+                        for y in 0..height as usize {
+                            // SAFETY: same checked depth and staging row ranges as above.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(self.depth_scratch.as_ptr().cast::<u8>().add(y * row), data.add(y * depth_pitch), row);
+                            }
+                        }
+                    }
                     for y in 0..height as usize {
                         // SAFETY: same checked texture and staging ranges as above.
                         unsafe {

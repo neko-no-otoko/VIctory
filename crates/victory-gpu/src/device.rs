@@ -455,6 +455,9 @@ mod native {
     extern "win64" fn rtv(this: This, resource: This, desc: *const [u32; 6], handle: u64) {
         descriptor::create_rtv(this, resource, desc, handle)
     }
+    extern "win64" fn dsv(this: This, resource: This, desc: *const [u32; 6], handle: u64) {
+        descriptor::create_dsv(this, resource, desc, handle)
+    }
     extern "win64" fn stream(this: This, desc: *const c_void, iid: *const Iid, out: *mut This) -> HRESULT {
         pipeline::create_stream(this, desc.cast(), iid, out)
     }
@@ -478,6 +481,7 @@ mod native {
         f[18] = srv as *const ();
         f[19] = uav as *const ();
         f[20] = rtv as *const ();
+        f[21] = dsv as *const ();
         f[22] = sampler as *const ();
         f[27] = committed as *const ();
         f[36] = fence as *const ();

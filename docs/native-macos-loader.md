@@ -102,13 +102,22 @@ indexed and nonindexed triangles, including target-edge clipping and empty
 scissors. One finite, positive-size viewport within D3D12's -32768..32767
 coordinate bounds and an ordered depth range in [0, 1] are accepted. Scissors
 are clipped to the target; inverted rectangles are rejected. This path still
-supports only one viewport and scissor and has no depth attachment.
+supports only one viewport and scissor.
+Depth support is restricted to one committed, linear single-sample D32_FLOAT
+depth attachment, with a default or D32_FLOAT 2D depth view and DEPTH_WRITE
+resource state. The pipeline supports depth test enabled with write mask zero
+or all and the eight D3D comparison functions. Stencil, read-only depth views,
+other depth formats, and DEPTH_READ are rejected. Depth-only clears accept
+finite values in [0, 1], including clipped rectangles. The synthetic depth
+fixture checks all comparisons, write masking, overlapping indexed and
+nonindexed draws, clears, retained resources, and color and mapped-depth values.
 With the same prerequisites, run:
 
 ```sh
 cargo test -p victory --target x86_64-apple-darwin --test native_graphics -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_indexed -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_viewport -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_depth -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the
