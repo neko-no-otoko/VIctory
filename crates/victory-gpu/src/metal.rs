@@ -131,6 +131,7 @@ impl Drop for HeapRef {
 const COMMON: u32 = 0;
 const VERTEX_BUFFER: u32 = 1;
 const RENDER_TARGET: u32 = 4;
+const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const UAV: u32 = 0x8;
 const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
@@ -153,7 +154,10 @@ fn store_state(resource: This, texture: bool, state: u32) {
 }
 fn supports_state(texture: bool, state: u32) -> bool {
     if texture {
-        matches!(state, COMMON | RENDER_TARGET | COPY_SOURCE)
+        matches!(
+            state,
+            COMMON | RENDER_TARGET | COPY_SOURCE | PIXEL_SHADER_RESOURCE
+        )
     } else {
         matches!(
             state,
@@ -162,7 +166,7 @@ fn supports_state(texture: bool, state: u32) -> bool {
     }
 }
 fn can_promote(texture: bool, state: u32) -> bool {
-    !texture || matches!(state, COMMON | COPY_SOURCE)
+    !texture || matches!(state, COMMON | COPY_SOURCE | PIXEL_SHADER_RESOURCE)
 }
 struct Touched {
     resource: ResourceRef,
@@ -182,7 +186,8 @@ impl Submission {
                 "resource state {current:#x} does not permit {required:#x}"
             ));
         }
-        let decay = !texture || (current == COMMON && required == COPY_SOURCE);
+        let decay = !texture
+            || (current == COMMON && matches!(required, COPY_SOURCE | PIXEL_SHADER_RESOURCE));
         self.touched
             .entry(resource as usize)
             .or_insert_with(|| Touched {
@@ -258,6 +263,17 @@ struct VertexBuffer {
     size: u32,
 }
 
+struct Sampled {
+    _view_heap: Arc<HeapRef>,
+    _sampler_heap: Arc<HeapRef>,
+    view_handle: u64,
+    sampler_handle: u64,
+    view: View,
+    sampler: View,
+    texture: ResourceRef,
+    filter: victory_metal::TextureFilter,
+}
+
 #[derive(Default)]
 enum Root {
     #[default]
@@ -272,6 +288,7 @@ enum Command {
         vertex_offset: u64,
         vertices: u32,
         target: ResourceRef,
+        sampled: Option<Sampled>,
         constants: Vec<u32>,
     },
     ReadTexture {
@@ -315,7 +332,9 @@ pub(crate) struct State {
     scissor: Option<Scissor>,
     triangle_list: bool,
     scratch: Vec<u8>,
+    texture_scratch: Vec<u8>,
     heap: Option<Arc<HeapRef>>,
+    sampler_heap: Option<Arc<HeapRef>>,
     roots: Vec<Root>,
     graphics_roots: Vec<Root>,
     local_states: HashMap<usize, u32>,
@@ -375,6 +394,15 @@ impl State {
         }
         if (before == UAV || after == UAV) && !crate::resource::metal_buffer_allows_uav(resource) {
             self.reject("buffer was not created for unordered access");
+            return;
+        }
+        if texture
+            && ((before == RENDER_TARGET || after == RENDER_TARGET)
+                && crate::resource::metal_texture(resource).is_none()
+                || (before == PIXEL_SHADER_RESOURCE || after == PIXEL_SHADER_RESOURCE)
+                    && crate::resource::metal_sampled_texture(resource).is_none())
+        {
+            self.reject("texture usage does not match its creation flags");
             return;
         }
         if self
@@ -537,35 +565,93 @@ impl State {
             return Err("viewport and scissor must cover the entire render target".into());
         }
         let prepared = pipeline.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = prepared.user_data.first().map(|u| usize::from(u.slot));
-        if self
-            .graphics_roots
-            .iter()
-            .enumerate()
-            .any(|(index, root)| !matches!(root, Root::None) && Some(index) != slot)
-        {
+        if self.graphics_roots.iter().enumerate().any(|(index, root)| {
+            !matches!(root, Root::None)
+                && !prepared
+                    .user_data
+                    .iter()
+                    .any(|u| usize::from(u.slot) == index)
+        }) {
             return Err("unsupported graphics root parameter".into());
         }
         let mut constants = vec![0; prepared.dwords];
         for u in &prepared.user_data {
-            let Some(Root::Constants(words)) = self.graphics_roots.get(u.slot as usize) else {
-                return Err("missing graphics root constants".into());
+            constants[u.index as usize] = match (u.root, self.graphics_roots.get(u.slot as usize)) {
+                (RootType::Constants, Some(Root::Constants(words))) => words
+                    .get(u.dword as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or("missing graphics root constant dword")?,
+                (RootType::Table, Some(Root::Table(_))) => 0,
+                _ => return Err("missing or unsupported graphics root argument".into()),
             };
-            constants[u.index as usize] = words
-                .get(u.dword as usize)
-                .copied()
-                .flatten()
-                .ok_or("missing graphics root constant dword")?;
         }
+        let sampled = match (prepared.texture_slot, prepared.sampler_slot) {
+            (Some(texture_slot), Some(sampler_slot)) => {
+                let view_heap = self.heap.clone().ok_or("missing view heap")?;
+                let sampler_heap = self.sampler_heap.clone().ok_or("missing sampler heap")?;
+                let table = |slot: u8, heap: &HeapRef| -> Result<u64, String> {
+                    let Some(Root::Table(handle)) = self.graphics_roots.get(slot as usize) else {
+                        return Err("missing graphics descriptor table".into());
+                    };
+                    let heap = descriptor::heap(heap.ptr());
+                    if !heap.owns_memory() || *handle != heap.start {
+                        return Err(
+                            "only owned descriptor heaps at index zero are supported".into()
+                        );
+                    }
+                    Ok(*handle)
+                };
+                let view_handle = table(texture_slot, &view_heap)?;
+                let sampler_handle = table(sampler_slot, &sampler_heap)?;
+                let view = descriptor::view(view_handle).ok_or("missing SRV descriptor")?;
+                let sampler =
+                    descriptor::view(sampler_handle).ok_or("missing sampler descriptor")?;
+                let View::Shader(texture, None) = view else {
+                    return Err("expected a default texture SRV".into());
+                };
+                let View::Sampler(words) = sampler else {
+                    return Err("expected a standard sampler".into());
+                };
+                if words[1..] != [3, 3, 3, 0, 1, 8, 0, 0, 0, 0, 0, 0] {
+                    return Err("unsupported sampler settings".into());
+                }
+                let filter = match words[0] {
+                    0 => victory_metal::TextureFilter::Nearest,
+                    0x15 => victory_metal::TextureFilter::Linear,
+                    _ => return Err("unsupported sampler filter".into()),
+                };
+                let texture = texture as This;
+                if crate::resource::metal_sampled_texture(texture).is_none() {
+                    return Err("expected a linear single-mip RGBA8 texture".into());
+                }
+                Some(Sampled {
+                    _view_heap: view_heap,
+                    _sampler_heap: sampler_heap,
+                    view_handle,
+                    sampler_handle,
+                    view: View::Shader(texture as usize, None),
+                    sampler: View::Sampler(words),
+                    texture: ResourceRef::new(texture),
+                    filter,
+                })
+            }
+            (None, None) => None,
+            _ => return Err("incomplete texture/sampler binding".into()),
+        };
         drop(prepared);
         self.use_state(vertex.ptr(), VERTEX_BUFFER)?;
         self.use_state(target.ptr(), RENDER_TARGET)?;
+        if let Some(sampled) = &sampled {
+            self.use_state(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
+        }
         self.commands.push(Command::Draw {
             pipeline,
             vertex,
             vertex_offset,
             vertices: count,
             constants,
+            sampled,
             target,
         });
         Ok(())
@@ -620,14 +706,34 @@ impl State {
         if !self.open() {
             return;
         }
-        if heaps.len() != 1
-            || heaps[0].is_null()
-            || !descriptor::heap(heaps[0]).is_shader_visible_view_heap()
-        {
-            self.reject("expected one shader-visible view heap");
-            return;
+        let mut view = None;
+        let mut sampler = None;
+        for &heap in heaps {
+            if heap.is_null() {
+                self.reject("null descriptor heap");
+                return;
+            }
+            let info = descriptor::heap(heap);
+            if info.is_shader_visible_view_heap() && view.is_none() {
+                view = Some(Arc::new(HeapRef::new(heap)));
+            } else if info.is_shader_visible_sampler_heap() && sampler.is_none() {
+                sampler = Some(Arc::new(HeapRef::new(heap)));
+            } else {
+                self.reject("unsupported or duplicate descriptor heap");
+                return;
+            }
         }
-        self.heap = Some(Arc::new(HeapRef::new(heaps[0])));
+        let changed = self.heap.as_ref().map(|h| h.ptr()) != view.as_ref().map(|h| h.ptr())
+            || self.sampler_heap.as_ref().map(|h| h.ptr()) != sampler.as_ref().map(|h| h.ptr());
+        if changed {
+            for root in self.roots.iter_mut().chain(self.graphics_roots.iter_mut()) {
+                if matches!(root, Root::Table(_)) {
+                    *root = Root::None;
+                }
+            }
+        }
+        self.heap = view;
+        self.sampler_heap = sampler;
     }
     pub(crate) fn set_table(&mut self, slot: u32, handle: u64) {
         if !self.open() {
@@ -641,6 +747,20 @@ impl State {
             self.roots.resize_with(slot as usize + 1, Root::default);
         }
         self.roots[slot as usize] = Root::Table(handle);
+    }
+    pub(crate) fn set_graphics_table(&mut self, slot: u32, handle: u64) {
+        if !self.open() {
+            return;
+        }
+        if slot >= 64 {
+            self.reject("graphics root slot out of range");
+            return;
+        }
+        if self.graphics_roots.len() <= slot as usize {
+            self.graphics_roots
+                .resize_with(slot as usize + 1, Root::default);
+        }
+        self.graphics_roots[slot as usize] = Root::Table(handle);
     }
     pub(crate) fn set_constants(&mut self, slot: u32, values: &[u32], offset: u32) {
         if !self.open() {
@@ -783,9 +903,47 @@ impl State {
                     vertex_offset,
                     vertices,
                     constants,
+                    sampled,
                     target,
                 } => {
                     submission.access(vertex.ptr(), VERTEX_BUFFER)?;
+                    let binding = if let Some(sampled) = sampled {
+                        if descriptor::view(sampled.view_handle).as_ref() != Some(&sampled.view)
+                            || descriptor::view(sampled.sampler_handle).as_ref()
+                                != Some(&sampled.sampler)
+                        {
+                            return Err("sampled descriptors changed after recording".into());
+                        }
+                        submission.access(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
+                        let (data, width, height, pitch) =
+                            crate::resource::metal_sampled_texture(sampled.texture.ptr())
+                                .ok_or("invalid sampled texture")?;
+                        let row = (width as usize)
+                            .checked_mul(4)
+                            .ok_or("sampled row overflow")?;
+                        let len = row
+                            .checked_mul(height as usize)
+                            .ok_or("sampled size overflow")?;
+                        self.texture_scratch.resize(len, 0);
+                        for y in 0..height as usize {
+                            // SAFETY: the retained texture's linear row layout was validated.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    data.add(y * pitch),
+                                    self.texture_scratch.as_mut_ptr().add(y * row),
+                                    row,
+                                )
+                            };
+                        }
+                        Some((
+                            width,
+                            height,
+                            self.texture_scratch.as_slice(),
+                            sampled.filter,
+                        ))
+                    } else {
+                        None
+                    };
                     submission.access(target.ptr(), RENDER_TARGET)?;
                     let (buffer, size) = crate::resource::buffer_bytes(vertex.ptr())
                         .ok_or("invalid vertex buffer")?;
@@ -827,6 +985,7 @@ impl State {
                         height,
                         verts,
                         constants,
+                        binding,
                         &mut self.scratch,
                     )?;
                     for y in 0..height as usize {

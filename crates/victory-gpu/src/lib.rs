@@ -40,6 +40,8 @@ mod metal_graphics;
 mod metal_graphics_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod metal_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod metal_texture_tests;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

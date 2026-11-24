@@ -140,18 +140,18 @@ batch-wide state tracking and decay, invalid transitions and queue failure.
 
 The same queue can execute a narrowly constrained offscreen draw: a validated
 graphics pipeline stream with a resource-free translated vertex shader and a
-translated pixel shader using at most one graphics root-constants parameter.
-The used dwords are snapshotted per draw and uploaded as a real fragment
-constant buffer at `b0, space0`; Apple's converter reflection must confirm
-the expected automatic layout. This is not support for arbitrary console root
-CBVs or constant-buffer descriptors. Draws use one float4 vertex buffer,
+translated pixel shader using at most one graphics root-constants parameter,
+one SRV table and one sampler table. Used root dwords are snapshotted per draw
+and uploaded as a real fragment constant buffer at `b0, space0`; Apple's
+converter reflection must confirm the expected automatic layout. This is not
+support for arbitrary console root CBVs or constant-buffer descriptors.
+Draws use one float4 vertex buffer,
 triangle-list topology, full-target viewport and scissor, and one committed
 linear single-sample RGBA8 render target. Whole-target readback to a buffer
 uses a 256-byte row-pitched footprint after an explicit `RENDER_TARGET` to
 `COPY_SOURCE` transition. Drawing preserves pixels outside the triangles; GPU
 work and host-memory copies complete in command order. Other graphics states,
-formats, textured shaders, depth, blending, instancing and presentation are
-rejected.
+formats, depth, blending, instancing and presentation are rejected.
 
 ```sh
 VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
@@ -161,6 +161,25 @@ VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
 The test uses a synthetic 5×4 target and two draws with different root values
 to check converter reflection, per-draw snapshots, mapped row pitch, rendered
 and preserved pixels, readback padding, resource lifetime and texture state.
+
+For texturing, the SRV must be a default view of a committed default-heap,
+linear, single-mip, single-sample RGBA8 2D texture. The shader's statically
+traced SRV and sampler tables must each address descriptor index zero in
+separate owned shader-visible heaps. Supported samplers are point or linear
+filtering with clamp-to-edge, zero LOD range and bias, and no comparison.
+Changing heaps invalidates descriptor-table bindings; rebind them before a draw.
+Recorded draws retain their resources and heaps, snapshot descriptor identity,
+and reject descriptor changes before execution; texture contents are read at
+submission. The converter is configured to use its texture-array compatibility
+ABI. Other texture layouts, dynamic indices and sampler modes are rejected.
+
+```sh
+VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-gpu console_samples_recorded_texture_and_sampler_tables -- --ignored
+```
+
+This synthetic test checks nearest and linear GPU samples, switching to an
+updated second texture, descriptor/resource lifetime and padded readback.
 
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle

@@ -919,6 +919,16 @@ pub(crate) fn metal_buffer_allows_uav(this: This) -> bool {
 /// Only linear single-sample RGBA8 targets have a defined CPU-visible layout.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
+    metal_linear_texture(this, 1)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_sampled_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
+    metal_linear_texture(this, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn metal_linear_texture(this: This, flags: u32) -> Option<(*mut u8, u32, u32, usize)> {
     if this.is_null() {
         return None;
     }
@@ -933,7 +943,7 @@ pub(crate) fn metal_texture(this: This) -> Option<(*mut u8, u32, u32, usize)> {
         || d.sample_count != 1
         || d.sample_quality != 0
         || d.layout != 1
-        || d.flags != 1
+        || d.flags != flags
         || r.heap.kind != 1
         || !matches!(r.backing, Backing::Committed(_))
     {
@@ -949,7 +959,9 @@ pub(crate) fn metal_texture_state<T>(
     this: This,
     f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T,
 ) -> Option<T> {
-    metal_texture(this)?;
+    if metal_texture(this).is_none() && metal_sampled_texture(this).is_none() {
+        return None;
+    }
     Some(f(&resource(this).state))
 }
 

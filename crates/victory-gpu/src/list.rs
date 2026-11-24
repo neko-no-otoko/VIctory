@@ -1303,6 +1303,9 @@ mod state {
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_metal(this, |s| s.set_table(slot, handle));
     }
+    pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        with_metal(this, |s| s.set_graphics_table(slot, handle));
+    }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
         with_metal(this, |s| s.set_constants(slot, &[value], offset));
     }
@@ -1416,7 +1419,6 @@ mod state {
     }
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_view;
-    pub(super) use super::ignored_state as graphics_table;
     pub(super) use super::ignored_state as graphics_view;
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as stencil_ref;

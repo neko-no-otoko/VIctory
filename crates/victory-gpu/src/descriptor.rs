@@ -77,6 +77,16 @@ impl Heap {
         self.desc.kind == VIEWS_KIND && self.desc.flags & SHADER_VISIBLE != 0
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_shader_visible_sampler_heap(&self) -> bool {
+        self.desc.kind == SAMPLERS && self.desc.flags & SHADER_VISIBLE != 0
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn owns_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.

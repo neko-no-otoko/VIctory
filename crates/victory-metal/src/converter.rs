@@ -67,7 +67,7 @@ impl Drop for Handle {
 /// Loading the supplied dynamic library executes its initializers; callers must
 /// supply a trusted Apple Metal Shader Converter library.
 pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, stage, None)
+    convert_impl(library, dxil, stage, None, false)
 }
 
 /// Convert a fragment shader after verifying its automatic resource layout.
@@ -82,7 +82,20 @@ pub fn convert_fragment_with_b0(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0))
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false)
+}
+
+/// Convert a sampled fragment shader using the same checked automatic b0 ABI.
+///
+/// Directly indexed resource and sampler heaps are not reported as resource
+/// locations by the converter; callers must validate their indices separately.
+/// Reflection must still report exactly the expected b0 location and no others.
+pub fn convert_sampled_fragment(
+    library: &Path,
+    dxil: &[u8],
+    expected_b0: bool,
+) -> Result<Vec<u8>, String> {
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true)
 }
 
 fn convert_impl(
@@ -90,6 +103,7 @@ fn convert_impl(
     dxil: &[u8],
     stage: Stage,
     expected_b0: Option<bool>,
+    force_texture_array: bool,
 ) -> Result<Vec<u8>, String> {
     // SAFETY: the caller supplies the path to a trusted converter library.
     let lib = unsafe { libloading::Library::new(library) }
@@ -133,6 +147,15 @@ fn convert_impl(
         );
 
         let compiler = Handle::new(compiler_create(), compiler_destroy, "compiler")?;
+        if force_texture_array {
+            // IRCompatibilityFlagForceTextureArray (metal_irconverter.h): keep the
+            // descriptor ABI stable across converter 2.x and 3.x.
+            let set_flags = api!(
+                "IRCompilerSetCompatibilityFlags",
+                unsafe extern "C" fn(Pointer, u32)
+            );
+            set_flags(compiler.ptr, 1 << 8);
+        }
         // OwnershipNone: the input slice outlives the DXIL object.
         let input = Handle::new(
             object_create(dxil.as_ptr(), dxil.len(), 0),
