@@ -102,6 +102,33 @@ cargo test -p victory-loader --test load_probe \
   --target x86_64-pc-windows-gnullvm
 ```
 
+### Synthetic CLI execution
+
+This builds our own PE for an ignored Windows integration test, with no game
+data. After the setup above, from the repository root:
+
+```sh
+mkdir -p /tmp/victory-cli-fixture
+printf 'LIBRARY kernel32.dll\nEXPORTS\nGetStdHandle\nWriteFile\n' > /tmp/victory-cli-fixture/kernel32.def
+llvm-dlltool -m i386:x86-64 -d /tmp/victory-cli-fixture/kernel32.def \
+  -l /tmp/victory-cli-fixture/kernel32.lib
+x86_64-w64-mingw32-clang -O2 -c tests/fixtures/windows_cli_probe.c \
+  -o /tmp/victory-cli-fixture/probe.obj
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib \
+  /out:/tmp/victory-cli-fixture/probe.exe /tmp/victory-cli-fixture/probe.obj \
+  /tmp/victory-cli-fixture/kernel32.lib
+export VICTORY_TEST_CLI_PE="$(winepath -w /tmp/victory-cli-fixture/probe.exe)"
+cargo test -p victory --test windows_run --target x86_64-pc-windows-gnullvm \
+  -- --ignored --nocapture
+```
+
+Verified with Rust 1.98.1, LLVM-MinGW 20261117 UCRT, Wine 11.0 and
+MetalVulkan v7.0 on an M3 Max. The test expects the CLI to map and bind the
+fixture without missing imports, print `VIctory synthetic entry executed`,
+and report `title exited with 42`. It uses temporary cache and data folders.
+This validates only a small synthetic PE; it does not run a title or exercise
+the GPU, and Wine is neither native macOS execution nor a native Metal backend.
+
 In that same prefix, the synthetic loader integration tests passed 2/2. A
 separate GPU compute experiment compiled self-authored HLSL with Microsoft
 DXC v1.9.2609 and used an adapted MetalVulkan compute probe: after dispatch,
