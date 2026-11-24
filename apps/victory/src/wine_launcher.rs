@@ -254,9 +254,12 @@ fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Resul
         std::thread::sleep(POLL);
     }
 }
-fn wine_overrides() -> Result<OsString> {
-    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem"];
+fn wine_overrides(gameinput: bool) -> Result<OsString> {
+    let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem", b"gameinput"];
     let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime,xmem=n");
+    if gameinput {
+        result.push(";gameinput=n");
+    }
     if let Some(existing) = std::env::var_os("WINEDLLOVERRIDES") {
         for entry in existing.as_bytes().split(|b| *b == b';') {
             let Some(eq) = entry.iter().position(|b| *b == b'=') else { continue };
@@ -268,7 +271,7 @@ fn wine_overrides() -> Result<OsString> {
                 let base = if basename.len() >= 4 && basename[basename.len()-4..].eq_ignore_ascii_case(b".dll") {
                     &basename[..basename.len()-4]
                 } else { basename };
-                if owned.iter().any(|item| base.eq_ignore_ascii_case(item)) {
+                if owned[..if gameinput { 5 } else { 4 }].iter().any(|item| base.eq_ignore_ascii_case(item)) {
                     let mode = entry[eq+1..].trim_ascii();
                     if !mode.eq_ignore_ascii_case(b"n") && !mode.eq_ignore_ascii_case(b"native") {
                         bail!("conflicting WINEDLLOVERRIDES setting for {}", String::from_utf8_lossy(name));
@@ -313,7 +316,7 @@ fn require_export(provider: &ImageInfo, file_len: usize, dll: &str, name: &str) 
 
 // This checks only imports in the executable, not dynamically loaded symbols
 // or imports of other DLLs. Wine remains authoritative about DLL selection.
-fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
+fn preflight(exe: &Path, dll_dir: &Path, gameinput: bool) -> Result<()> {
     let (guest, _) = image(exe, false)?;
     let mut providers = Vec::new();
     for name in PROVIDERS {
@@ -323,7 +326,30 @@ fn preflight(exe: &Path, dll_dir: &Path) -> Result<()> {
     for name in XMEM_EXPORTS.into_iter().chain(std::iter::once("VIctoryXMemMapAlias")) {
         require_export(&backend, backend_len, XMEM_BACKEND, name)?;
     }
+    let input = if gameinput {
+        let (provider, len) = image(&dll_dir.join("gameinput.dll"), true)?;
+        require_export(&provider, len, "gameinput.dll", "GameInputCreate")?;
+        let export = provider.exports.iter().find(|entry| entry.name.as_deref() == Some("GameInputCreate"))
+            .context("gameinput.dll is missing GameInputCreate")?;
+        if export.ordinal != 1 {
+            bail!("gameinput.dll must export GameInputCreate at ordinal 1");
+        }
+        Some(provider)
+    } else { None };
     for module in guest.imports.iter().chain(&guest.delay_imports) {
+        if module.dll.eq_ignore_ascii_case("gameinput.dll") {
+            if input.is_none() {
+                bail!("{} imports GameInput.dll; use --provision-gameinput with a dedicated prefix", exe.display());
+            }
+            for entry in &module.entries {
+                match &entry.symbol {
+                    ImportSymbol::Ordinal(1) => {}
+                    ImportSymbol::Name { name, .. } if name == "GameInputCreate" => {}
+                    _ => bail!("unsupported GameInput import {}", entry.symbol),
+                }
+            }
+            continue;
+        }
         let Some(index) = PROVIDERS.iter().position(|name| module.dll.eq_ignore_ascii_case(name)) else { continue };
         let (provider, file_len) = &providers[index];
         for entry in &module.entries {
@@ -398,9 +424,118 @@ fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path) -> Result<()>
     Ok(())
 }
 
+// Wine's system32 GameInput placeholder shadows WINEPATH. Provision only in
+// a prefix that was empty at entry; never replace anything in an existing one.
+fn gameinput_file(dir: &Path) -> Result<Option<PathBuf>> {
+    let mut found = None;
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        if entry.file_name().as_bytes().eq_ignore_ascii_case(b"gameinput.dll") {
+            if found.is_some() { bail!("ambiguous GameInput DLLs in {}", dir.display()); }
+            found = Some(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+fn gameinput_system32(prefix: &Path) -> Result<PathBuf> {
+    let root = prefix.join("drive_c");
+    let drive = fs::canonicalize(&root).context("resolving Wine drive_c")?;
+    let mapped = fs::canonicalize(prefix.join("dosdevices/c:")).context("resolving Wine C: mapping")?;
+    if drive != mapped || !drive.starts_with(prefix) {
+        bail!("Wine C: must map to the selected prefix's drive_c");
+    }
+    let windows = windows_child_directory(&root, "windows")?.context("Wine prefix has no Windows directory")?;
+    let system32 = windows_child_directory(&windows, "system32")?.context("Wine prefix has no system32 directory")?;
+    let resolved = fs::canonicalize(&system32)?;
+    if !resolved.starts_with(prefix) { bail!("Wine system32 escapes the selected prefix"); }
+    Ok(resolved)
+}
+
+fn same_contents(left: &Path, right: &Path) -> Result<bool> {
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let size = left.metadata()?.len();
+    if size != right.metadata()?.len() { return Ok(false); }
+    let mut a = [0u8; 32768];
+    let mut b = [0u8; 32768];
+    let mut remaining = size;
+    while remaining != 0 {
+        let count = remaining.min(a.len() as u64) as usize;
+        left.read_exact(&mut a[..count])?;
+        right.read_exact(&mut b[..count])?;
+        if a[..count] != b[..count] { return Ok(false); }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
+fn wine_builtin(path: &Path) -> Result<bool> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() { return Ok(false); }
+    let mut header = [0u8; 80];
+    if File::open(path)?.read_exact(&mut header).is_err() { return Ok(false); }
+    Ok(&header[..2] == b"MZ" && &header[64..80] == b"Wine builtin DLL")
+}
+
+fn reject_gameinput_shadow(dir: &Path) -> Result<()> {
+    if let Some(path) = gameinput_file(dir)? {
+        bail!("GameInput DLL conflict in Wine search directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn reject_gameinput_shadows(exe: &Path, prefix: &Path) -> Result<()> {
+    reject_gameinput_shadow(exe.parent().context("guest executable has no parent directory")?)?;
+    reject_gameinput_shadow(&std::env::current_dir()?)?;
+    let root = prefix.join("drive_c");
+    if !optional_directory(&root)? { return Ok(()); }
+    let Some(windows) = windows_child_directory(&root, "windows")? else { return Ok(()) };
+    reject_gameinput_shadow(&windows)?;
+    if let Some(dir) = windows_child_directory(&windows, "system")? {
+        reject_gameinput_shadow(&dir)?;
+    }
+    // A fresh Wine 11 prefix also has a 32-bit builtin in syswow64.
+    if let Some(dir) = windows_child_directory(&windows, "syswow64")? {
+        if let Some(path) = gameinput_file(&dir)? {
+            if !wine_builtin(&path)? {
+                bail!("GameInput DLL conflict in Wine search directory: {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_gameinput_installation(prefix: &Path, provider: &Path) -> Result<()> {
+    let system32 = gameinput_system32(prefix)?;
+    let installed = gameinput_file(&system32)?.context("existing Wine prefix has no GameInput provider")?;
+    if !fs::symlink_metadata(&installed)?.file_type().is_file() || !same_contents(&installed, provider)? {
+        bail!("existing Wine prefix GameInput differs from the selected provider; refusing to modify it");
+    }
+    Ok(())
+}
+
+fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
+    let system32 = gameinput_system32(prefix)?;
+    let installed = gameinput_file(&system32)?.context("new Wine prefix has no GameInput placeholder")?;
+    if !wine_builtin(&installed)? {
+        bail!("new prefix GameInput is not a Wine builtin placeholder");
+    }
+    let temporary = system32.join(format!(".victory-gameinput-{}.tmp", std::process::id()));
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+        .context("creating temporary GameInput provider")?;
+    let result = (|| -> Result<()> {
+        io::copy(&mut File::open(provider)?, &mut output)?;
+        output.sync_all()?;
+        fs::rename(&temporary, &installed)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result.context("installing GameInput in dedicated Wine prefix")
+}
+
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -409,11 +544,18 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let dll_dir = directory(dll_dir, "DLL directory")?;
     let wine_prefix = directory(wine_prefix, "Wine prefix")?;
     reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
-    preflight(&exe, &dll_dir)?;
-    let overrides = wine_overrides()?;
+    preflight(&exe, &dll_dir, provision_gameinput)?;
+    let overrides = wine_overrides(provision_gameinput)?;
     if !allow_unverified_dll_search {
         bail!("Wine cannot guarantee exact provider DLL identity; use --allow-unverified-dll-search only with a trusted, stable guest, prefix and search paths");
     }
+    let (input_provider, fresh_prefix) = if provision_gameinput {
+        let provider = regular_file(&dll_dir.join("gameinput.dll"), "GameInput provider")?;
+        reject_gameinput_shadows(&exe, &wine_prefix)?;
+        let fresh = fs::read_dir(&wine_prefix)?.next().transpose()?.is_none();
+        if !fresh { checked_gameinput_installation(&wine_prefix, &provider)?; }
+        (Some(provider), fresh)
+    } else { (None, false) };
     eprintln!("Warning: Wine provider DLL paths are not pinned; preflight cannot exclude activation contexts, registry overrides, guest-directed loads or file replacement. Trust the guest and prefix.");
     let _signals = SignalGuard::install()?;
     let mut path_command = Command::new(&winepath);
@@ -431,6 +573,11 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         .context("winepath unexpectedly still running")?;
     path_child.reaped = true;
     drop(path_child);
+    if let Some(provider) = &input_provider {
+        if fresh_prefix { install_gameinput(&wine_prefix, provider)?; }
+        checked_gameinput_installation(&wine_prefix, provider)?;
+        reject_gameinput_shadows(&exe, &wine_prefix)?;
+    }
     let mut wine_path = OsString::from_vec(windows_path);
     if let Some(old) = std::env::var_os("WINEPATH").filter(|value| !value.is_empty()) {
         wine_path.push(OsStr::new(";")); wine_path.push(old);
@@ -480,8 +627,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

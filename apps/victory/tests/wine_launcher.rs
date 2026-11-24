@@ -115,6 +115,33 @@ impl Fixture {
         exe
     }
 
+    fn build_gameinput(&self, ordinal: u16) -> PathBuf {
+        let dir = self.temp.path();
+        // Reuse the ordinary provider import libraries built by the existing fixture.
+        self.build();
+        for (name, export) in [("input_named", "GameInputCreate".to_owned()),
+            ("input_ordinal", format!("OrdinalCreate @{ordinal} NONAME"))] {
+            let def = dir.join(format!("{name}.def"));
+            fs::write(&def, format!("LIBRARY GameInput.dll\nEXPORTS\n {export}\n")).unwrap();
+            let mut command = Command::new(self.llvm.join("bin/llvm-dlltool"));
+            command.args(["-m", "i386:x86-64", "-d"]).arg(def).arg("-l").arg(dir.join(format!("{name}.lib")));
+            self.checked(&mut command);
+        }
+        let guest_dir = dir.join(format!("original-guest-{ordinal}"));
+        fs::create_dir(&guest_dir).unwrap();
+        fs::write(guest_dir.join("asset.txt"), b"asset").unwrap();
+        let exe = guest_dir.join("guest.exe");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wine_launcher_gameinput.c");
+        let mut command = Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"));
+        command.args(["-std=c11", "-fno-emulated-tls", "-O1"]).arg(source);
+        for name in ["d3d12_xs", "xg_xs", "xgameruntime", "input_named", "input_ordinal"] {
+            command.arg(dir.join(format!("{name}.lib")));
+        }
+        command.arg("-o").arg(&exe);
+        self.checked(&mut command);
+        exe
+    }
+
     // The wrapper records the actual host PID, then replaces itself with the host.
     fn tracked_host(&self) -> PathBuf {
         let wrapper = self.temp.path().join("host-wrapper");
@@ -183,6 +210,11 @@ impl Drop for Fixture {
     }
 }
 
+fn wine_z_path(path: &Path) -> String {
+    let path = fs::canonicalize(path).unwrap();
+    format!("Z:{}", path.to_str().unwrap().replace('/', "\\"))
+}
+
 #[test]
 #[ignore = "requires explicitly configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
 fn launcher_runs_real_provider_tls_and_metal_compute() {
@@ -203,6 +235,110 @@ fn launcher_runs_real_provider_tls_and_metal_compute() {
         assert!(out.stdout.contains(marker), "missing {marker}\n{}\n{}", out.stdout, out.stderr);
     }
     f.assert_host_gone();
+}
+
+#[test]
+#[ignore = "requires Wine, LLVM-MinGW, all providers, GameInput DLL and native Metal host/converter"]
+fn launcher_provisions_gameinput_in_fresh_prefix_without_relocating_guest() {
+    let mut f = Fixture::new();
+    let providers = f.temp.path().join("providers");
+    fs::create_dir(&providers).unwrap();
+    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "victory_xmem_backend.dll"] {
+        fs::copy(f.dll_dir.join(name), providers.join(name)).unwrap();
+    }
+    fs::copy(required_path("VICTORY_TEST_GAMEINPUT_DLL"), providers.join("gameinput.dll")).unwrap();
+    f.dll_dir = providers;
+    let exe = f.build_gameinput(1);
+    let guest_dir = exe.parent().unwrap();
+    let before_exe = fs::read(&exe).unwrap();
+    let before_asset = fs::read(guest_dir.join("asset.txt")).unwrap();
+    let mut before_names: Vec<_> = fs::read_dir(guest_dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    before_names.sort();
+    let host = f.tracked_host();
+    let configure = |command: &mut Command| {
+        command.arg("--provision-gameinput")
+            .env("WINEPATH", wine_z_path(&f.llvm.join("x86_64-w64-mingw32/bin")))
+            .env("VICTORY_EXPECT_GUEST_EXE", wine_z_path(&exe))
+            .env("VICTORY_EXPECT_GAMEINPUT_DLL", "C:\\windows\\system32\\gameinput.dll");
+        for (name, dll) in [("VICTORY_EXPECT_D3D12X_DLL", "d3d12_xs.dll"),
+            ("VICTORY_EXPECT_XG_DLL", "xg_xs.dll"), ("VICTORY_EXPECT_RUNTIME_DLL", "xgameruntime.dll")] {
+            command.env(name, wine_z_path(&f.dll_dir.join(dll)));
+        }
+    };
+    for _ in 0..2 {
+        let mut command = f.command(&exe, &host);
+        configure(&mut command);
+        let output = run(&mut command, f.temp.path());
+        assert_eq!(output.status.code(), Some(42), "{}\n{}", output.stdout, output.stderr);
+        for marker in ["Guest image path and adjacent resource passed",
+            "GameInput imports, singleton, readings, callbacks and pinned lifetime passed",
+            "Provider threads and static TLS callbacks passed", "D3D12X synthetic compute readback 42"] {
+            assert!(output.stdout.contains(marker), "missing {marker}\n{}\n{}", output.stdout, output.stderr);
+        }
+        f.assert_host_gone();
+    }
+    let installed = f.prefix.join("drive_c/windows/system32/gameinput.dll");
+    assert!(Command::new("/usr/bin/cmp").arg(&installed).arg(f.dll_dir.join("gameinput.dll")).status().unwrap().success());
+    let mut after_names: Vec<_> = fs::read_dir(guest_dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    after_names.sort();
+    assert_eq!(before_names, after_names);
+    assert_eq!(before_exe, fs::read(&exe).unwrap());
+    assert_eq!(before_asset, fs::read(guest_dir.join("asset.txt")).unwrap());
+    let output = run(&mut f.command(&exe, &host), f.temp.path());
+    assert!(!output.status.success() && output.stderr.contains("--provision-gameinput"), "{}", output.stderr);
+    assert!(!f.host_pid.exists());
+
+    let mut command = f.command(&exe, &host);
+    command.arg("--provision-gameinput").env("WINEDLLOVERRIDES", "gameinput=b");
+    let output = run(&mut command, f.temp.path());
+    assert!(!output.status.success() && output.stderr.contains("conflicting WINEDLLOVERRIDES"), "{}", output.stderr);
+    assert!(!f.host_pid.exists());
+
+    let shadow = guest_dir.join("GameInput.dll");
+    fs::write(&shadow, b"do not load").unwrap();
+    let mut command = f.command(&exe, &host);
+    command.arg("--provision-gameinput");
+    let output = run(&mut command, f.temp.path());
+    assert!(!output.status.success() && output.stderr.contains("GameInput DLL conflict"), "{}", output.stderr);
+    assert_eq!(fs::read(&shadow).unwrap(), b"do not load");
+    assert!(!f.host_pid.exists());
+    fs::remove_file(shadow).unwrap();
+
+    let bad_ordinal = f.build_gameinput(2);
+    let mut command = f.command(&bad_ordinal, &host);
+    command.arg("--provision-gameinput");
+    let output = run(&mut command, f.temp.path());
+    assert!(!output.status.success() && output.stderr.contains("unsupported GameInput import"), "{}", output.stderr);
+    assert!(!f.host_pid.exists());
+
+    let bad_prefix = f.temp.path().join("existing-prefix");
+    let bad_system = bad_prefix.join("drive_c/windows/system32");
+    fs::create_dir_all(&bad_system).unwrap();
+    fs::create_dir(bad_prefix.join("dosdevices")).unwrap();
+    std::os::unix::fs::symlink("../drive_c", bad_prefix.join("dosdevices/c:")).unwrap();
+    let sentinel = bad_system.join("gameinput.dll");
+    fs::write(&sentinel, b"existing data").unwrap();
+    let original_prefix = std::mem::replace(&mut f.prefix, bad_prefix.clone());
+    let mut command = f.command(&exe, &host);
+    command.arg("--provision-gameinput");
+    let output = run(&mut command, f.temp.path());
+    f.prefix = original_prefix;
+    assert!(!output.status.success() && output.stderr.contains("refusing to modify"), "{}", output.stderr);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"existing data");
+    assert!(!f.host_pid.exists());
+    let foreign = f.temp.path().join("foreign-drive");
+    fs::create_dir(&foreign).unwrap();
+    let mapped = bad_prefix.join("dosdevices/c:");
+    fs::remove_file(&mapped).unwrap();
+    std::os::unix::fs::symlink(&foreign, &mapped).unwrap();
+    let original_prefix = std::mem::replace(&mut f.prefix, bad_prefix);
+    let mut command = f.command(&exe, &host);
+    command.arg("--provision-gameinput");
+    let output = run(&mut command, f.temp.path());
+    f.prefix = original_prefix;
+    assert!(!output.status.success() && output.stderr.contains("Wine C: must map"), "{}", output.stderr);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"existing data");
+    assert!(!f.host_pid.exists());
 }
 
 #[test]

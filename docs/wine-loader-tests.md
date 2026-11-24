@@ -647,15 +647,25 @@ export CARGO_TARGET_DIR=/tmp/victory-gameinput-win-target
 cargo build --locked -p victory-gameinput-dll --target x86_64-pc-windows-gnullvm
 ```
 
-For a trusted executable, place the resulting `gameinput.dll` beside the guest
-EXE, make the LLVM-MinGW `x86_64-w64-mingw32/bin` runtime available via
-`WINEPATH`, and launch normally with `WINEDLLOVERRIDES=gameinput=n`. Do not
-overwrite an existing title DLL without considering its provenance. In the
-tested Wine 11 prefix, a Wine `system32` GameInput placeholder takes
-precedence over a provider directory supplied only through `WINEPATH`; the
-application-directory placement was necessary. Wine DLL search is not a
-sandbox. The integrated launcher does not install, override, or preflight
-GameInput.
+For direct Wine use, a provider beside the trusted guest EXE can take
+precedence, but do not overwrite a title DLL. On the tested Wine 11 prefix,
+`gameinput=n` with the provider only in `WINEPATH` failed because Wine's
+system32 GameInput placeholder was found first; adding `WINEDLLPATH` did not
+fix it. Allowing `gameinput=n,b` loaded Wine's builtin instead, not this
+provider. Wine DLL search is not a sandbox.
+
+The integrated `wine-run --provision-gameinput` route keeps the original guest
+path and files. Put `gameinput.dll` alongside the other selected HLE DLLs and
+choose a **new, empty, dedicated Wine prefix**. The launcher initializes it and
+installs the native provider into that prefix's system32, with a native Wine
+override. It accepts an existing prefix only if the installed provider already
+byte-matches the selected DLL; it does not replace files in existing prefixes.
+This separate prefix has its own Wine registry and saves and is not equivalent
+to an existing game prefix. Do not use it concurrently or with untrusted
+processes. An interrupted first initialization may leave a nonempty prefix
+requiring a fresh dedicated prefix. The usual
+`--allow-unverified-dll-search` acknowledgement remains required: activation
+contexts, guest-directed loading and search-path races are not pinned.
 
 This exposes the upstream provider's existing subset, not a new complete input
 stack: it polls XInput controllers and focused-window keyboard state under Wine,
@@ -680,6 +690,15 @@ reading, callback, error and reference-lifetime checks. A separate dynamically
 loaded guest verified the module remains pinned after its sole loader reference
 is released. The seven existing GameInput HLE unit tests also passed as Windows
 executables under Wine. No game binary or physical controller was tested.
+
+With the launcher test prerequisites below and `VICTORY_TEST_GAMEINPUT_DLL`
+set to the built `gameinput.dll`, the ignored
+`launcher_provisions_gameinput_in_fresh_prefix_without_relocating_guest` test
+also exercises the integrated route. On Wine 11 under Rosetta it passed named
+and ordinal imports from the selected system32 provider, the original PE
+path and adjacent resource, TLS/provider checks and a real native Metal
+compute readback. It checks prefix reuse, conflicting DLLs, unsupported
+ordinals and existing-prefix preservation; no game binary was used.
 
 ## Integrated Wine launcher
 
