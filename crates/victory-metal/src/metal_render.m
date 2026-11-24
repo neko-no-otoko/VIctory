@@ -221,7 +221,8 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, co
 static bool draw(void *handle, const float *vertices, uint32_t count,
                  const void *indices, uint32_t index_count, uint32_t index_size,
                  int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
-                 bool preserve, char *error, size_t error_len) {
+                 bool preserve, const double *viewport, const uint32_t *scissor,
+                 char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         if ((size_t)count > SIZE_MAX / (4 * sizeof(float)))
@@ -264,6 +265,14 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> render = [command renderCommandEncoderWithDescriptor:pass];
         if (!command || !render) return fail(error, error_len, @"render command creation failed");
+        bool rasterize = scissor[2] != 0 && scissor[3] != 0;
+        if (rasterize) {
+            MTLViewport vp = { viewport[0], viewport[1], viewport[2], viewport[3],
+                               viewport[4], viewport[5] };
+            MTLScissorRect rect = { scissor[0], scissor[1], scissor[2], scissor[3] };
+            [render setViewport:vp];
+            [render setScissorRect:rect];
+        }
         [render setRenderPipelineState:r.pipeline];
         [render setVertexBuffer:r.vertices offset:0 atIndex:6];
         if (r.fragmentConstants) {
@@ -276,7 +285,7 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
             [render setFragmentBuffer:r.samplerHeap offset:0 atIndex:1];
             [render useResource:r.sampledTexture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
-        if (indices) {
+        if (rasterize && indices) {
             [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                indexCount:index_count
                                 indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
@@ -285,7 +294,7 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
                             instanceCount:1
                                baseVertex:(NSInteger)base_vertex
                              baseInstance:0];
-        } else {
+        } else if (rasterize) {
             [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
         }
         [render endEncoding];
@@ -308,17 +317,19 @@ static bool draw(void *handle, const float *vertices, uint32_t count,
 
 bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
                         const uint32_t *constants, uint8_t *pixels, bool preserve,
+                        const double *viewport, const uint32_t *scissor,
                         char *error, size_t error_len) {
     return draw(handle, vertices, count, NULL, 0, 0, 0, constants, pixels,
-                preserve, error, error_len);
+                preserve, viewport, scissor, error, error_len);
 }
 
 bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t vertex_count,
                                 const void *indices, uint32_t index_count, uint32_t index_size,
                                 int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
+                                const double *viewport, const uint32_t *scissor,
                                 char *error, size_t error_len) {
     return draw(handle, vertices, vertex_count, indices, index_count, index_size, base_vertex,
-                constants, pixels, true, error, error_len);
+                constants, pixels, true, viewport, scissor, error, error_len);
 }
 
 void victory_metal_destroy(void *handle) {

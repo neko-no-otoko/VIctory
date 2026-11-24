@@ -46,6 +46,8 @@ unsafe extern "C" {
         fragment_constants: *const u32,
         pixels: *mut u8,
         preserve: bool,
+        viewport: *const f64,
+        scissor: *const u32,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -59,6 +61,8 @@ unsafe extern "C" {
         base_vertex: i32,
         fragment_constants: *const u32,
         pixels: *mut u8,
+        viewport: *const f64,
+        scissor: *const u32,
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
@@ -138,6 +142,10 @@ pub struct Renderer {
     fragment_constant_dwords: usize,
     fragment_texture: bool,
     texture_bound: bool,
+    width: u32,
+    height: u32,
+    viewport: [f64; 6],
+    scissor: [u32; 4],
 }
 
 /// Texture filtering; address mode is clamp-to-edge and LOD is fixed to zero.
@@ -208,7 +216,34 @@ impl Renderer {
             fragment_constant_dwords: fragment_constant_dwords as usize,
             fragment_texture,
             texture_bound: false,
+            width,
+            height,
+            viewport: [0.0, 0.0, f64::from(width), f64::from(height), 0.0, 1.0],
+            scissor: [0, 0, width, height],
         })
+    }
+
+    /// Set the viewport and target-clipped scissor used by subsequent draws.
+    /// A zero-width or zero-height scissor clips all fragments.
+    pub fn set_viewport_scissor(
+        &mut self,
+        viewport: [f64; 6],
+        scissor: [u32; 4],
+    ) -> Result<(), RenderError> {
+        if !viewport.iter().all(|value| value.is_finite())
+            || viewport[2] <= 0.0 || viewport[3] <= 0.0
+            || viewport[4] < 0.0 || viewport[5] > 1.0 || viewport[4] > viewport[5]
+        {
+            return Err(RenderError("invalid viewport".into()));
+        }
+        if scissor[0].checked_add(scissor[2]).map_or(true, |end| end > self.width)
+            || scissor[1].checked_add(scissor[3]).map_or(true, |end| end > self.height)
+        {
+            return Err(RenderError("scissor exceeds render target".into()));
+        }
+        self.viewport = viewport;
+        self.scissor = scissor;
+        Ok(())
     }
 
     /// Upload RGBA8 texels and bind the sole fragment texture and sampler.
@@ -309,6 +344,9 @@ impl Renderer {
             .ok_or_else(|| RenderError("vertex buffer size overflow".into()))?;
         len.checked_mul(index_size as usize)
             .ok_or_else(|| RenderError("index buffer size overflow".into()))?;
+        if self.scissor[2] == 0 || self.scissor[3] == 0 {
+            return Ok(());
+        }
         let mut error = [0 as c_char; 1024];
         // SAFETY: all input and output slices remain live for the synchronous
         // call; counts, byte sizes, and indexed vertex bounds were checked.
@@ -316,7 +354,8 @@ impl Renderer {
             victory_metal_draw_indexed(
                 self.handle.as_ptr(), vertices.as_ptr(), vertex_count, ptr,
                 index_count, index_size, base_vertex, fragment_constants.as_ptr(),
-                pixels.as_mut_ptr(), error.as_mut_ptr(), error.len(),
+                pixels.as_mut_ptr(), self.viewport.as_ptr(), self.scissor.as_ptr(),
+                error.as_mut_ptr(), error.len(),
             )
         };
         if ok { Ok(()) } else { Err(native_error(&error)) }
@@ -344,6 +383,9 @@ impl Renderer {
         }
         let count =
             u32::try_from(vertices.len()).map_err(|_| RenderError("too many vertices".into()))?;
+        if preserve && (self.scissor[2] == 0 || self.scissor[3] == 0) {
+            return Ok(());
+        }
         let mut error = [0 as c_char; 1024];
         // SAFETY: the renderer is live, the buffers remain valid for the
         // synchronous draw, and their lengths were checked above.
@@ -355,6 +397,8 @@ impl Renderer {
                 fragment_constants.as_ptr(),
                 pixels.as_mut_ptr(),
                 preserve,
+                self.viewport.as_ptr(),
+                self.scissor.as_ptr(),
                 error.as_mut_ptr(),
                 error.len(),
             )

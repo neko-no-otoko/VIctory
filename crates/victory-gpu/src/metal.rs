@@ -323,6 +323,8 @@ enum Command {
         indexed: Option<IndexedDraw>,
         sampled: Option<Sampled>,
         constants: Vec<u32>,
+        viewport: [f64; 6],
+        scissor: [u32; 4],
     },
     ReadTexture {
         target: ResourceRef,
@@ -490,16 +492,18 @@ impl State {
         if !self.open() {
             return;
         }
-        if viewport.x != 0.0
-            || viewport.y != 0.0
-            || !viewport.width.is_finite()
-            || !viewport.height.is_finite()
-            || viewport.width <= 0.0
-            || viewport.height <= 0.0
-            || viewport.min != 0.0
-            || viewport.max != 1.0
+        let x = f64::from(viewport.x);
+        let y = f64::from(viewport.y);
+        let width = f64::from(viewport.width);
+        let height = f64::from(viewport.height);
+        if ![x, y, width, height, f64::from(viewport.min), f64::from(viewport.max)]
+            .iter().all(|v| v.is_finite())
+            || width <= 0.0 || height <= 0.0
+            || x < -32768.0 || y < -32768.0
+            || x + width > 32767.0 || y + height > 32767.0
+            || viewport.min < 0.0 || viewport.max > 1.0 || viewport.min > viewport.max
         {
-            self.reject("only full-target viewports are supported");
+            self.reject("invalid viewport bounds or depth range");
             return;
         }
         self.viewport = Some(viewport);
@@ -508,8 +512,8 @@ impl State {
         if !self.open() {
             return;
         }
-        if scissor.left != 0 || scissor.top != 0 || scissor.right <= 0 || scissor.bottom <= 0 {
-            self.reject("only full-target scissors are supported");
+        if scissor.left > scissor.right || scissor.top > scissor.bottom {
+            self.reject("inverted scissor rectangle");
             return;
         }
         self.scissor = Some(scissor);
@@ -684,13 +688,17 @@ impl State {
             crate::resource::metal_texture(target.ptr()).ok_or("invalid render target")?;
         let viewport = self.viewport.ok_or("missing viewport")?;
         let scissor = self.scissor.ok_or("missing scissor")?;
-        if viewport.width != width as f32
-            || viewport.height != height as f32
-            || scissor.right != width as i32
-            || scissor.bottom != height as i32
-        {
-            return Err("viewport and scissor must cover the entire render target".into());
-        }
+        let clip = |value: i32, limit: u32| i64::from(value).clamp(0, i64::from(limit)) as u32;
+        let left = clip(scissor.left, width);
+        let top = clip(scissor.top, height);
+        let right = clip(scissor.right, width);
+        let bottom = clip(scissor.bottom, height);
+        let scissor = [left, top, right - left, bottom - top];
+        let viewport = [
+            f64::from(viewport.x), f64::from(viewport.y),
+            f64::from(viewport.width), f64::from(viewport.height),
+            f64::from(viewport.min), f64::from(viewport.max),
+        ];
         let prepared = pipeline.lock().unwrap_or_else(|e| e.into_inner());
         if self.graphics_roots.iter().enumerate().any(|(index, root)| {
             !matches!(root, Root::None)
@@ -783,6 +791,8 @@ impl State {
             indexed,
             constants,
             sampled,
+            viewport,
+            scissor,
             target,
         });
         Ok(())
@@ -1056,6 +1066,8 @@ impl State {
                     indexed,
                     constants,
                     sampled,
+                    viewport,
+                    scissor,
                     target,
                 } => {
                     submission.access(vertex.ptr(), VERTEX_BUFFER)?;
@@ -1158,6 +1170,8 @@ impl State {
                         height,
                         verts,
                         indices,
+                        *viewport,
+                        *scissor,
                         constants,
                         binding,
                         &mut self.scratch,

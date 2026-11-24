@@ -93,11 +93,18 @@ pixels after releasing the index resource, rejects invalid formats, ranges,
 alignment and instancing at list close, and rejects out-of-range effective
 indices at submission. Only nonempty, non-instanced triangle lists using a
 float4 vertex view are supported; other formats and topologies are rejected.
+The viewport fixture checks distinct per-draw viewport and scissor snapshots on
+indexed and nonindexed triangles, including target-edge clipping and empty
+scissors. One finite, positive-size viewport within D3D12's -32768..32767
+coordinate bounds and an ordered depth range in [0, 1] are accepted. Scissors
+are clipped to the target; inverted rectangles are rejected. This path still
+supports only one viewport and scissor and has no depth attachment.
 With the same prerequisites, run:
 
 ```sh
 cargo test -p victory --target x86_64-apple-darwin --test native_graphics -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_indexed -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_viewport -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

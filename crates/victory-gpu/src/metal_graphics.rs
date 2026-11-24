@@ -37,6 +37,8 @@ impl Prepared {
         height: u32,
         vertices: &[[f32; 4]],
         indices: Option<(victory_metal::IndexData<'_>, i32)>,
+        viewport: [f64; 6],
+        scissor: [u32; 4],
         constants: &[u32],
         texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter)>,
         pixels: &mut [u8],
@@ -59,6 +61,7 @@ impl Prepared {
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
+        renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
         if let Some((width, height, texels, filter)) = texture {
             renderer
                 .set_fragment_texture(width, height, texels, filter)
