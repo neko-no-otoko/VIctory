@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
         if (ID3D12Device_CreateCommandList((ID3D12Device *)dev, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator, (ID3D12PipelineState *)pipeline, &IID_ID3D12GraphicsCommandList, (void **)&lists[i]) != S_OK) return 9;
         ID3D12GraphicsCommandList_SetPipelineState(lists[i], (ID3D12PipelineState *)pipeline);
         SLOT(lists[i],0x100,SetHeaps)(lists[i], 1, &heap);
-        SLOT(lists[i],0x118,SetTable)(lists[i], test == BAD_SLOT ? 2 : 1, handle);
+        SLOT(lists[i],0x118,SetTable)(lists[i], test == BAD_SLOT ? 64 : 1, handle);
         SLOT(lists[i],0x70,Dispatch)(lists[i], 1, 1, 1);
         HRESULT closed = ID3D12GraphicsCommandList_Close(lists[i]);
         if (test == BAD_SLOT || test == MISSING || test == ALIAS) {

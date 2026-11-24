@@ -16,6 +16,8 @@ pub(crate) struct Prepared {
     table_slot: u8,
     root_cbv: Option<(u8, u64, usize)>,
     raw_views: bool,
+    raw_accesses: Vec<(usize, ResourceType)>,
+    raw_required: Vec<(usize, usize)>,
     threads: [u32; 3],
 }
 
@@ -35,28 +37,26 @@ impl Prepared {
         let native::StageIo::Cs(io) = &p.io else {
             return Err("missing compute metadata".into());
         };
-        let mut uavs = p.used.iter().filter(|u| u.kind == ResourceType::Uav);
-        let uav = uavs.next().ok_or("missing UAV descriptor")?;
-        if uavs.next().is_some() || uav.root != RootType::Table || uav.stride != 0
-            || uav.table_offset_dwords != if raw_views { 8 } else { 0 } || uav.dwords != 4
-            || if raw_views {
-                p.used.len() != 2 || !p.used.iter().any(|u| u.kind == ResourceType::Srv
-                    && u.root == RootType::Table && u.stride == 0 && u.dwords == 4
-                    && u.table_offset_dwords == 0 && u.slot == uav.slot
-                    && u.user_data == uav.user_data)
-            } else {
-                p.used.iter().any(|u| u.kind != ResourceType::Uav
+        let uav = if raw_views {
+            p.used.first().ok_or("missing raw descriptor metadata")?
+        } else {
+            let mut uavs = p.used.iter().filter(|u| u.kind == ResourceType::Uav);
+            let uav = uavs.next().ok_or("missing UAV descriptor")?;
+            if uavs.next().is_some() || uav.root != RootType::Table || uav.stride != 0
+                || uav.table_offset_dwords != 0 || uav.dwords != 4
+                || p.used.iter().any(|u| u.kind != ResourceType::Uav
                     && !(u.kind == ResourceType::Cbv && u.root == RootType::Descriptor))
+            {
+                return Err("unsupported compute resource metadata".into());
             }
-        {
-            return Err("unsupported compute resource metadata".into());
-        }
+            uav
+        };
         let program = ir::build(&p.code, p.wave64, p.vgprs).map_err(|e| e.to_string())?;
         let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
         let descriptor = traced.descriptors.iter()
-            .find(|d| matches!(d.source, resource::Source::Loaded { first: 0, .. }))
+            .find(|d| matches!(d.source, resource::Source::Loaded { .. }))
             .ok_or("expected a table descriptor access")?;
-        let resource::Source::Loaded { load, first: 0 } = descriptor.source else { unreachable!() };
+        let resource::Source::Loaded { load, .. } = descriptor.source else { unreachable!() };
         let Some((_, addr)) = traced.scalar.iter().find(|(site, _)| *site == load) else {
             return Err("missing descriptor load".into());
         };
@@ -68,14 +68,23 @@ impl Prepared {
         {
             return Err("invalid descriptor table root".into());
         }
+        let mut raw_accesses = Vec::new();
+        let mut raw_required: Vec<(usize, usize)> = Vec::new();
         if raw_views {
-            if root.slot != 1 || traced.scalar.is_empty() {
-                return Err("expected raw view table at root slot 1".into());
+            if root.slot == 0 || root.slot >= 64 || traced.scalar.is_empty()
+                || p.used.iter().any(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                    || u.root != RootType::Table || u.stride != 0 || u.dwords != 4
+                    || u.slot != root.slot || u.user_data != root.user_data
+                    || u.table_offset_dwords % 8 != 0)
+                || p.used.iter().enumerate().any(|(i, u)| p.used[..i].iter()
+                    .any(|prior| prior.table_offset_dwords == u.table_offset_dwords))
+            {
+                return Err("unsupported raw descriptor metadata".into());
             }
-            let mut seen = [false; 2];
             for (site, address) in &traced.scalar {
-                if address.param != addr.param || address.dynamic.is_some()
-                    || !matches!(address.offset, 0 | 32)
+                if p.layout.get(address.param).is_none_or(|r|
+                    r.root != RootType::Table || r.slot != root.slot || r.user_data != root.user_data)
+                    || address.dynamic.is_some()
                     || !traced.descriptors.iter().any(|d| matches!(
                         d.source, resource::Source::Loaded { load, .. } if load == *site
                     ))
@@ -89,26 +98,48 @@ impl Prepared {
                 };
                 let address = traced.scalar.iter().find(|(site, _)| *site == load)
                     .map(|(_, address)| address).ok_or("missing raw view load")?;
+                let offset = address.offset.checked_add(u32::from(first) * 4)
+                    .ok_or("raw view descriptor offset overflow")?;
+                if offset % 32 != 0 {
+                    return Err("unsupported raw view descriptor index".into());
+                }
+                let used = p.used.iter().find(|u| u.table_offset_dwords == offset / 4)
+                    .ok_or("missing raw descriptor metadata")?;
                 let inst = program.blocks.get(d.site.0).and_then(|b| b.insts.get(d.site.1))
                     .ok_or("invalid raw view access")?;
                 let name = inst.name();
-                let offset = address.offset.checked_add(u32::from(first) * 4)
-                    .ok_or("raw view descriptor offset overflow")?;
-                if !matches!(offset, 0 | 32) {
-                    return Err("unsupported raw view descriptor index".into());
-                }
-                let index = (offset / 32) as usize;
                 if d.role != resource::Role::Resource
-                    || (index == 0 && !name.starts_with("buffer_load_dword"))
-                    || (index == 1 && !(name.starts_with("buffer_load_dword")
-                        || name.starts_with("buffer_store_dword")))
+                    || !(name.starts_with("buffer_load_dword")
+                        || (used.kind == ResourceType::Uav && name.starts_with("buffer_store_dword")))
                 {
                     return Err("unsupported raw buffer access".into());
                 }
-                seen[index] = true;
+                let victory_shader::gfx10::Fields::Buffer {
+                    data: Some(victory_shader::gfx10::Operand::Vector { dwords, .. }),
+                    soffset, offset: byte_offset, offen: false, idxen: false,
+                    format: None, lds: false, tfe: false, ..
+                } = &inst.fields else {
+                    return Err("dynamic or unsupported raw buffer addressing".into());
+                };
+                if !matches!(soffset, victory_shader::gfx10::Operand::Const(128)
+                    | victory_shader::gfx10::Operand::Scalar { code: victory_shader::gfx10::NULL, .. }) {
+                    return Err("dynamic raw buffer offset is unsupported".into());
+                }
+                let required = usize::from(*byte_offset) + usize::from(*dwords) * 4;
+                let index = (offset / 32) as usize;
+                if let Some((_, n)) = raw_required.iter_mut().find(|(i, _)| *i == index) {
+                    *n = (*n).max(required);
+                } else {
+                    raw_required.push((index, required));
+                }
+                let access = ((offset / 32) as usize, used.kind);
+                if raw_accesses.iter().any(|&(index, kind)| index == access.0 && kind != access.1) {
+                    return Err("conflicting raw descriptor metadata".into());
+                }
+                if !raw_accesses.contains(&access) { raw_accesses.push(access); }
             }
-            if !seen[0] || !seen[1] {
-                return Err("expected both raw view accesses".into());
+            if raw_accesses.is_empty() {
+                return Err("missing raw view accesses".into());
             }
         } else if traced.scalar.len() != 1 || addr.offset != 0 || addr.dynamic.is_some() {
             return Err("only descriptor index zero is supported".into());
@@ -189,6 +220,8 @@ impl Prepared {
             user_data: host.user_data,
             table_slot: root.slot,
             raw_views,
+            raw_accesses,
+            raw_required,
             root_cbv,
             threads: io.threads,
         })
@@ -218,17 +251,58 @@ impl WineMetalCompute {
             return Err("invalid compute request dimensions or lengths".into());
         }
         let prepared = Prepared::new_inner(shader, raw_views)?;
-        if prepared.table_slot != 1
+        if (!raw_views && prepared.table_slot != 1)
             || prepared.root_cbv.is_some_and(|(slot, _, _)| !(2..64).contains(&slot))
+            || prepared.user_data.iter().any(|u| !matches!(
+                (u.root, u.slot), (RootType::Constants, 0)
+            ) && !(u.root == RootType::Table && u.slot == prepared.table_slot))
         {
-            return Err("expected UAV table at root slot 1 and optional root CBV at slot 2..63".into());
-        }
-        if prepared.user_data.iter().any(|u| !matches!(
-            (u.root, u.slot), (RootType::Constants, 0) | (RootType::Table, 1)
-        )) {
             return Err("unsupported root argument".into());
         }
         Ok(Self { prepared })
+    }
+
+    /// Dispatch a raw descriptor heap using the shader's traced table bindings.
+    pub fn dispatch_raw_heap(
+        &mut self,
+        resources: &mut [victory_metal::compute::RawHeapBuffer<'_>],
+        table_slot: u32,
+        table_base: u32,
+        root_constants: &[u32],
+        groups: [u32; 3],
+    ) -> Result<(), String> {
+        let p = &mut self.prepared;
+        if !p.raw_views || table_slot != u32::from(p.table_slot)
+            || resources.is_empty() || resources.len() > 16
+            || root_constants.len() > 64 || groups.contains(&0)
+        {
+            return Err("invalid raw heap compute request".into());
+        }
+        let base = usize::try_from(table_base).map_err(|_| "invalid table base")?;
+        for &(index, kind) in &p.raw_accesses {
+            let resource = base.checked_add(index).and_then(|i| resources.get(i))
+                .ok_or("raw descriptor index out of bounds")?;
+            if resource.writable != (kind == ResourceType::Uav) {
+                return Err("raw descriptor kind mismatch".into());
+            }
+        }
+        for &(index, required) in &p.raw_required {
+            if base.checked_add(index).and_then(|i| resources.get(i))
+                .is_none_or(|view| view.length < required) {
+                return Err("raw descriptor range is too small for shader access".into());
+            }
+        }
+        let table_offset = table_base.checked_mul(32).ok_or("table offset overflow")?;
+        let mut constants = vec![0; p.dwords];
+        for u in &p.user_data {
+            constants[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => *root_constants.get(u.dword as usize)
+                    .ok_or("missing root constant")?,
+                (RootType::Table, slot) if slot == p.table_slot => table_offset,
+                _ => return Err("unsupported root argument".into()),
+            };
+        }
+        p.compute.dispatch_raw_heap(resources, &constants, groups, p.threads)
     }
 
     /// Dispatch synchronously with separate input and output raw buffer views.
@@ -243,10 +317,17 @@ impl WineMetalCompute {
     ) -> Result<(), String> {
         let p = &mut self.prepared;
         if !p.raw_views || output.is_empty() || input.is_empty()
+            || p.table_slot != 1
+            || p.raw_accesses.iter().any(|&(index, kind)| !matches!(
+                (index, kind), (0, ResourceType::Srv) | (1, ResourceType::Uav)))
+            || !p.raw_accesses.contains(&(0, ResourceType::Srv))
+            || !p.raw_accesses.contains(&(1, ResourceType::Uav))
             || output.len() > 16 * 1024 * 1024 || input.len() > 16 * 1024 * 1024
             || root_constants.len() > 64 || groups.contains(&0)
             || srv.1 == 0 || srv.0.checked_add(srv.1).is_none_or(|end| end > input.len())
             || uav.1 == 0 || uav.0.checked_add(uav.1).is_none_or(|end| end > output.len())
+            || p.raw_required.iter().any(|&(index, required)|
+                match index { 0 => srv.1 < required, 1 => uav.1 < required, _ => true })
         {
             return Err("invalid raw view compute request".into());
         }

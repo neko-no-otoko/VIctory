@@ -103,6 +103,74 @@ mod host {
         Ok(buffer)
     }
 
+    fn raw_heap_request(
+        stream: &mut TcpStream,
+        len: usize,
+        cache: &mut Option<(Vec<u8>, bool, victory_gpu::WineMetalCompute)>,
+    ) -> Result<Vec<u8>, String> {
+        let mut payload = vec![0; len];
+        stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+        let mut cursor = 0usize;
+        let take = |cursor: &mut usize, count: usize| -> Result<&[u8], String> {
+            let end = cursor.checked_add(count).ok_or("raw heap payload overflow")?;
+            let bytes = payload.get(*cursor..end).ok_or("truncated raw heap payload")?;
+            *cursor = end;
+            Ok(bytes)
+        };
+        let header = take(&mut cursor, 32)?;
+        let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
+        let [shader_len, count, table_slot, table_base, desc_count, x, y, z] = fields;
+        if shader_len == 0 || shader_len as usize > MAX_SHADER || count > 64
+            || !(1..64).contains(&table_slot) || desc_count == 0 || desc_count > 16
+            || [x, y, z].contains(&0)
+        {
+            return Err("invalid raw heap request".into());
+        }
+        let shader = take(&mut cursor, shader_len as usize)?.to_vec();
+        let constants: Vec<u32> = take(&mut cursor, count as usize * 4)?
+            .chunks_exact(4).map(word).collect();
+        let mut entries = Vec::with_capacity(desc_count as usize);
+        let mut response_len = 0usize;
+        for _ in 0..desc_count {
+            let entry = take(&mut cursor, 16)?;
+            let kind = word(&entry[0..4]);
+            let offset = word(&entry[4..8]) as usize;
+            let length = word(&entry[8..12]) as usize;
+            let size = word(&entry[12..16]) as usize;
+            if !matches!(kind, 1 | 2) || size == 0 || length == 0
+                || offset.checked_add(length).is_none_or(|end| end > size)
+            {
+                return Err("invalid raw heap descriptor".into());
+            }
+            if kind == 2 {
+                response_len = response_len.checked_add(size).ok_or("raw heap response overflow")?;
+                if response_len > 64 * 1024 * 1024 {
+                    return Err("raw heap response too large".into());
+                }
+            }
+            entries.push((kind, offset, length, take(&mut cursor, size)?.to_vec()));
+        }
+        if cursor != payload.len() {
+            return Err("trailing raw heap payload".into());
+        }
+        if cache.as_ref().is_none_or(|(cached, raw, _)| *cached != shader || !*raw) {
+            *cache = None;
+            let pipeline = victory_gpu::WineMetalCompute::new_raw_views(&shader)?;
+            *cache = Some((shader, true, pipeline));
+        }
+        let mut resources: Vec<_> = entries.iter_mut().map(|(kind, offset, length, bytes)|
+            victory_metal::compute::RawHeapBuffer {
+                bytes, offset: *offset, length: *length, writable: *kind == 2,
+            }).collect();
+        cache.as_mut().expect("pipeline was prepared").2.dispatch_raw_heap(
+            &mut resources, table_slot, table_base, &constants, [x, y, z])?;
+        let mut response = Vec::with_capacity(response_len);
+        for (kind, _, _, bytes) in entries {
+            if kind == 2 { response.extend_from_slice(&bytes); }
+        }
+        Ok(response)
+    }
+
     fn graphics_request(stream: &mut TcpStream, fields: [u32; 8]) -> Result<Vec<u8>, String> {
         let vs_len = fields[2] as usize;
         let ps_len = fields[3] as usize;
@@ -190,7 +258,7 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8) {
             return Err("invalid protocol header".into());
         }
         if matches!(fields[1], 1 | 6 | 7) {
@@ -207,6 +275,11 @@ mod host {
         {
             return Err("invalid batch request length or reserved fields".into());
         }
+        if fields[1] == 8 && (fields[2] < 32 || fields[2] as usize > 64 * 1024 * 1024
+            || fields[3..].iter().any(|&v| v != 0))
+        {
+            return Err("invalid raw heap payload length or reserved fields".into());
+        }
         let mut supplied_token = [0; 16];
         stream.read_exact(&mut supplied_token).map_err(|e| e.to_string())?;
         if supplied_token.iter().zip(expected_token).fold(0u8, |diff, (a, b)| diff | (a ^ b)) != 0 {
@@ -214,6 +287,7 @@ mod host {
         }
         match fields[1] {
             1 | 6 | 7 => compute_request(stream, fields, cache),
+            8 => raw_heap_request(stream, fields[2] as usize, cache),
             2 => graphics_request(stream, fields),
             5 => {
                 let mut payload = vec![0; fields[2] as usize];

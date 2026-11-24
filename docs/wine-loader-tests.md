@@ -243,10 +243,11 @@ guest pointers or COM objects cross the process boundary. Wine and the native
 host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
 execution. This is a trusted-workload experiment, not a process sandbox.
 
-The restricted compute path supports either one whole-buffer raw UAV in a
-one-entry shader-visible heap, with an optional root CBV, or the two-entry
-raw SRV/UAV subset below. Both use root constants in slot 0, a descriptor
-table in slot 1, and dispatch/readback; the optional CBV uses a slot 2–63.
+The restricted compute path supports one whole-buffer raw UAV with an
+optional root CBV, or a bounded table of raw SRV/UAV buffers. The latter
+accepts up to 16 populated entries, a nonzero table base and one table root
+slot 1–63; root constants use slot 0. The optional CBV uses slot 2–63 and
+is not combined with the multi-view path.
 A pending queue wait can defer the work as described below. Limits are 4 MiB
 per shader, 16 MiB per buffer and 64 constant dwords. Restricted graphics and
 opt-in presentation paths are described below. Root SRV/UAV descriptors,
@@ -275,19 +276,27 @@ methods were rejected. With the launcher environment below, run `cargo test
 --nocapture`. This is a restricted compute binding path, not general D3D12.X
 or game compatibility.
 
-The two-entry compute heap supports a raw buffer SRV at entry 0 and a raw
-buffer UAV at entry 1, in distinct committed default-heap buffers. Explicit
-R32_TYPELESS RAW views use checked `FirstElement` and `NumElements` ranges;
-the UAV resource must allow unordered access. SRVs require COMMON or
-NON_PIXEL_SHADER_RESOURCE state, UAVs COMMON or UNORDERED_ACCESS. The
-translated shader must use the corresponding static table offsets and raw
-load/store subset. Views and buffers are retained and descriptor mutation
-before execution is rejected. Execution snapshots current input/output
-bytes, preserves unrelated output bytes, and writes back after Metal completes.
-Aliased views, structured or typed buffers, counters, dynamic descriptor
-indices, other heap layouts and combining this path with root CBVs are
-rejected. This is not general root-signature or descriptor-heap support.
-Wine protocol opcode 7 carries both views; Metal uses the buffer descriptor
+The raw compute table accepts SRV and UAV entries in any order, each backed
+by a distinct committed default-heap buffer. Explicit R32_TYPELESS RAW views
+retain checked `FirstElement` and `NumElements` ranges; UAV resources must
+allow unordered access. SRVs require COMMON or NON_PIXEL_SHADER_RESOURCE
+state, UAVs COMMON or UNORDERED_ACCESS. Shader resource kinds, static table
+offsets and root slot are checked against the pipeline metadata and the
+bound table. Descriptors and buffers are retained, descriptor mutation before
+execution is rejected, and writable resources are returned after Metal
+completes. Opcode 8 carries general tables; the prior two-entry opcode 7
+remains supported.
+
+Only raw dword loads/stores with statically provable immediate byte offsets
+are accepted on these table paths. The host checks every access width and
+offset against its view length before dispatch; indexed, dynamic and
+out-of-range accesses are rejected. This restriction matters: in a test on
+the Apple converter and M3 Max, a load outside an SRV view but inside its
+backing allocation returned the backing byte rather than zero. Do not rely
+on Metal descriptor length alone to enforce D3D out-of-bounds semantics.
+Aliased views, structured or typed buffers, counters and mixing these
+tables with root CBVs are rejected. This is pipeline-metadata binding, not
+general D3D12 root-signature support. Metal uses the buffer descriptor
 encoding documented by [Apple](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
 
 On an M3 Max under Rosetta with Wine 11 and Apple's converter, a normally
@@ -297,6 +306,15 @@ deferred fence wait, output and untouched bytes, retained resources, and
 invalid state, range, format, counter, slot and alias cases. Run `cargo test
 --locked -p victory --target x86_64-apple-darwin --test wine_raw_views --
 --ignored --nocapture` with the launcher environment below.
+
+The `wine_multi_views` test uses a normally Wine-launched TLS guest with
+four independently accessed SRV/UAV entries, a nonzero table base, root
+slot 7 and nonzero view offsets. On M3 Max with Wine 11 and Apple's converter,
+it verifies two output buffers, retained resources, changed input after a
+deferred fence wait, invalid descriptor ranges and rejection of an access
+outside its view. Run `cargo test --locked -p victory --target
+x86_64-apple-darwin --test wine_multi_views -- --ignored --nocapture` with
+the launcher environment below.
 
 The fixture below uses compiler-generated static TLS, two Windows threads and
 TLS callbacks before dispatching the existing synthetic D3D12.X shader and

@@ -18,6 +18,7 @@ static bool compute_fail(char *dst, size_t len, NSString *message) {
 @property(nonatomic, strong) id<MTLBuffer> constantBuffer;
 @property(nonatomic, strong) id<MTLBuffer> rootCBVBuffer;
 @property(nonatomic, strong) id<MTLBuffer> resourceHeap;
+@property(nonatomic, strong) NSMutableArray<id<MTLBuffer>> *heapBuffers;
 @property(nonatomic, strong) id<MTLBuffer> arguments;
 @end
 @implementation VictoryMetalCompute
@@ -48,9 +49,10 @@ void *victory_metal_compute_create(const uint8_t *bytes, size_t len, const char 
         c.pipeline = [c.device newComputePipelineStateWithFunction:function error:&e];
         if (!c.pipeline) FAIL(e.localizedDescription ?: @"compute pipeline creation failed");
         c.queue = [c.device newCommandQueue];
-        c.resourceHeap = [c.device newBufferWithLength:48 options:MTLResourceStorageModeShared];
+        c.resourceHeap = [c.device newBufferWithLength:16 * 24 options:MTLResourceStorageModeShared];
+        c.heapBuffers = [NSMutableArray array];
         c.arguments = [c.device newBufferWithLength:24 options:MTLResourceStorageModeShared];
-        if (!c.queue || !c.resourceHeap || !c.arguments) FAIL(@"compute queue or descriptor allocation failed");
+        if (!c.queue || !c.resourceHeap || !c.arguments || !c.heapBuffers) FAIL(@"compute queue or descriptor allocation failed");
 #undef FAIL
         return (__bridge_retained void *)c;
     }
@@ -182,6 +184,102 @@ bool victory_metal_compute_dispatch_raw_views(void *handle, uint8_t *output, siz
                             srv_offset, srv_len, uav_offset, uav_len,
                             constants, constant_bytes, NULL, 0, 0,
                             groups, threads, error, error_len);
+}
+
+// The layout matches NativeRawHeapBuffer in compute.rs.
+typedef struct {
+    uint8_t *bytes;
+    size_t size;
+    size_t offset;
+    size_t length;
+    uint32_t writable;
+} VictoryRawHeapBuffer;
+
+bool victory_metal_compute_dispatch_raw_heap(void *handle,
+                                             const VictoryRawHeapBuffer *resources,
+                                             size_t resource_count,
+                                             const uint32_t *constants, size_t constant_bytes,
+                                             const uint32_t *groups, const uint32_t *threads,
+                                             char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalCompute *c = (__bridge VictoryMetalCompute *)handle;
+        if (!c || !resources || resource_count > 16 || !constants || !groups || !threads ||
+            constant_bytes > UINT32_MAX || constant_bytes % sizeof(uint32_t) ||
+            !groups[0] || !groups[1] || !groups[2] ||
+            !threads[0] || !threads[1] || !threads[2])
+            return compute_fail(error, error_len, @"invalid raw heap dispatch arguments");
+        MTLSize maximum = c.device.maxThreadsPerThreadgroup;
+        if (threads[0] > maximum.width || threads[1] > maximum.height || threads[2] > maximum.depth ||
+            (uint64_t)threads[0] * threads[1] > c.pipeline.maxTotalThreadsPerThreadgroup ||
+            (uint64_t)threads[0] * threads[1] * threads[2] > c.pipeline.maxTotalThreadsPerThreadgroup)
+            return compute_fail(error, error_len, @"threadgroup dimensions exceed Metal pipeline limits");
+        for (size_t i = 0; i < resource_count; i++) {
+            const VictoryRawHeapBuffer *r = &resources[i];
+            if (!r->bytes || !r->size || r->size > UINT32_MAX || !r->length ||
+                r->offset > r->size || r->length > r->size - r->offset || r->writable > 1)
+                return compute_fail(error, error_len, @"invalid raw heap buffer view");
+        }
+        size_t padded_constants = (constant_bytes + 15) & ~(size_t)15;
+        if (padded_constants < 16) padded_constants = 16;
+        if (padded_constants > c.device.maxBufferLength)
+            return compute_fail(error, error_len, @"compute constants exceed Metal device limit");
+        if (c.constantBuffer.length < padded_constants) {
+            id<MTLBuffer> replacement = [c.device newBufferWithLength:padded_constants options:MTLResourceStorageModeShared];
+            if (!replacement) return compute_fail(error, error_len, @"compute constant buffer allocation failed");
+            c.constantBuffer = replacement;
+        }
+        memset(c.constantBuffer.contents, 0, padded_constants);
+        if (constant_bytes) memcpy(c.constantBuffer.contents, constants, constant_bytes);
+        uint64_t *heap = c.resourceHeap.contents;
+        memset(heap, 0, 16 * 24);
+        for (size_t i = 0; i < resource_count; i++) {
+            const VictoryRawHeapBuffer *r = &resources[i];
+            id<MTLBuffer> buffer = i < c.heapBuffers.count ? c.heapBuffers[i] : nil;
+            if (buffer.length < r->size) {
+                buffer = [c.device newBufferWithLength:r->size options:MTLResourceStorageModeShared];
+                if (!buffer) return compute_fail(error, error_len, @"compute heap buffer allocation failed");
+                if (i < c.heapBuffers.count) c.heapBuffers[i] = buffer;
+                else [c.heapBuffers addObject:buffer];
+            }
+            memcpy(buffer.contents, r->bytes, r->size);
+            if (buffer.gpuAddress > UINT64_MAX - r->offset)
+                return compute_fail(error, error_len, @"compute view GPU address overflow");
+            // IRDescriptorTableEntry is three 64-bit words: address, texture ID, length.
+            heap[3 * i] = buffer.gpuAddress + r->offset;
+            heap[3 * i + 1] = 0;
+            heap[3 * i + 2] = r->length;
+        }
+        uint64_t *args = c.arguments.contents;
+        args[0] = c.constantBuffer.gpuAddress;
+        args[1] = 0;
+        args[2] = padded_constants;
+        id<MTLCommandBuffer> command = [c.queue commandBuffer];
+        if (!command) return compute_fail(error, error_len, @"compute command buffer creation failed");
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return compute_fail(error, error_len, @"compute encoder creation failed");
+        [encoder setComputePipelineState:c.pipeline];
+        [encoder setBuffer:c.resourceHeap offset:0 atIndex:0];
+        [encoder setBuffer:c.arguments offset:0 atIndex:2];
+        for (size_t i = 0; i < resource_count; i++) {
+            MTLResourceUsage usage = MTLResourceUsageRead;
+            if (resources[i].writable) usage |= MTLResourceUsageWrite;
+            [encoder useResource:c.heapBuffers[i] usage:usage];
+        }
+        [encoder useResource:c.constantBuffer usage:MTLResourceUsageRead];
+        [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
+               threadsPerThreadgroup:MTLSizeMake(threads[0], threads[1], threads[2])];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted)
+            return compute_fail(error, error_len, command.error.localizedDescription ?: @"compute command failed");
+        for (size_t i = 0; i < resource_count; i++) {
+            if (resources[i].writable)
+                memcpy(resources[i].bytes, c.heapBuffers[i].contents, resources[i].size);
+        }
+        return true;
+    }
 }
 
 void victory_metal_compute_destroy(void *handle) {

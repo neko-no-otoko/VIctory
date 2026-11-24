@@ -1,9 +1,8 @@
 //! Synchronous compute dispatch for shaders produced by Metal Shader Converter.
 //!
-//! The shader uses a writable raw buffer at resource heap index 0. The
-//! automatic linear argument buffer contains b0 at offset 0 when used;
-//! an optional root CBV uses the offset returned by converter reflection.
-//! Callers are responsible for checking the converted shader's binding layout.
+//! Legacy dispatch uses a writable raw buffer at heap index 0. Raw heap
+//! dispatch accepts ordered SRV and UAV entries. Callers must check the
+//! converted shader's binding layout.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::NonNull;
@@ -47,6 +46,17 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
+    fn victory_metal_compute_dispatch_raw_heap(
+        handle: *mut c_void,
+        resources: *const NativeRawHeapBuffer,
+        resource_count: usize,
+        constants: *const u32,
+        constant_bytes: usize,
+        groups: *const u32,
+        threads: *const u32,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> bool;
     fn victory_metal_compute_destroy(handle: *mut c_void);
 }
 
@@ -58,6 +68,24 @@ fn native_error(error: &[c_char]) -> String {
     } else {
         message.into_owned()
     }
+}
+
+/// A full resource snapshot and its raw view, at its index in the descriptor heap.
+pub struct RawHeapBuffer<'a> {
+    pub bytes: &'a mut [u8],
+    pub offset: usize,
+    pub length: usize,
+    pub writable: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeRawHeapBuffer {
+    bytes: *mut u8,
+    size: usize,
+    offset: usize,
+    length: usize,
+    writable: u32,
 }
 
 /// A retained Metal compute pipeline with reusable shared buffers.
@@ -139,6 +167,56 @@ impl Compute {
                 input.len(), srv.0, srv.1, uav.0, uav.1, constants.as_ptr(),
                 constants.len() * 4, groups.as_ptr(), threads.as_ptr(), error.as_mut_ptr(),
                 error.len(),
+            )
+        };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
+    /// Dispatches with ordered raw heap entries, copying writable resources back.
+    pub fn dispatch_raw_heap(
+        &mut self,
+        resources: &mut [RawHeapBuffer<'_>],
+        constants: &[u32],
+        groups: [u32; 3],
+        threads: [u32; 3],
+    ) -> Result<(), String> {
+        if resources.len() > 16 {
+            return Err("at most 16 raw heap entries are supported".into());
+        }
+        if constants.len() > (u32::MAX / 4) as usize {
+            return Err("constant size must fit in 32 bits".into());
+        }
+        if groups.contains(&0) || threads.contains(&0) {
+            return Err("group and thread dimensions must be nonzero".into());
+        }
+        let empty = NativeRawHeapBuffer {
+            bytes: std::ptr::null_mut(), size: 0, offset: 0, length: 0, writable: 0,
+        };
+        let mut native = [empty; 16];
+        for (entry, resource) in native.iter_mut().zip(resources.iter_mut()) {
+            if resource.bytes.is_empty() || resource.bytes.len() > u32::MAX as usize {
+                return Err("buffer size must be nonzero and fit in 32 bits".into());
+            }
+            if resource.length == 0 || resource.offset.checked_add(resource.length)
+                .is_none_or(|end| end > resource.bytes.len())
+            {
+                return Err("raw view must be nonempty and contained in its buffer".into());
+            }
+            *entry = NativeRawHeapBuffer {
+                bytes: resource.bytes.as_mut_ptr(),
+                size: resource.bytes.len(),
+                offset: resource.offset,
+                length: resource.length,
+                writable: u32::from(resource.writable),
+            };
+        }
+        let mut error = [0 as c_char; 1024];
+        // Resources and constants remain borrowed until this synchronous call returns.
+        let ok = unsafe {
+            victory_metal_compute_dispatch_raw_heap(
+                self.handle.as_ptr(), native.as_ptr(), resources.len(), constants.as_ptr(),
+                constants.len() * 4, groups.as_ptr(), threads.as_ptr(),
+                error.as_mut_ptr(), error.len(),
             )
         };
         if ok { Ok(()) } else { Err(native_error(&error)) }

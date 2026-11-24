@@ -22,6 +22,7 @@ const FAIL: HRESULT = 0x80004005u32 as i32;
 const MAGIC: u32 = 0x31474d56;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
 const MAX_BUFFER: usize = 16 * 1024 * 1024;
+const MAX_COMPUTE_PAYLOAD: usize = 64 * 1024 * 1024;
 const UNKNOWN: Iid = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
 const DEVICE11: Iid = guid(0x5405c344, 0xd457, 0x444e, [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39]);
 const HEAP: Iid = guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
@@ -110,6 +111,11 @@ impl Buffer {
 struct BufferView { buffer: Arc<Buffer>, offset: u32, length: u32 }
 #[derive(Clone)]
 enum BufferDescriptor { Srv(BufferView), Uav(BufferView) }
+impl BufferDescriptor {
+    fn view(&self) -> &BufferView {
+        match self { Self::Srv(view) | Self::Uav(view) => view }
+    }
+}
 struct BufferHeap { entries: Vec<Option<BufferDescriptor>>, generation: u64 }
 type ComputeHeap = Arc<Mutex<BufferHeap>>;
 
@@ -199,9 +205,9 @@ struct Job {
     shader: Arc<Vec<u8>>,
     heap: ComputeHeap,
     generation: u64,
-    buffer: Arc<Buffer>,
-    srv: Option<BufferView>,
-    uav: BufferView,
+    descriptors: Vec<BufferDescriptor>,
+    table_slot: u32,
+    table_base: u32,
     constants: Vec<u32>,
     cbv: Option<RootCbv>,
     groups: [u32; 3],
@@ -219,7 +225,7 @@ struct ListState {
     invalid: bool,
     pipeline: Option<Arc<Vec<u8>>>,
     heap: Option<(usize, ComputeHeap)>,
-    table: bool,
+    table: Option<(u32, u32)>,
     constants: Vec<Option<u32>>,
     cbv: Option<RootCbv>,
     jobs: Vec<Job>,
@@ -523,7 +529,7 @@ extern "system" fn create_heap(this: This, d: *const HeapDesc, iid: *const Iid, 
     let Some(d) = (unsafe { d.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if device(this).is_none() || d.count == 0 || d.count > 2 || d.nodes != 0 {
+    if device(this).is_none() || d.count == 0 || d.count > 16 || d.nodes != 0 {
         return E_INVALIDARG;
     }
     if d.kind == 2 && d.flags == 0 && d.count == 1 {
@@ -719,12 +725,8 @@ extern "system" fn create_uav(
     else { trap("invalid UAV arguments"); };
     if device(this).is_none() || !b.allow_uav || !counter.is_null() || d.format != 39 || d.dimension != 1
         || d.stride != 0 || d.counter != 0 || d.flags != 1
-        || index != h.lock().unwrap().entries.len() - 1
     { trap("unsupported UAV view"); }
     let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid UAV range"); };
-    if h.lock().unwrap().entries.len() == 1 && (view.offset != 0 || view.length as usize != view.buffer.len()) {
-        trap("legacy UAV must cover the buffer");
-    }
     write_buffer_descriptor(&h, index, BufferDescriptor::Uav(view));
 }
 #[repr(C)]
@@ -736,7 +738,7 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
     if let Some(Data::Buffer(b)) = data(res) {
         let (Some((h, index)), Some(d)) = (buffer_handle(handle), unsafe { desc.cast::<BufferSrvDesc>().as_ref() })
             else { trap("invalid buffer SRV"); };
-        if device(this).is_none() || h.lock().unwrap().entries.len() != 2 || index != 0
+        if device(this).is_none()
             || d.format != 39 || d.dimension != 1 || d.mapping != 5768 || d.stride != 0 || d.flags != 1
         { trap("unsupported buffer SRV"); }
         let Some(view) = raw_view(b, d.first, d.elements) else { trap("invalid SRV range"); };
@@ -984,7 +986,7 @@ extern "system" fn set_heaps(this: This, n: u32, heaps: *const This) {
     let p = unsafe { *heaps };
     if let Some(Data::Heap(h, _)) = data(p) {
         l.heap = Some((p as usize, h));
-        l.table = false;
+        l.table = None;
     } else {
         l.invalid = true;
     }
@@ -995,10 +997,17 @@ extern "system" fn set_table(this: This, slot: u32, handle: u64) {
     if l.closed {
         trap("closed list");
     }
-    if l.kind != 2 || slot != 1 || l.heap.as_ref().map(|h| h.0) != Some(handle as usize) {
+    let binding = l.heap.as_ref().and_then(|(base, heap)| {
+        let index = handle.checked_sub(*base as u64)?;
+        (index < heap.lock().unwrap().entries.len() as u64).then_some((slot, index as u32))
+    });
+    if l.kind != 2 || !(1..=63).contains(&slot) || binding.is_none()
+        || l.table.is_some_and(|(old_slot, _)| old_slot != slot)
+        || l.cbv.as_ref().is_some_and(|cbv| cbv.slot == slot)
+    {
         l.invalid = true;
     } else {
-        l.table = true;
+        l.table = binding;
     }
 }
 extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
@@ -1046,6 +1055,7 @@ extern "system" fn set_cbv(this: This, slot: u32, address: u64) {
     }
     if l.kind != 2 || !(2..=63).contains(&slot) || address % 16 != 0
         || l.cbv.as_ref().is_some_and(|cbv| cbv.slot != slot)
+        || l.table.is_some_and(|(table_slot, _)| table_slot == slot)
     {
         l.invalid = true;
         return;
@@ -1075,28 +1085,31 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         trap("closed list");
     }
     let Some(heap) = l.heap.as_ref().map(|h| h.1.clone()) else { l.invalid = true; return; };
-    let (generation, srv, uav) = {
+    let (generation, descriptors) = {
         let h = heap.lock().unwrap();
-        match h.entries.as_slice() {
-            [Some(BufferDescriptor::Uav(uav))] => (h.generation, None, uav.clone()),
-            [Some(BufferDescriptor::Srv(srv)), Some(BufferDescriptor::Uav(uav))] =>
-                (h.generation, Some(srv.clone()), uav.clone()),
-            _ => { l.invalid = true; return; }
-        }
+        let Some(descriptors) = h.entries.iter().cloned().collect::<Option<Vec<_>>>() else {
+            l.invalid = true; return;
+        };
+        (h.generation, descriptors)
     };
     let constants: Option<Vec<u32>> = l.constants.iter().copied().collect();
-    if l.kind != 2 || x == 0 || y == 0 || z == 0 || !l.table || l.pipeline.is_none()
-        || constants.is_none() || (srv.is_some() && l.cbv.is_some())
-        || srv.as_ref().is_some_and(|v| Arc::ptr_eq(&v.buffer, &uav.buffer))
-        || l.cbv.as_ref().is_some_and(|cbv| Arc::ptr_eq(&cbv.buffer, &uav.buffer))
+    let Some((table_slot, table_base)) = l.table else { l.invalid = true; return; };
+    let legacy_cbv = table_slot == 1 && table_base == 0
+        && matches!(descriptors.as_slice(), [BufferDescriptor::Uav(v)]
+            if v.offset == 0 && v.length as usize == v.buffer.len());
+    if l.kind != 2 || x == 0 || y == 0 || z == 0 || l.pipeline.is_none()
+        || constants.is_none() || (l.cbv.is_some() && !legacy_cbv)
+        || descriptors.iter().enumerate().any(|(i, d)|
+            descriptors[..i].iter().any(|other| Arc::ptr_eq(&d.view().buffer, &other.view().buffer))
+                || l.cbv.as_ref().is_some_and(|cbv| Arc::ptr_eq(&d.view().buffer, &cbv.buffer)))
     { l.invalid = true; return; }
     let job = Job {
         shader: l.pipeline.as_ref().unwrap().clone(),
         heap,
         generation,
-        buffer: uav.buffer.clone(),
-        srv,
-        uav,
+        descriptors,
+        table_slot,
+        table_base,
         constants: constants.unwrap(),
         cbv: l.cbv.clone(),
         groups: [x, y, z],
@@ -1105,11 +1118,15 @@ extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
 }
 fn run(c: &Config, j: &Job) -> Result<(), String> {
     // Snapshot at execution, after earlier queued jobs have updated resources.
-    if !matches!(*j.buffer.state.lock().unwrap(), 0 | 8) {
-        return Err("UAV requires COMMON or UNORDERED_ACCESS state".into());
-    }
-    if j.srv.as_ref().is_some_and(|v| !matches!(*v.buffer.state.lock().unwrap(), 0 | 0x40)) {
-        return Err("SRV requires COMMON or NON_PIXEL_SHADER_RESOURCE state".into());
+    for descriptor in &j.descriptors {
+        let state = *descriptor.view().buffer.state.lock().unwrap();
+        match descriptor {
+            BufferDescriptor::Srv(_) if !matches!(state, 0 | 0x40) =>
+                return Err("SRV requires COMMON or NON_PIXEL_SHADER_RESOURCE state".into()),
+            BufferDescriptor::Uav(_) if !matches!(state, 0 | 8) =>
+                return Err("UAV requires COMMON or UNORDERED_ACCESS state".into()),
+            _ => {}
+        }
     }
     if let Some(binding) = &j.cbv {
         if !matches!(*binding.buffer.state.lock().unwrap(), 0 | 1) {
@@ -1123,47 +1140,89 @@ fn run(c: &Config, j: &Job) -> Result<(), String> {
         }.to_vec();
         (binding.slot, bytes)
     });
+    let legacy = if j.table_slot == 1 && j.table_base == 0 {
+        match j.descriptors.as_slice() {
+            [BufferDescriptor::Uav(uav)] if uav.offset == 0 && uav.length as usize == uav.buffer.len() =>
+                Some((None, uav)),
+            [BufferDescriptor::Srv(srv), BufferDescriptor::Uav(uav)] if cbv.is_none() =>
+                Some((Some(srv), uav)),
+            _ => None,
+        }
+    } else { None };
+    let response_len = j.descriptors.iter().try_fold(0usize, |sum, descriptor| {
+        if let BufferDescriptor::Uav(view) = descriptor { sum.checked_add(view.buffer.len()) } else { Some(sum) }
+    }).ok_or("compute response too large")?;
+    let payload_len = j.descriptors.iter().try_fold(
+        32usize.checked_add(j.shader.len()).and_then(|n| n.checked_add(j.constants.len() * 4))
+            .ok_or("compute payload too large")?,
+        |sum, descriptor| sum.checked_add(16)?.checked_add(descriptor.view().buffer.len()),
+    ).ok_or("compute payload too large")?;
+    if payload_len > MAX_COMPUTE_PAYLOAD || response_len > MAX_COMPUTE_PAYLOAD {
+        return Err("compute payload or response too large".into());
+    }
     let mut s = TcpStream::connect_timeout(&c.addr, Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
-    for v in [
-        MAGIC, if j.srv.is_some() { 7 } else if cbv.is_some() { 6 } else { 1 }, j.shader.len() as u32, j.buffer.len() as u32, j.constants.len() as u32,
-        j.groups[0], j.groups[1], j.groups[2],
-    ] {
-        s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+    let header = if let Some((srv, uav)) = legacy {
+        [MAGIC, if srv.is_some() { 7 } else if cbv.is_some() { 6 } else { 1 },
+         j.shader.len() as u32, uav.buffer.len() as u32, j.constants.len() as u32,
+         j.groups[0], j.groups[1], j.groups[2]]
+    } else {
+        [MAGIC, 8, payload_len as u32, 0, 0, 0, 0, 0]
+    };
+    for value in header {
+        s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
     }
-    let input = unsafe { std::slice::from_raw_parts(j.buffer.ptr(), j.buffer.len()) };
     s.write_all(&c.token).map_err(|e| e.to_string())?;
-    if let Some(srv) = &j.srv {
-        for value in [srv.buffer.len() as u32, srv.offset, srv.length, j.uav.offset, j.uav.length] {
+    if let Some((srv, uav)) = legacy {
+        if let Some(srv) = srv {
+            for value in [srv.buffer.len() as u32, srv.offset, srv.length, uav.offset, uav.length] {
+                s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some((slot, bytes)) = &cbv {
+            s.write_all(&slot.to_le_bytes())
+                .and_then(|_| s.write_all(&(bytes.len() as u32).to_le_bytes()))
+                .map_err(|e| e.to_string())?;
+        }
+        let input = unsafe { std::slice::from_raw_parts(uav.buffer.ptr(), uav.buffer.len()) };
+        s.write_all(&j.shader).and_then(|_| s.write_all(input)).map_err(|e| e.to_string())?;
+        for value in &j.constants {
             s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
         }
-    }
-    if let Some((slot, bytes)) = &cbv {
-        s.write_all(&slot.to_le_bytes())
-            .and_then(|_| s.write_all(&(bytes.len() as u32).to_le_bytes()))
-            .map_err(|e| e.to_string())?;
-    }
-    s.write_all(&j.shader)
-        .and_then(|_| s.write_all(input))
-        .map_err(|e| e.to_string())?;
-    for v in &j.constants {
-        s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
-    }
-    if let Some((_, bytes)) = &cbv {
-        s.write_all(bytes).map_err(|e| e.to_string())?;
-    }
-    if let Some(srv) = &j.srv {
-        let bytes = unsafe { std::slice::from_raw_parts(srv.buffer.ptr(), srv.buffer.len()) };
-        s.write_all(bytes).map_err(|e| e.to_string())?;
+        if let Some((_, bytes)) = &cbv {
+            s.write_all(bytes).map_err(|e| e.to_string())?;
+        }
+        if let Some(srv) = srv {
+            let bytes = unsafe { std::slice::from_raw_parts(srv.buffer.ptr(), srv.buffer.len()) };
+            s.write_all(bytes).map_err(|e| e.to_string())?;
+        }
+    } else {
+        for value in [j.shader.len() as u32, j.constants.len() as u32, j.table_slot, j.table_base,
+            j.descriptors.len() as u32, j.groups[0], j.groups[1], j.groups[2]] {
+            s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        s.write_all(&j.shader).map_err(|e| e.to_string())?;
+        for value in &j.constants {
+            s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        for descriptor in &j.descriptors {
+            let view = descriptor.view();
+            let kind = match descriptor { BufferDescriptor::Srv(_) => 1u32, BufferDescriptor::Uav(_) => 2 };
+            for value in [kind, view.offset, view.length, view.buffer.len() as u32] {
+                s.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(view.buffer.ptr(), view.buffer.len()) };
+            s.write_all(bytes).map_err(|e| e.to_string())?;
+        }
     }
     let mut header = [0u8; 16];
     s.read_exact(&mut header).map_err(|e| e.to_string())?;
     let word = |n: usize| u32::from_le_bytes(header[n..n + 4].try_into().unwrap());
     let (magic, status, len, msg) = (word(0), word(4), word(8) as usize, word(12) as usize);
-    if magic != MAGIC || len > MAX_BUFFER || msg > 4096
-        || (status == 0 && (len != j.buffer.len() || msg != 0))
+    if magic != MAGIC || len > MAX_COMPUTE_PAYLOAD || msg > 4096
+        || (status == 0 && (len != response_len || msg != 0))
         || (status != 0 && len != 0)
     {
         return Err("invalid proxy response".into());
@@ -1175,7 +1234,14 @@ fn run(c: &Config, j: &Job) -> Result<(), String> {
     if status != 0 {
         return Err(format!("proxy status {status}: {message}"));
     }
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), j.buffer.ptr(), len); }
+    let mut offset = 0;
+    for descriptor in &j.descriptors {
+        if let BufferDescriptor::Uav(view) = descriptor {
+            let size = view.buffer.len();
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), view.buffer.ptr(), size); }
+            offset += size;
+        }
+    }
     tracing::info!("Wine Metal proxy connected");
     Ok(())
 }
