@@ -1,0 +1,393 @@
+//! Synthetic console COM calls through device, list and queue into Metal.
+use crate::object::{self, HRESULT, Iid, S_OK, This, slot};
+use std::ffi::c_void;
+
+#[repr(C)]
+struct Bytecode {
+    code: *const u8,
+    size: usize,
+}
+#[repr(C)]
+struct ComputeDesc {
+    root: This,
+    stage: Bytecode,
+}
+#[repr(C)]
+struct QueueDesc {
+    kind: u32,
+    priority: i32,
+    flags: u32,
+    nodes: u32,
+}
+#[repr(C)]
+struct HeapDesc {
+    kind: u32,
+    count: u32,
+    flags: u32,
+    nodes: u32,
+    placement: [u64; 2],
+}
+#[repr(C)]
+struct HeapProperties {
+    kind: u32,
+    cpu_pages: u32,
+    pool: u32,
+    creation_nodes: u32,
+    visible_nodes: u32,
+}
+#[repr(C)]
+struct ResourceDesc {
+    dimension: u32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth: u16,
+    mips: u16,
+    format: u32,
+    samples: u32,
+    quality: u32,
+    layout: u32,
+    flags: u32,
+}
+
+fn iid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Iid {
+    object::guid(a, b, c, d)
+}
+
+// Synthetic FSSM console compute container: 1 thread writes s0 + 1 to UAV 0.
+fn shader() -> Vec<u8> {
+    let words = [
+        0xbe85_0380u32,
+        0xf408_0202,
+        0xfa00_0000,
+        0x7e00_0200,
+        0x4a00_0081,
+        0xe070_0000,
+        0x8002_0000,
+        0xbf81_0000,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut payload = vec![0u8; 0x68];
+    payload[0..8].copy_from_slice(&6u64.to_le_bytes());
+    for slot in [0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] {
+        payload[slot..slot + 8].copy_from_slice(&0xdead_beef_dead_beefu64.to_le_bytes());
+    }
+    let record = payload.len();
+    payload[0x60..0x68].copy_from_slice(&(record as u64).to_le_bytes());
+    let code_at = record + 0x54 + 0x40;
+    payload.resize(code_at, 0);
+    payload[record..record + 8].copy_from_slice(&(code_at as u64).to_le_bytes());
+    payload[record + 8..record + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    payload[record + 0x14..record + 0x18].copy_from_slice(&0x20u32.to_le_bytes());
+    payload[record + 0x50..record + 0x54].copy_from_slice(&8u32.to_le_bytes());
+    let stage = record + 0x54;
+    payload[stage + 0x24..stage + 0x28].copy_from_slice(&(5u32 << 1).to_le_bytes());
+    for (i, n) in [1u32, 1, 1].iter().enumerate() {
+        payload[stage + 0x28 + i * 4..stage + 0x2c + i * 4].copy_from_slice(&n.to_le_bytes());
+    }
+    payload.extend_from_slice(&code);
+    let layout = payload.len();
+    for (kind, user, slot) in [(0u32, 0u8, 0u8), (3u32, 4u8, 1u8)] {
+        for n in [kind, 0, 1, 0] {
+            payload.extend_from_slice(&n.to_le_bytes());
+        }
+        payload.extend_from_slice(&[user, slot, 0, 0]);
+    }
+    let used = payload.len();
+    payload.extend_from_slice(&[3, 3, 0, 0]);
+    for n in [0u32, 0, 0] {
+        payload.extend_from_slice(&n.to_le_bytes());
+    }
+    payload.extend_from_slice(&[4, 4, 1, 0]);
+    payload[record + 0x28..record + 0x30].copy_from_slice(&(layout as u64).to_le_bytes());
+    payload[record + 0x30..record + 0x38].copy_from_slice(&(used as u64).to_le_bytes());
+    payload[record + 0x38..record + 0x3c].copy_from_slice(&2u32.to_le_bytes());
+    payload[record + 0x3c..record + 0x40].copy_from_slice(&1u32.to_le_bytes());
+    let mut fssm = b"FSSM".to_vec();
+    fssm.extend_from_slice(&0x101u32.to_le_bytes());
+    fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    fssm.extend_from_slice(&payload);
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+    let mut blob = b"XBCH".to_vec();
+    blob.extend_from_slice(&3u32.to_le_bytes());
+    blob.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&packed);
+    let mut dxil = vec![0u8; 0x18];
+    dxil.extend_from_slice(b"XDAT");
+    for n in [1u32, 0x24, 0x0d, 0x30, blob.len() as u32] {
+        dxil.extend_from_slice(&n.to_le_bytes());
+    }
+    dxil.extend_from_slice(&blob);
+    let mut container = vec![0u8; 0x24];
+    container[..4].copy_from_slice(b"DXBC");
+    container[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    container[0x18..0x1c].copy_from_slice(&((0x2c + dxil.len()) as u32).to_le_bytes());
+    container[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+    container[0x20..0x24].copy_from_slice(&0x24u32.to_le_bytes());
+    container.extend_from_slice(b"DXIL");
+    container.extend_from_slice(&(dxil.len() as u32).to_le_bytes());
+    container.extend_from_slice(&dxil);
+    container
+}
+
+#[test]
+#[ignore = "requires Apple Metal Shader Converter and a Metal GPU"]
+fn console_compute_records_and_submits_on_metal() {
+    assert!(
+        std::env::var_os("VICTORY_METAL_CONVERTER").is_some(),
+        "set VICTORY_METAL_CONVERTER"
+    );
+    let null: This = std::ptr::null();
+    let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+    let mut dev = null;
+    assert_eq!(
+        crate::device::create(
+            null.cast(),
+            &crate::device::CHECKED_VERSION,
+            &crate::device::IID,
+            &mut dev
+        ),
+        S_OK
+    );
+    let heap_iid = iid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+    let heap_desc = HeapDesc {
+        kind: 0,
+        count: 1,
+        flags: 1,
+        nodes: 0,
+        placement: [0; 2],
+    };
+    let mut heap = null;
+    let make_heap = slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+        dev, 0x70,
+    );
+    assert_eq!(
+        make_heap(dev, (&raw const heap_desc).cast(), &heap_iid, &mut heap),
+        S_OK
+    );
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let props = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 1,
+        alignment: 0,
+        width: 64,
+        height: 1,
+        depth: 1,
+        mips: 1,
+        format: 0,
+        samples: 1,
+        quality: 0,
+        layout: 1,
+        flags: 4,
+    };
+    let resource_iid = iid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let make_resource = slot::<
+        extern "system" fn(
+            This,
+            *const c_void,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT,
+    >(dev, 0xd8);
+    let mut resource = null;
+    assert_eq!(
+        make_resource(
+            dev,
+            (&raw const props).cast(),
+            0,
+            (&raw const desc).cast(),
+            0,
+            null.cast(),
+            &resource_iid,
+            &mut resource
+        ),
+        S_OK
+    );
+    let mut mapped = std::ptr::null_mut();
+    assert_eq!(
+        slot::<extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT>(
+            resource, 0x40
+        )(resource, 0, null.cast(), &mut mapped),
+        S_OK
+    );
+    // SAFETY: mapped resource is 64 bytes.
+    unsafe {
+        mapped.cast::<u32>().write_unaligned(0x12345678);
+    }
+    slot::<extern "system" fn(This, This, This, *const [u32; 10], u64)>(dev, 0x98)(
+        dev,
+        resource,
+        null,
+        null.cast(),
+        handle,
+    );
+    let bytes = shader();
+    let pipeline_desc = ComputeDesc {
+        root: null,
+        stage: Bytecode {
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        },
+    };
+    let pipeline_iid = iid(
+        0x765a30f3,
+        0xf624,
+        0x4c6f,
+        [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+    );
+    let mut pipeline = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x58
+        )(
+            dev,
+            (&raw const pipeline_desc).cast(),
+            &pipeline_iid,
+            &mut pipeline
+        ),
+        S_OK
+    );
+    let allocator_iid = iid(
+        0x6102dee4,
+        0xaf59,
+        0x4b09,
+        [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+    );
+    let mut allocator = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, u32, *const Iid, *mut This) -> HRESULT>(dev, 0x48)(
+            dev,
+            2,
+            &allocator_iid,
+            &mut allocator
+        ),
+        S_OK
+    );
+    let list_iid = iid(
+        0x7116d91c,
+        0xe7e4,
+        0x47ce,
+        [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5],
+    );
+    let mut list = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, u32, u32, This, This, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x60
+        )(dev, 0, 2, allocator, pipeline, &list_iid, &mut list),
+        S_OK
+    );
+    slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, &heap);
+    slot::<extern "system" fn(This, u32, u64)>(list, 0x118)(list, 1, handle);
+    let constants = slot::<extern "system" fn(This, u32, u32, *const u32, u32)>(list, 0x138);
+    let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x70);
+    constants(list, 0, 4, [8, 0, 0, 0].as_ptr(), 0);
+    dispatch(list, 1, 1, 1);
+    slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+    constants(list, 0, 4, [41, 0, 0, 0].as_ptr(), 0);
+    dispatch(list, 1, 1, 1);
+    let closed = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+    assert_eq!(
+        closed,
+        S_OK,
+        "list error: {:?}",
+        crate::list::metal_execute(list)
+    );
+    // SAFETY: list holds the resource alive through submission.
+    assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 0x12345678);
+    assert_eq!(release(resource), 2);
+    assert_eq!(release(heap), 1);
+    assert_eq!(release(pipeline), 0);
+    let queue_iid = iid(
+        0x0ec870a6,
+        0x5d7e,
+        0x4c22,
+        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+    );
+    let queue_desc = QueueDesc {
+        kind: 2,
+        priority: 0,
+        flags: 0,
+        nodes: 0,
+    };
+    let mut queue = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x40
+        )(dev, (&raw const queue_desc).cast(), &queue_iid, &mut queue),
+        S_OK
+    );
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    // SAFETY: list still holds the resource reference.
+    assert_eq!(unsafe { mapped.cast::<u32>().read_unaligned() }, 42);
+    let mut fence = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, u64, u32, *const Iid, *mut This) -> HRESULT>(dev, 0x120)(
+            dev,
+            0,
+            0,
+            &crate::fence::FENCE_IIDS[0],
+            &mut fence
+        ),
+        S_OK
+    );
+    let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(queue, 0x70);
+    let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+    assert_eq!(signal(queue, fence, 7), S_OK);
+    assert_eq!(completed(fence), 7);
+    // Changing an already-recorded descriptor must not silently use the old buffer.
+    slot::<extern "system" fn(This, This, This, *const [u32; 10], u64)>(dev, 0x98)(
+        dev,
+        null,
+        null,
+        null.cast(),
+        handle,
+    );
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    assert_eq!(signal(queue, fence, 8), object::E_NOTIMPL);
+    assert_eq!(completed(fence), 7);
+    assert_eq!(release(queue), 0);
+    queue = null;
+    assert_eq!(
+        slot::<extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT>(
+            dev, 0x40
+        )(dev, (&raw const queue_desc).cast(), &queue_iid, &mut queue),
+        S_OK
+    );
+    assert_eq!(
+        slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null),
+        S_OK
+    );
+    slot::<extern "system" fn(This)>(list, 0x60)(list); // Unsupported draw poisons the list.
+    assert_eq!(
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+        object::E_NOTIMPL
+    );
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    assert_eq!(signal(queue, fence, 8), object::E_NOTIMPL);
+    assert_eq!(completed(fence), 7);
+    assert_eq!(release(fence), 0);
+    assert_eq!(release(list), 0);
+    assert_eq!(release(allocator), 0);
+    assert_eq!(release(queue), 0);
+}

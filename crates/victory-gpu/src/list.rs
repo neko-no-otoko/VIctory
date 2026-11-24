@@ -119,6 +119,8 @@ struct List {
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    #[cfg(target_os = "macos")]
+    metal: std::sync::Mutex<crate::metal::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -143,6 +145,42 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+#[cfg(target_os = "macos")]
+fn with_metal(this: This, f: impl FnOnce(&mut crate::metal::State)) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).metal };
+    f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_execute(this: This) -> Result<(), String> {
+    if this.is_null() {
+        return Err("null command list".into());
+    }
+    // SAFETY: the queue receives one of our live command lists.
+    let state = unsafe { &(*this.cast::<List>()).metal };
+    state.lock().unwrap_or_else(|e| e.into_inner()).execute()
+}
+macro_rules! reject_metal {
+    ($this:expr, $reason:literal) => {
+        if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            with_metal($this, |s| s.reject($reason));
+            return;
+        }
+    };
+}
+#[cfg(target_os = "macos")]
+extern "system" fn unsupported_metal(this: This) -> HRESULT {
+    with_metal(this, |s| {
+        s.reject("command list method is unsupported on Metal")
+    });
+    object::E_NOTIMPL
+}
+
 pub(crate) extern "system" fn create_allocator(
     _: This,
     kind: u32,
@@ -162,11 +200,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -184,7 +222,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -193,14 +231,30 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(target_os = "macos")]
+    let metal = {
+        let mut state = crate::metal::State::default();
+        if !pipeline.is_null() {
+            state.set_pipeline(pipeline);
+        }
+        std::sync::Mutex::new(state)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = pipeline;
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -225,6 +279,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         }),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(target_os = "macos")]
+        metal,
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -252,10 +308,26 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        let mut result = Ok(());
+        with_metal(this, |s| result = s.close());
+        return match result {
+            Ok(()) => S_OK,
+            Err(e) => {
+                tracing::error!(error = %e, "Metal command list rejected");
+                object::E_NOTIMPL
+            }
+        };
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
+    #[cfg(not(target_os = "macos"))]
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -270,6 +342,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     with_state(this, |host, state| {
         host.reset();
         state.reset(pipeline);
+    });
+    #[cfg(target_os = "macos")]
+    with_metal(this, |s| {
+        *s = Default::default();
+        if !pipeline.is_null() {
+            s.set_pipeline(pipeline);
+        }
     });
     #[cfg(not(windows))]
     let _ = (this, pipeline);
@@ -351,6 +430,12 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(target_os = "macos")]
+    if count != 0 {
+        with_metal(this, |s| {
+            s.reject("resource barriers are unsupported on Metal")
+        });
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -425,6 +510,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    reject_metal!(this, "buffer copies are unsupported on Metal");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -437,6 +523,7 @@ extern "system" fn copy_buffer_region(
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    reject_metal!(this, "resource copies are unsupported on Metal");
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -490,6 +577,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    reject_metal!(this, "texture copies are unsupported on Metal");
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -606,6 +694,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    reject_metal!(this, "resolve is unsupported on Metal");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -674,6 +763,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    reject_metal!(this, "render-target clear is unsupported on Metal");
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -724,6 +814,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    reject_metal!(this, "depth clear is unsupported on Metal");
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -746,8 +837,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -757,6 +853,7 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    reject_metal!(this, "memory copy is unsupported on Metal");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -783,19 +880,32 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
-    #[cfg(windows)]
-    state::dispatch(this, x, y, z);
-    #[cfg(not(windows))]
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    #[cfg(target_os = "macos")]
     {
-        let _ = (this, x, y, z);
+        if flags != 0 {
+            return with_metal(this, |s| s.reject("DispatchX flags are unsupported"));
+        }
+        return state::dispatch(this, x, y, z);
+    }
+    #[cfg(windows)]
+    {
+        let _ = flags;
+        state::dispatch(this, x, y, z);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "system" fn query_mark(this: This, _heap: This, _kind: u32, _index: u32) {
+    reject_metal!(this, "queries are unsupported on Metal");
+    let _ = this;
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -813,6 +923,7 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    reject_metal!(this, "query resolve is unsupported on Metal");
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -856,6 +967,8 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
+    #[cfg(target_os = "macos")]
+    with_metal(this, |s| s.set_pipeline(pipeline));
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -864,7 +977,10 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    reject_metal!(this, "console sync is unsupported on Metal");
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -879,7 +995,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -892,14 +1011,22 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
+#[cfg(not(target_os = "macos"))]
 extern "system" fn ignored_state(_: This) {}
+#[cfg(target_os = "macos")]
+extern "system" fn ignored_state(this: This) {
+    with_metal(this, |s| s.reject("unsupported command-list state"));
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1089,8 +1216,70 @@ mod state {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod state {
+    use super::{This, with_metal};
+    pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+        if heaps.is_null() && count != 0 {
+            return with_metal(this, |s| s.reject("null descriptor heap list"));
+        }
+        let heaps = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller supplies `count` heap pointers.
+            unsafe { std::slice::from_raw_parts(heaps, count as usize) }
+        };
+        with_metal(this, |s| s.set_heaps(heaps));
+    }
+    pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        with_metal(this, |s| s.set_table(slot, handle));
+    }
+    pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        with_metal(this, |s| s.set_constants(slot, &[value], offset));
+    }
+    pub(super) extern "system" fn compute_constants(
+        this: This,
+        slot: u32,
+        count: u32,
+        values: *const u32,
+        offset: u32,
+    ) {
+        if values.is_null() && count != 0 {
+            return with_metal(this, |s| s.reject("null root constants"));
+        }
+        let values = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller supplies `count` constants.
+            unsafe { std::slice::from_raw_parts(values, count as usize) }
+        };
+        with_metal(this, |s| s.set_constants(slot, values, offset));
+    }
+    pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_metal(this, |s| s.dispatch([x, y, z]));
+    }
+    pub(super) use super::ignored_state as blend_factor;
+    pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as graphics_constant;
+    pub(super) use super::ignored_state as graphics_constants;
+    pub(super) use super::ignored_state as graphics_table;
+    pub(super) use super::ignored_state as graphics_view;
+    pub(super) use super::ignored_state as index_buffer;
+    pub(super) use super::ignored_state as scissors;
+    pub(super) use super::ignored_state as stencil_ref;
+    pub(super) use super::ignored_state as targets;
+    pub(super) use super::ignored_state as topology;
+    pub(super) use super::ignored_state as vertex_buffers;
+    pub(super) use super::ignored_state as viewports;
+    pub(super) use super::ignored_state as draw;
+    pub(super) use super::ignored_state as draw_indexed;
+    pub(super) use super::ignored_state as dispatch_mesh;
+    pub(super) use super::ignored_state as dispatch_mesh_x;
+}
+
 /// Without a host GPU every draw state call is ignored.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
@@ -1146,6 +1335,7 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    reject_metal!(this, "indirect execution is unsupported on Metal");
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
@@ -1159,7 +1349,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1215,7 +1409,10 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "system" fn wait_value(this: This, _address: u64, _comparison: u32, _reference: u64) {
+    reject_metal!(this, "GPU memory waits are unsupported on Metal");
+    let _ = this;
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1223,13 +1420,20 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(target_os = "macos")]
+    if count != 0 {
+        with_metal(this, |s| {
+            s.reject("enhanced barriers are unsupported on Metal")
+        });
+    }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1241,9 +1445,11 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    reject_metal!(this, "console memory writes are unsupported on Metal");
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    reject_metal!(this, "console memory writes are unsupported on Metal");
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -1263,6 +1469,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
+    reject_metal!(this, "console memory writes are unsupported on Metal");
     let _ = this;
     // Without a host GPU nothing runs later: write now.
     what.write(address as *mut u8, bytes);
@@ -1365,6 +1572,14 @@ const NEWER_METHODS: [(usize, *const ()); 3] = [
 
 const fn list_table(newer: bool) -> [*const (); 160] {
     let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
+    #[cfg(target_os = "macos")]
+    {
+        let mut slot = 9;
+        while slot < f.len() {
+            f[slot] = unsupported_metal as *const ();
+            slot += 1;
+        }
+    }
     let mut i = 0;
     while i < METHODS.len() + MORE_METHODS.len() {
         let (slot, method) = if i < METHODS.len() {
@@ -1426,10 +1641,18 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        assert!(
+            unsafe { &(*list.cast::<List>()).uploads }
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

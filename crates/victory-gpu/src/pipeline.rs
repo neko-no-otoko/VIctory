@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(target_os = "macos")]
+    metal: OnceLock<Result<Arc<Mutex<crate::metal::Prepared>>, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +90,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(target_os = "macos")]
+                metal: OnceLock::new(),
             })
         })
         .clone()
@@ -190,6 +194,23 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_compute(this: This) -> Result<Arc<Mutex<crate::metal::Prepared>>, String> {
+    if this.is_null() {
+        return Err("no compute pipeline bound".into());
+    }
+    let p = pipeline(this);
+    if p.shaders.len() != 1 || p.shaders[0].stage != "compute" {
+        return Err("pipeline is not a single compute shader".into());
+    }
+    p.shaders[0]
+        .metal
+        .get_or_init(|| {
+            crate::metal::Prepared::new(&p.shaders[0].container).map(|p| Arc::new(Mutex::new(p)))
+        })
+        .clone()
+}
+
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
@@ -275,7 +296,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).

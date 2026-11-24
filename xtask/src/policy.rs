@@ -19,6 +19,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 const ALLOWED_NAMES: &[&str] = &[
     "d3d12-probe.c",
     "metal_compute_probe.m",
+    "metal_compute.m",
     "metal_render.m",
     "rosetta-avx-probe.c",
     "macos_pe_fixture.c",

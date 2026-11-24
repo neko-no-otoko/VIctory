@@ -72,6 +72,11 @@ impl Heap {
         self.desc.kind == SAMPLERS
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_shader_visible_view_heap(&self) -> bool {
+        self.desc.kind == VIEWS_KIND && self.desc.flags & SHADER_VISIBLE != 0
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
@@ -637,7 +642,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {

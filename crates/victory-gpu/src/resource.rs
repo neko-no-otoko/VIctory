@@ -276,6 +276,7 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+#[cfg(windows)]
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
@@ -867,7 +868,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -981,6 +985,13 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Resource {
+    fn drop(&mut self) {
+        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
     }
 }
 
@@ -1233,7 +1244,7 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null

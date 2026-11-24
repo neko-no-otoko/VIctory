@@ -98,6 +98,31 @@ the converter's resource reflection, dispatches it on Metal and verifies
 `41 + 1` is written to a buffer without modifying its other words. This is
 one synthetic compute case, not a game compatibility or renderer test.
 
+The macOS `victory-gpu` command objects also have an experimental synchronous
+compute path: a recorded console compute dispatch translates the native
+shader, loads it through Apple's converter, and executes it on Metal when
+its command list is submitted. It supports a single shader-visible view
+heap, a whole-buffer UAV at descriptor index zero, and root constants;
+other shader bindings, descriptor changes after recording, root-signature
+commands, graphics, resource barriers, copies, waits and presentation are
+not implemented. Unsupported list commands reject the list; a submission
+failure latches the queue and prevents later fence signals. Dispatches retain
+their pipeline, heap and resource until the list is reset or released.
+The caller must not access a mapped buffer concurrently with submission.
+This experimental path is not wired into a macOS title loader and is not
+an Xbox GPU backend.
+
+To run the synthetic device/list/queue test on a Metal GPU (no title assets):
+
+```sh
+VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-gpu console_compute_records_and_submits_on_metal -- --ignored
+```
+
+It checks the buffer is unchanged before submission, runs two ordered
+dispatches with different constants, verifies the result is 42, and checks
+that a rejected list prevents the queue from signalling its fence.
+
 The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
 pipeline from converted vertex and fragment metallibs. It draws triangle
 lists from a float4 vertex buffer into RGBA8 and reads the pixels back;

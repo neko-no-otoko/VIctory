@@ -32,6 +32,10 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(target_os = "macos")]
+mod metal;
+#[cfg(all(test, target_os = "macos"))]
+mod metal_tests;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

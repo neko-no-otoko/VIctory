@@ -6,6 +6,9 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod compute;
+pub mod converter;
+
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::ptr::NonNull;

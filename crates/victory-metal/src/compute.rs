@@ -32,7 +32,11 @@ unsafe extern "C" {
 fn native_error(error: &[c_char]) -> String {
     // Native functions NUL-terminate the initialized error buffer.
     let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
-    if message.is_empty() { "Metal compute failed".into() } else { message.into_owned() }
+    if message.is_empty() {
+        "Metal compute failed".into()
+    } else {
+        message.into_owned()
+    }
 }
 
 /// A retained Metal compute pipeline with reusable shared buffers.
@@ -42,7 +46,6 @@ pub struct Compute {
 // Metal objects may be used from any thread; dispatch requires exclusive access
 // and completes before returning, so moving the retained handle is safe.
 unsafe impl Send for Compute {}
-
 
 impl Compute {
     pub fn new(metallib: &[u8], entry: &str) -> Result<Compute, String> {
@@ -54,10 +57,16 @@ impl Compute {
         // Inputs remain alive for the call; the native handle owns its pipeline.
         let handle = unsafe {
             victory_metal_compute_create(
-                metallib.as_ptr(), metallib.len(), entry.as_ptr(), error.as_mut_ptr(), error.len(),
+                metallib.as_ptr(),
+                metallib.len(),
+                entry.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
             )
         };
-        Ok(Self { handle: NonNull::new(handle).ok_or_else(|| native_error(&error))? })
+        Ok(Self {
+            handle: NonNull::new(handle).ok_or_else(|| native_error(&error))?,
+        })
     }
 
     /// Uploads the buffer and constants, waits for execution, and copies the result back.
@@ -71,7 +80,10 @@ impl Compute {
         if buffer.is_empty() || buffer.len() > u32::MAX as usize {
             return Err("buffer size must be nonzero and fit in 32 bits".into());
         }
-        if constants.len() < 4 || constants.len() % 4 != 0 || constants.len() > (u32::MAX / 4) as usize {
+        if constants.len() < 4
+            || constants.len() % 4 != 0
+            || constants.len() > (u32::MAX / 4) as usize
+        {
             return Err("constant size must be at least 16 bytes, a multiple of 16 bytes, and fit in 32 bits".into());
         }
         if groups.contains(&0) || threads.contains(&0) {
@@ -81,11 +93,22 @@ impl Compute {
         // All pointers remain valid until the native synchronous dispatch returns.
         let ok = unsafe {
             victory_metal_compute_dispatch(
-                self.handle.as_ptr(), buffer.as_mut_ptr(), buffer.len(), constants.as_ptr(),
-                constants.len() * 4, groups.as_ptr(), threads.as_ptr(), error.as_mut_ptr(), error.len(),
+                self.handle.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                constants.as_ptr(),
+                constants.len() * 4,
+                groups.as_ptr(),
+                threads.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
             )
         };
-        if ok { Ok(()) } else { Err(native_error(&error)) }
+        if ok {
+            Ok(())
+        } else {
+            Err(native_error(&error))
+        }
     }
 }
 

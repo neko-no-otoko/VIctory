@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(target_os = "macos")]
+static METAL_SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -34,6 +37,8 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    #[cfg(target_os = "macos")]
+    failed: AtomicBool,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +66,8 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        #[cfg(target_os = "macos")]
+        failed: AtomicBool::new(false),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -111,8 +118,33 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
+        #[cfg(target_os = "macos")]
+        if !this.is_null() && count != 0 {
+            queue(this).failed.store(true, Ordering::Release);
+        }
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if this.is_null() {
+            return;
+        }
+        let q = queue(this);
+        let _guard = METAL_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+        if q.failed.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: caller supplies count live command-list pointers.
+        let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        for &list in lists {
+            if let Err(error) = crate::list::metal_execute(list) {
+                tracing::error!(%error, "Metal command submission failed");
+                q.failed.store(true, Ordering::Release);
+                break;
+            }
+        }
         return;
     }
     #[cfg(windows)]
@@ -141,7 +173,15 @@ pub(crate) struct Plane {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, flags: u32) {
+    #[cfg(target_os = "macos")]
+    if token != 0 || flags != 0 {
+        if !this.is_null() {
+            queue(this).failed.store(true, Ordering::Release);
+        }
+        return;
+    }
+    let _ = (token, flags);
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
@@ -150,14 +190,25 @@ extern "system" fn signal2_x(
     this: This,
     fence: This,
     value: u64,
-    _bottom: *const u8,
-    _top: *const u8,
+    bottom: *const u8,
+    top: *const u8,
 ) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    if !bottom.is_null() || !top.is_null() {
+        return object::E_NOTIMPL;
+    }
+    let _ = (bottom, top);
     signal(this, fence, value)
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    let _guard = METAL_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "macos")]
+    if this.is_null() || queue(this).failed.load(Ordering::Acquire) {
+        return object::E_NOTIMPL;
+    }
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -165,6 +216,12 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = fence;
+        return object::E_NOTIMPL;
+    }
+    #[cfg(not(target_os = "macos"))]
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
@@ -242,6 +299,11 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (planes, plane_parameters);
+        return object::E_NOTIMPL;
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -403,7 +465,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
