@@ -1009,6 +1009,33 @@ and HUP with bounded child-group cleanup. It does not terminate a shared Wine
 server or track descendants that detach into another session. This is not
 ARM-native PE execution or evidence of game compatibility.
 
+The XGame title provider's `XLaunchNewGame` sends a bounded authenticated
+loopback request to `wine-run` after the existing HLE suspend routine. The
+launcher waits for the old Wine child to exit, tears down its process group,
+checks the requested executable and its imports again, and launches it with the
+same prefix, provider configuration, Metal host and save-root lock. An empty
+executable requests the current guest; a nonempty executable must be an
+absolute Windows drive path, not a relative or UNC path. A missing target,
+invalid request or unavailable launcher channel fails explicitly instead of
+silently restarting the wrong image. The guest and prefix remain trusted; the
+inherited token is not a security boundary against same-user processes.
+
+As in the existing Windows custom-loader path, the argument string is split on
+whitespace; quoted Windows command-line arguments are **not** preserved. Wine
+system APIs are not intercepted to populate HLE suspend registrations, so
+normal Wine lifecycle callbacks are not claimed. Wine server processes and
+descendants that leave the managed process group are not supervised.
+
+With the launcher test environment below, run:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_relaunch -- --ignored --nocapture --test-threads=1
+```
+
+The synthetic tests cover a second guest checking its image and arguments and
+confirming the first process had exited, absent and relative targets failing,
+and host cleanup.
+
 For the focused launcher tests, set the following paths (using the same
 target directory and LLVM-MinGW setup as above):
 

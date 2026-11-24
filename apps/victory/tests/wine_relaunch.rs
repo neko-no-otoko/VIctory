@@ -165,7 +165,9 @@ fn title_provider_relaunches_real_wine_guest_and_returns_final_status() {
     let first_marker = out.stdout.find("relaunch first guest sentinel written");
     let second_marker = out.stdout.find("relaunch second guest image, arguments and sentinel passed");
     assert!(matches!((first_marker, second_marker), (Some(a), Some(b)) if a < b), "{}\n{}", out.stdout, out.stderr);
-    assert_eq!(fs::read(marker).unwrap(), b"first guest completed before relaunch\0");
+    let marker = fs::read(marker).unwrap();
+    assert!(marker.starts_with(b"first guest completed before relaunch\0"));
+    assert_eq!(marker.len(), b"first guest completed before relaunch\0".len() + 4);
     f.assert_host_gone();
 }
 
@@ -179,6 +181,23 @@ fn nonexistent_relaunch_target_fails_after_first_guest() {
     assert!(!out.status.success(), "{}\n{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("relaunch first guest sentinel written"), "{}\n{}", out.stdout, out.stderr);
     assert!(!out.stdout.contains("relaunch second guest image"), "{}\n{}", out.stdout, out.stderr);
-    assert_eq!(fs::read(marker).unwrap(), b"first guest completed before relaunch\0");
+    let marker = fs::read(marker).unwrap();
+    assert!(marker.starts_with(b"first guest completed before relaunch\0"));
+    assert_eq!(marker.len(), b"first guest completed before relaunch\0".len() + 4);
+    f.assert_host_gone();
+}
+
+#[test]
+#[ignore = "requires configured Wine, LLVM-MinGW, provider DLLs and native Metal host/converter"]
+fn relative_relaunch_target_fails_closed() {
+    let f = Fixture::new();
+    let (first, second) = f.build();
+    let marker = f.temp.path().join("sentinel");
+    let mut command = f.command(&first, &second, &marker);
+    command.env("VICTORY_RELAUNCH_TEST_TARGET", "relative.exe");
+    let out = run(&mut command, f.temp.path());
+    assert!(!out.status.success(), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("absolute drive path"), "{}\n{}", out.stdout, out.stderr);
+    assert!(!out.stdout.contains("relaunch second guest image"), "{}\n{}", out.stdout, out.stderr);
     f.assert_host_gone();
 }

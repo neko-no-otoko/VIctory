@@ -26,7 +26,9 @@ int main(int argc, char **argv) {
         if (QueryApiImpl(&title_provider, &title_iid, &object) != 0 || !object) return 11;
         file = CreateFileA(marker, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file == INVALID_HANDLE_VALUE) return 12;
-        int ok = WriteFile(file, sentinel, sizeof(sentinel), &count, NULL) && count == sizeof(sentinel);
+        DWORD first_pid = GetCurrentProcessId();
+        int ok = WriteFile(file, sentinel, sizeof(sentinel), &count, NULL) && count == sizeof(sentinel) &&
+            WriteFile(file, &first_pid, sizeof(first_pid), &count, NULL) && count == sizeof(first_pid);
         CloseHandle(file);
         if (!ok) return 13;
         puts("relaunch first guest sentinel written"); fflush(stdout);
@@ -38,14 +40,25 @@ int main(int argc, char **argv) {
     }
     if (argc != 3 || strcmp(argv[1], "--phase") || strcmp(argv[2], "second")) return 15;
     DWORD length = GetModuleFileNameA(NULL, image, sizeof(image));
-    if (!length || length >= sizeof(image) ||
-        !GetFullPathNameA(target, sizeof(expected), expected, NULL) || _stricmp(image, expected)) return 16;
+    DWORD expected_len = GetFullPathNameA(target, sizeof(expected), expected, NULL);
+    if (!length || length >= sizeof(image) || !expected_len || expected_len >= sizeof(expected) || _stricmp(image, expected)) {
+        fprintf(stderr, "image path mismatch: image=%s target=%s expected=%s\n", image, target, expected);
+        return 16;
+    }
     file = CreateFileA(marker, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) return 17;
+    DWORD first_pid = 0;
     int ok = ReadFile(file, data, sizeof(data), &count, NULL) && count == sizeof(sentinel) &&
-        !memcmp(data, sentinel, sizeof(sentinel));
+        !memcmp(data, sentinel, sizeof(sentinel)) &&
+        ReadFile(file, &first_pid, sizeof(first_pid), &count, NULL) && count == sizeof(first_pid) && first_pid;
     CloseHandle(file);
     if (!ok) return 18;
+    HANDLE first = OpenProcess(SYNCHRONIZE, FALSE, first_pid);
+    if (first) {
+        DWORD state = WaitForSingleObject(first, 0);
+        CloseHandle(first);
+        if (state != WAIT_OBJECT_0) return 19;
+    } else if (GetLastError() != ERROR_INVALID_PARAMETER) return 20;
     puts("relaunch second guest image, arguments and sentinel passed"); fflush(stdout);
     return 42;
 }

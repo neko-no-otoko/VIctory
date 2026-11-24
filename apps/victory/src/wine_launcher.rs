@@ -5,8 +5,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -194,7 +194,50 @@ fn clean_bridge_env(command: &mut Command) {
     command.env_remove("VICTORY_WINE_METAL_ADDR")
         .env_remove("VICTORY_WINE_METAL_TOKEN")
         .env_remove("VICTORY_WINE_TITLE_DATA")
+        .env_remove("VICTORY_WINE_RELAUNCH_ADDR")
         .env_remove("VICTORY_WINE_PLS_DRIVE");
+}
+
+struct Relaunch {
+    exe: String,
+    args: String,
+}
+
+// This channel is for a trusted guest, not a same-user security boundary.
+// A bounded read prevents a partial frame from indefinitely stalling the
+// supervising loop; authentication uses the same private token as the bridge.
+fn receive_relaunch(listener: &TcpListener, token: &str) -> Result<Option<Relaunch>> {
+    let (mut stream, peer) = match listener.accept() {
+        Ok(connection) => connection,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e).context("accepting Wine relaunch request"),
+    };
+    if !peer.ip().is_loopback() { bail!("non-loopback Wine relaunch request"); }
+    // Accepted sockets can inherit nonblocking mode; read_exact needs the
+    // bounded blocking mode below rather than a race with the sender.
+    stream.set_nonblocking(false).context("setting relaunch connection blocking")?;
+    stream.set_read_timeout(Some(GRACE)).context("setting relaunch read timeout")?;
+    stream.set_write_timeout(Some(GRACE)).context("setting relaunch write timeout")?;
+    let mut header = [0u8; 48];
+    stream.read_exact(&mut header).context("reading Wine relaunch header")?;
+    if &header[..8] != b"VILNCH01" || &header[8..40] != token.as_bytes() {
+        bail!("invalid Wine relaunch authentication or protocol");
+    }
+    let exe_len = u32::from_le_bytes(header[40..44].try_into().expect("fixed header")) as usize;
+    let args_len = u32::from_le_bytes(header[44..48].try_into().expect("fixed header")) as usize;
+    if exe_len > 32767 || args_len > 32767 { bail!("Wine relaunch request exceeds size limit"); }
+    let mut data = vec![0; exe_len + args_len];
+    stream.read_exact(&mut data).context("reading Wine relaunch request")?;
+    if data.contains(&0) { bail!("Wine relaunch request contains a NUL byte"); }
+    let exe = std::str::from_utf8(&data[..exe_len]).context("invalid Wine relaunch executable encoding")?.to_owned();
+    let args = std::str::from_utf8(&data[exe_len..]).context("invalid Wine relaunch arguments encoding")?.to_owned();
+    let path = exe.as_bytes();
+    if !exe.is_empty() && !(path.len() >= 3 && path[0].is_ascii_alphabetic() &&
+        path[1] == b':' && matches!(path[2], b'\\' | b'/')) {
+        bail!("Wine relaunch executable must be an absolute drive path");
+    }
+    stream.write_all(&[1]).context("acknowledging Wine relaunch request")?;
+    Ok(Some(Relaunch { exe, args }))
 }
 
 fn nonblocking(reader: &impl AsRawFd) -> Result<()> {
@@ -629,14 +672,25 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     if let (Some(letter), Some((save, _))) = (storage_drive, &save_root) {
         checked_storage_drive(&wine_prefix, save, letter)?;
     }
-    let mut wine_command = Command::new(&wine);
-    wine_command.arg(&exe).args(args).env("WINEPREFIX", &wine_prefix)
-        .env("WINEPATH", wine_path).env("WINEDLLOVERRIDES", overrides);
-    clean_bridge_env(&mut wine_command);
-    wine_command.env("VICTORY_WINE_METAL_ADDR", address.to_string()).env("VICTORY_WINE_METAL_TOKEN", &token);
-    if let Some(root) = &windows_save_root { wine_command.env("VICTORY_WINE_TITLE_DATA", root); }
-    if let Some(letter) = storage_drive { wine_command.env("VICTORY_WINE_PLS_DRIVE", letter.to_string()); }
-    let mut guest = ManagedChild::spawn(&mut wine_command, "Wine")?;
+    let relaunch = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("binding Wine relaunch channel")?;
+    relaunch.set_nonblocking(true).context("setting Wine relaunch channel nonblocking")?;
+    let relaunch_address = relaunch.local_addr().context("reading Wine relaunch address")?.to_string();
+    let wine_command = |exe: &OsStr, args: &[OsString]| {
+        let mut command = Command::new(&wine);
+        command.arg(exe).args(args).env("WINEPREFIX", &wine_prefix)
+            .env("WINEPATH", &wine_path).env("WINEDLLOVERRIDES", &overrides);
+        clean_bridge_env(&mut command);
+        command.env("VICTORY_WINE_METAL_ADDR", address.to_string())
+            .env("VICTORY_WINE_METAL_TOKEN", &token)
+            .env("VICTORY_WINE_RELAUNCH_ADDR", &relaunch_address);
+        if let Some(root) = &windows_save_root { command.env("VICTORY_WINE_TITLE_DATA", root); }
+        if let Some(letter) = storage_drive { command.env("VICTORY_WINE_PLS_DRIVE", letter.to_string()); }
+        command
+    };
+    let mut launch_path = exe.as_os_str().to_owned();
+    let mut current_exe = exe;
+    let mut guest = ManagedChild::spawn(&mut wine_command(&launch_path, args), "Wine")?;
+    let mut pending = None;
     loop {
         check_signal()?;
         // Bound each drain so a noisy host cannot starve status and signal checks.
@@ -651,10 +705,36 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
                 }
             }
         }
+        if pending.is_none() { pending = receive_relaunch(&relaunch, &token)?; }
         let status = guest.try_wait()?;
         if let Some(host_status) = host.try_wait()? { bail!("Metal host exited while Wine was running: {host_status}"); }
         if let Some(status) = status {
-            return Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+            let Some(request) = pending.take() else {
+                return Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+            };
+            if !status.success() { bail!("Wine exited with {status} after requesting relaunch"); }
+            // End and reap the old process group before launching the new one.
+            drop(guest);
+            if !request.exe.is_empty() {
+                let path = winepath_output(&winepath, &wine_prefix, "-u", OsStr::new(&request.exe))
+                    .context("converting Wine relaunch executable")?;
+                current_exe = regular_file(&PathBuf::from(OsString::from_vec(path)), "relaunch executable")?;
+                // Validate the mapped host file, but let Wine open the exact
+                // requested Windows path so GetModuleFileName preserves it.
+                launch_path = OsString::from(&request.exe);
+            }
+            reject_known_shadows(&current_exe, &dll_dir, &wine_prefix)?;
+            crate::wine_imports::run(&current_exe, &dll_dir, provision_gameinput, guest_dll)?;
+            if let Some(root) = &title_root { checked_title_root(&wine_prefix, root)?; }
+            if let (Some(letter), Some((save, _))) = (storage_drive, &save_root) {
+                checked_storage_drive(&wine_prefix, save, letter)?;
+            }
+            if let Some(provider) = &input_provider {
+                checked_gameinput_installation(&wine_prefix, provider)?;
+                reject_gameinput_shadows(&current_exe, &wine_prefix)?;
+            }
+            let next_args: Vec<OsString> = request.args.split_whitespace().map(OsString::from).collect();
+            guest = ManagedChild::spawn(&mut wine_command(&launch_path, &next_args), "relaunched Wine")?;
         }
         std::thread::sleep(POLL);
     }
@@ -667,5 +747,37 @@ pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converte
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relaunch_accepts_a_fragmented_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let (ready, connected) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(b"VILNCH01").unwrap();
+            stream.write_all(token.as_bytes()).unwrap();
+            stream.write_all(&3u32.to_le_bytes()).unwrap();
+            stream.write_all(&3u32.to_le_bytes()).unwrap();
+            stream.write_all(b"C:\\one").unwrap();
+            let mut ack = [0];
+            stream.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [1]);
+        });
+        connected.recv().unwrap();
+        let request = receive_relaunch(&listener, token).unwrap().unwrap();
+        assert_eq!(request.exe, "C:\\");
+        assert_eq!(request.args, "one");
+        client.join().unwrap();
     }
 }
