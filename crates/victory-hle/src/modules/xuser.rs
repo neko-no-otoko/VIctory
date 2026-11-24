@@ -6,6 +6,9 @@
 
 use std::ffi::{c_char, c_void};
 
+pub use victory_runtime::user::{LOCAL_ID, USER_NOT_FOUND, XUID};
+use victory_runtime::user::{GAMERTAG, find_id, find_local_id};
+
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
@@ -50,13 +53,6 @@ pub const DEVICE_IID: Guid = Guid::new(
     0x4fdf,
     [0x93, 0x41, 0x9d, 0x5d, 0xa6, 0x49, 0xeb, 0xc8],
 );
-
-/// The documented "no such user" error.
-pub const USER_NOT_FOUND: HRESULT = 0x8924_5104_u32 as i32;
-
-pub const XUID: u64 = 0x0009_0000_0000_0001;
-pub const LOCAL_ID: u64 = 1;
-const GAMERTAG: &str = "Player";
 
 /// The only user; a handle is its address, duplicating and closing are free.
 pub struct User;
@@ -139,13 +135,13 @@ extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, LOCAL_ID)
 }
 extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
-    found(id == LOCAL_ID, out)
+    found(find_local_id(id), out)
 }
 extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, XUID)
 }
 extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
-    found(id == XUID, out)
+    found(find_id(id), out)
 }
 extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
     put(out, false)
