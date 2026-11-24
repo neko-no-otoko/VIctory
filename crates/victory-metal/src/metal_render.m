@@ -9,68 +9,121 @@ static bool fail(char *dst, size_t len, NSString *message) {
     return false;
 }
 
-// Synchronous procedural triangle render into caller-owned tightly packed
-// RGBA8 bytes. No console bindings or graphics state are emulated here.
-bool victory_metal_render(const char *source, const char *vertex_name,
-                          const uint8_t *fragment, size_t fragment_len,
-                          const char *fragment_name, uint32_t width, uint32_t height,
-                          uint8_t *pixels, char *error, size_t error_len) {
+@interface VictoryMetalRenderer : NSObject
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) id<MTLCommandQueue> queue;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pipeline;
+@property(nonatomic, strong) id<MTLTexture> texture;
+@property(nonatomic, strong) id<MTLBuffer> readback;
+@property(nonatomic, strong) id<MTLBuffer> vertices;
+@property(nonatomic) uint32_t width;
+@property(nonatomic) uint32_t height;
+@property(nonatomic) size_t stride;
+@end
+@implementation VictoryMetalRenderer
+@end
+
+static id<MTLLibrary> loadLibrary(id<MTLDevice> device, const uint8_t *bytes,
+                                  size_t len, NSError **error) {
+    // Retain a copy for as long as Metal retains the dispatch data.
+    NSData *owned = [NSData dataWithBytes:bytes length:len];
+    dispatch_data_t data = dispatch_data_create(owned.bytes, owned.length,
+                                                dispatch_get_main_queue(), ^{ (void)owned; });
+    return [device newLibraryWithData:data error:error];
+}
+
+void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
+                           const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
+                           uint32_t width, uint32_t height, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        if (!device) return fail(error, error_len, @"no Metal device");
+#define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
+        VictoryMetalRenderer *r = [VictoryMetalRenderer new];
+        r.device = MTLCreateSystemDefaultDevice();
+        if (!r.device) FAIL(@"no Metal device");
         NSError *e = nil;
-        NSString *vertexSource = [NSString stringWithUTF8String:source];
-        id<MTLLibrary> vertexLibrary = [device newLibraryWithSource:vertexSource options:nil error:&e];
-        if (!vertexLibrary) return fail(error, error_len, e.localizedDescription ?: @"vertex compilation failed");
-        id<MTLFunction> vertex = [vertexLibrary newFunctionWithName:[NSString stringWithUTF8String:vertex_name]];
-        if (!vertex) return fail(error, error_len, @"vertex function not found");
-        NSData *bytes = [NSData dataWithBytesNoCopy:(void *)fragment length:fragment_len freeWhenDone:NO];
-        dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, dispatch_get_main_queue(), ^{ (void)bytes; });
-        id<MTLLibrary> fragmentLibrary = [device newLibraryWithData:data error:&e];
-        if (!fragmentLibrary) return fail(error, error_len, e.localizedDescription ?: @"fragment library loading failed");
-        id<MTLFunction> pixel = [fragmentLibrary newFunctionWithName:[NSString stringWithUTF8String:fragment_name]];
-        if (!pixel) return fail(error, error_len, @"fragment function not found");
+        id<MTLLibrary> vl = loadLibrary(r.device, vertex_data, vertex_len, &e);
+        if (!vl) FAIL(e.localizedDescription ?: @"vertex library loading failed");
+        id<MTLFunction> vertex = [vl newFunctionWithName:[NSString stringWithUTF8String:vertex_name]];
+        if (!vertex) FAIL(@"vertex function not found");
+        id<MTLLibrary> fl = loadLibrary(r.device, fragment_data, fragment_len, &e);
+        if (!fl) FAIL(e.localizedDescription ?: @"fragment library loading failed");
+        id<MTLFunction> fragment = [fl newFunctionWithName:[NSString stringWithUTF8String:fragment_name]];
+        if (!fragment) FAIL(@"fragment function not found");
+        MTLVertexDescriptor *layout = [MTLVertexDescriptor vertexDescriptor];
+        // Apple's converter reserves attributes 0-10 and vertex buffers 0-5.
+        layout.attributes[11].format = MTLVertexFormatFloat4;
+        layout.attributes[11].offset = 0;
+        layout.attributes[11].bufferIndex = 6;
+        layout.layouts[6].stride = 4 * sizeof(float);
+        layout.layouts[6].stepFunction = MTLVertexStepFunctionPerVertex;
         MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
         desc.vertexFunction = vertex;
-        desc.fragmentFunction = pixel;
+        desc.fragmentFunction = fragment;
+        desc.vertexDescriptor = layout;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-        id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&e];
-        if (!pipeline) return fail(error, error_len, e.localizedDescription ?: @"pipeline creation failed");
-        MTLTextureDescriptor *textureDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
-        textureDesc.storageMode = MTLStorageModePrivate;
-        textureDesc.usage = MTLTextureUsageRenderTarget;
-        id<MTLTexture> texture = [device newTextureWithDescriptor:textureDesc];
-        if (!texture) return fail(error, error_len, @"texture allocation failed");
-        size_t rowBytes = (size_t)width * 4;
-        size_t stride = (rowBytes + 255) & ~(size_t)255;
-        if (stride > SIZE_MAX / height) return fail(error, error_len, @"readback dimensions overflow");
-        id<MTLBuffer> readback = [device newBufferWithLength:stride * height options:MTLResourceStorageModeShared];
-        if (!readback) return fail(error, error_len, @"readback allocation failed");
+        r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
+        if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");
+        MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+        texture.storageMode = MTLStorageModePrivate;
+        texture.usage = MTLTextureUsageRenderTarget;
+        r.texture = [r.device newTextureWithDescriptor:texture];
+        if (!r.texture) FAIL(@"texture allocation failed");
+        size_t row = (size_t)width * 4;
+        r.stride = (row + 255) & ~(size_t)255;
+        if (r.stride > SIZE_MAX / height) FAIL(@"readback dimensions overflow");
+        r.readback = [r.device newBufferWithLength:r.stride * height options:MTLResourceStorageModeShared];
+        r.queue = [r.device newCommandQueue];
+        if (!r.readback || !r.queue) FAIL(@"readback or queue allocation failed");
+        r.width = width;
+        r.height = height;
+#undef FAIL
+        return (__bridge_retained void *)r;
+    }
+}
+
+bool victory_metal_draw(void *handle, const float *vertices, uint32_t count, uint8_t *pixels,
+                        char *error, size_t error_len) {
+    @autoreleasepool {
+        if (error_len) error[0] = 0;
+        VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+        size_t size = (size_t)count * 4 * sizeof(float);
+        if (!r.vertices || r.vertices.length < size)
+            r.vertices = [r.device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        if (!r.vertices) return fail(error, error_len, @"vertex buffer allocation failed");
+        memcpy(r.vertices.contents, vertices, size);
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = texture;
+        pass.colorAttachments[0].texture = r.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLCommandQueue> queue = [device newCommandQueue];
-        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLCommandBuffer> command = [r.queue commandBuffer];
         id<MTLRenderCommandEncoder> render = [command renderCommandEncoderWithDescriptor:pass];
-        if (!queue || !command || !render) return fail(error, error_len, @"render command creation failed");
-        [render setRenderPipelineState:pipeline];
-        [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        if (!command || !render) return fail(error, error_len, @"render command creation failed");
+        [render setRenderPipelineState:r.pipeline];
+        [render setVertexBuffer:r.vertices offset:0 atIndex:6];
+        [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
         [render endEncoding];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
         if (!blit) return fail(error, error_len, @"blit command creation failed");
-        [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(width, height, 1) toBuffer:readback destinationOffset:0
-              destinationBytesPerRow:stride destinationBytesPerImage:stride * height];
+        [blit copyFromTexture:r.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(r.width, r.height, 1) toBuffer:r.readback destinationOffset:0
+              destinationBytesPerRow:r.stride destinationBytesPerImage:r.stride * r.height];
         [blit endEncoding];
         [command commit];
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted)
             return fail(error, error_len, command.error.localizedDescription ?: @"GPU command failed");
-        for (uint32_t y = 0; y < height; ++y)
-            memcpy(pixels + (size_t)y * rowBytes, (const uint8_t *)readback.contents + (size_t)y * stride, rowBytes);
+        size_t row = (size_t)r.width * 4;
+        for (uint32_t y = 0; y < r.height; ++y)
+            memcpy(pixels + (size_t)y * row, (const uint8_t *)r.readback.contents + (size_t)y * r.stride, row);
         return true;
+    }
+}
+
+void victory_metal_destroy(void *handle) {
+    @autoreleasepool {
+        VictoryMetalRenderer *r = (__bridge_transfer VictoryMetalRenderer *)handle;
+        (void)r;
     }
 }

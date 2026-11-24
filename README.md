@@ -98,12 +98,13 @@ the converter's resource reflection, dispatches it on Metal and verifies
 `41 + 1` is written to a buffer without modifying its other words. This is
 one synthetic compute case, not a game compatibility or renderer test.
 
-The macOS-only `victory-metal` library offers a limited offscreen
-`render_triangle` API: it compiles caller-supplied procedural Metal vertex
-source, links a converted fragment metallib, renders to RGBA8 and returns
-CPU-readable pixels. It binds no vertex buffers or shader resources, and
-does not implement a console GPU, presentation, or game rendering.
-To exercise this path with a synthetic translated GFX10 fragment shader:
+The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
+pipeline from converted vertex and fragment metallibs. It draws triangle
+lists from a float4 vertex buffer into RGBA8 and reads the pixels back;
+device, pipeline, target and buffers are reused across draws. Its fixed input
+layout supports one per-vertex float4 and it binds no other shader resources.
+It does not implement a console GPU, presentation, or game rendering.
+To exercise synthetic translated GFX10 vertex and fragment shaders:
 
 ```sh
 cargo build -p victory

@@ -1,18 +1,9 @@
 #![cfg(target_os = "macos")]
 
 use std::process::Command;
-use victory_metal::render_triangle;
-use victory_shader::native::StageIo;
+use victory_metal::Renderer;
+use victory_shader::native::{StageIo, Usage, VsInput};
 use victory_shader::{Container, HwStage, NativeProgram, emit, io, ir, resource, structure};
-
-const VERTEX: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-vertex float4 triangle(uint id [[vertex_id]]) {
-    float2 p[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
-    return float4(p[id], 0.0, 1.0);
-}
-"#;
 
 // Synthetic GFX10 pixel shader exporting RGBA (1, 0, 0, 1), no game data.
 fn fragment_dxil() -> Vec<u8> {
@@ -75,46 +66,138 @@ fn fragment_dxil() -> Vec<u8> {
     .dxil
 }
 
+// A translated GFX10 vertex shader forwards float4 POSITION to SV_Position.
+fn vertex_dxil() -> Vec<u8> {
+    let native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 15,
+                vgpr: 4,
+            }],
+            outputs: vec![],
+        },
+        code: [0xf800_18cfu32, 0x0706_0504, 0xbf81_0000]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+    };
+    let signature = |name: &[u8], system: u32| {
+        let mut sig = vec![0u8; 40];
+        sig[0..4].copy_from_slice(&1u32.to_le_bytes());
+        sig[4..8].copy_from_slice(&8u32.to_le_bytes());
+        sig[12..16].copy_from_slice(&40u32.to_le_bytes());
+        sig[20..24].copy_from_slice(&system.to_le_bytes());
+        sig[24..28].copy_from_slice(&3u32.to_le_bytes());
+        sig[32] = 15;
+        sig.extend_from_slice(name);
+        sig
+    };
+    let input = signature(b"POSITION\0", 0);
+    let output = signature(b"SV_Position\0", 1);
+    let second = 40 + 8 + input.len();
+    let mut data = vec![0u8; 40];
+    data[..4].copy_from_slice(b"DXBC");
+    data[24..28].copy_from_slice(&((second + 8 + output.len()) as u32).to_le_bytes());
+    data[28..32].copy_from_slice(&2u32.to_le_bytes());
+    data[32..36].copy_from_slice(&40u32.to_le_bytes());
+    data[36..40].copy_from_slice(&(second as u32).to_le_bytes());
+    for (tag, sig) in [(b"ISG1", input), (b"OSG1", output)] {
+        data.extend_from_slice(tag);
+        data.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        data.extend_from_slice(&sig);
+    }
+    let container = Container::parse(&data).unwrap();
+    let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let resources = resource::track(&program, &native.layout, native.stage).unwrap();
+    let raised = io::raise(&program, &native).unwrap();
+    let structured = structure::structure(&program).unwrap();
+    emit::emit(
+        &container,
+        &native,
+        &program,
+        &structured,
+        &raised,
+        &resources,
+    )
+    .unwrap()
+    .dxil
+}
+
 #[test]
 fn rejects_invalid_arguments_before_gpu_work() {
-    assert!(render_triangle(VERTEX, "triangle", &[], "main", 1, 1).is_err());
-    assert!(render_triangle(VERTEX, "triangle", &[1], "main", 0, 1).is_err());
-    assert!(render_triangle("bad\0source", "triangle", &[1], "main", 1, 1).is_err());
+    assert!(Renderer::new(&[], "main", &[1], "main", 1, 1).is_err());
+    assert!(Renderer::new(&[1], "main", &[1], "main", 0, 1).is_err());
+    assert!(Renderer::new(&[1], "bad\0name", &[1], "main", 1, 1).is_err());
 }
 
 #[test]
 #[ignore = "requires a Metal GPU, Apple's converter and a built victory CLI"]
-fn translated_fragment_renders_pixels() {
-    let cli =
-        std::env::var_os("VICTORY_TEST_CLI").expect("set VICTORY_TEST_CLI to the victory binary");
+fn translated_stages_render_vertex_buffer() {
+    let cli = std::env::var_os("VICTORY_TEST_CLI").expect("set VICTORY_TEST_CLI");
     let converter =
         std::env::var_os("VICTORY_TEST_METAL_CONVERTER").expect("set VICTORY_TEST_METAL_CONVERTER");
     let tmp = tempfile::tempdir().unwrap();
-    let dxil = tmp.path().join("fragment.dxil");
-    let metallib = tmp.path().join("fragment.metallib");
-    std::fs::write(&dxil, fragment_dxil()).unwrap();
-    let result = Command::new(cli)
-        .arg("convert-metal")
-        .arg(&dxil)
-        .arg("--library")
-        .arg(converter)
-        .args(["--stage", "fragment", "--output"])
-        .arg(&metallib)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "converter: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let fragment = std::fs::read(metallib).unwrap();
-    // Odd width verifies the padded GPU readback stride is removed correctly.
-    let pixels = render_triangle(VERTEX, "triangle", &fragment, "main", 5, 3).unwrap();
-    assert_eq!(pixels.len(), 5 * 3 * 4);
+    let mut libs = Vec::new();
+    for (stage, data) in [("vertex", vertex_dxil()), ("fragment", fragment_dxil())] {
+        let dxil = tmp.path().join(format!("{stage}.dxil"));
+        let metallib = tmp.path().join(format!("{stage}.metallib"));
+        std::fs::write(&dxil, data).unwrap();
+        let output = Command::new(&cli)
+            .arg("convert-metal")
+            .arg(&dxil)
+            .arg("--library")
+            .arg(&converter)
+            .arg("--stage")
+            .arg(stage)
+            .arg("--output")
+            .arg(&metallib)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "converter: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        libs.push(std::fs::read(metallib).unwrap());
+    }
+    // Odd width verifies padded GPU readback is copied into tight rows.
+    let mut renderer = Renderer::new(&libs[0], "main", &libs[1], "main", 5, 3).unwrap();
+    let fullscreen = [[-1., -1., 0., 1.], [3., -1., 0., 1.], [-1., 3., 0., 1.]];
+    let outside = [[2., 2., 0., 1.], [3., 2., 0., 1.], [2., 3., 0., 1.]];
+    let mut pixels = vec![0; 5 * 3 * 4];
+    renderer.draw(&fullscreen, &mut pixels).unwrap();
     assert!(
         pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]),
         "{pixels:?}"
     );
-    assert!(render_triangle(VERTEX, "missing", &fragment, "main", 1, 1).is_err());
-    assert!(render_triangle(VERTEX, "triangle", &fragment, "main", 0, 1).is_err());
+    let two_triangles = [
+        fullscreen[0],
+        fullscreen[1],
+        fullscreen[2],
+        outside[0],
+        outside[1],
+        outside[2],
+    ];
+    renderer.draw(&two_triangles, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]),
+        "{pixels:?}"
+    );
+    renderer.draw(&outside, &mut pixels).unwrap();
+    assert!(pixels.iter().all(|p| *p == 0), "{pixels:?}");
+    renderer.draw(&fullscreen, &mut pixels).unwrap();
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]),
+        "{pixels:?}"
+    );
+    assert!(renderer.draw(&[], &mut pixels).is_err());
+    assert!(renderer.draw(&fullscreen, &mut pixels[..4]).is_err());
+    assert!(Renderer::new(&libs[0], "missing", &libs[1], "main", 1, 1).is_err());
 }
