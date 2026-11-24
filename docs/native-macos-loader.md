@@ -90,21 +90,29 @@ tools, then build or run that target. For a self-authored PE executable:
 ```sh
 cargo run -p victory --target x86_64-apple-darwin -- native-fixture /path/to/fixture.exe
 cargo run -p victory --target x86_64-apple-darwin -- native-fixture /path/to/fixture.exe --execute
+cargo run -p victory --target x86_64-apple-darwin -- native-fixture /path/to/fixture.exe --dll /path/to/consumer.dll --dll /path/to/provider.dll --execute
 ```
 
-Without `--execute`, the command maps and binds but does not call the entry.
-With it, code runs **unsandboxed in the CLI process** and can crash, hang or
-corrupt it. Only pass a trusted fixture with a normally returning
-`extern "win64" fn() -> u32` entry, and ensure its callbacks and thread
-lifetime satisfy the safety requirements above. The returned integer is
-printed; it is not used as the CLI exit status. This command cannot supply
-dependent DLLs, rejects unsupported images and missing imports, and exposes
-only the combined native services described above. It does not supply a
-Windows environment, start Windows processes, or support games.
+Without `--execute`, the command maps and binds but calls neither the
+executable entry nor DLL attach functions. Repeat `--dll` to supply each
+trusted dependency explicitly. The UTF-8 basename is its import name;
+matching and duplicate-name rejection use ASCII case-insensitivity. Two
+paths with the same basename are rejected even if they are in different
+directories. The loader attaches DLLs in dependency order and detaches in
+reverse order; cycles, forwarded exports, unsupported images and missing
+imports are rejected. DLLs are not searched for or loaded dynamically.
+
+With `--execute`, executable and DLL code runs **unsandboxed in the CLI
+process** and can crash, hang or corrupt it. Only pass trusted images with
+a normally returning `extern "win64" fn() -> u32` executable entry, and
+ensure every DLL, callback and thread lifetime satisfies the safety
+requirements above. The returned integer is printed, not used as the CLI
+exit status. Only the limited native services above are exposed. This does
+not supply a Windows environment, start Windows processes, or support games.
 
 With LLVM-MinGW on `PATH` as in the test setup below, the following builds
-and runs a self-authored synthetic PE using both native services, verifies
-the opt-in and exercises missing-import and invalid-image failures:
+and runs self-authored synthetic executables and DLLs, checks dependency
+attachment/detachment order and opt-in, and exercises failure paths:
 
 ```sh
 cargo test -p victory --target x86_64-apple-darwin --test native_fixture

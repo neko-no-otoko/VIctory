@@ -72,3 +72,95 @@ unsigned entry(void) {
     std::fs::write(&invalid, b"not a PE").unwrap();
     assert!(!cli(&["native-fixture".as_ref(), invalid.as_os_str(), "--execute".as_ref()]).status.success());
 }
+
+#[test]
+fn explicit_dll_dependencies_attach_in_order_and_reject_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("failed")).unwrap();
+    std::fs::write(root.join("provider.def"), "LIBRARY provider.dll\nEXPORTS\nis_live\nnote_attach\nnote_detach\n").unwrap();
+    std::fs::write(root.join("consumer.def"), "LIBRARY consumer.dll\nEXPORTS\nconsumer_call\n").unwrap();
+    std::fs::write(root.join("provider.c"), r#"
+static int live, attached, detached;
+int *volatile relocate = &live;
+__declspec(dllexport) int is_live(void) { return *relocate; }
+__declspec(dllexport) void note_attach(void) { attached = 1; }
+__declspec(dllexport) void note_detach(void) { detached = 1; }
+int DllMain(void *m, unsigned long reason, void *r) {
+    (void)m; (void)r;
+    if (reason == 1) live = 1;
+    if (reason == 0) { if (attached && !detached) __builtin_trap(); live = 0; }
+    return 1;
+}
+"#).unwrap();
+    std::fs::write(root.join("consumer.c"), r#"
+__declspec(dllimport) int is_live(void);
+__declspec(dllimport) void note_attach(void);
+__declspec(dllimport) void note_detach(void);
+static int live;
+int *volatile relocate = &live;
+__declspec(dllexport) int consumer_call(void) { return *relocate && is_live() ? 42 : 0; }
+int DllMain(void *m, unsigned long reason, void *r) {
+    (void)m; (void)r;
+    if (reason == 1) {
+        if (!is_live()) return 0;
+#ifdef FAIL_ATTACH
+        return 0;
+#else
+        live = 1; note_attach();
+#endif
+    }
+    if (reason == 0) { if (!is_live()) __builtin_trap(); note_detach(); live = 0; }
+    return 1;
+}
+"#).unwrap();
+    std::fs::write(root.join("program.c"), r#"
+__declspec(dllimport) int consumer_call(void);
+int value = 7; int *volatile relocate = &value;
+unsigned entry(void) { return *relocate == 7 ? consumer_call() : 0; }
+"#).unwrap();
+    for (def, lib) in [("provider.def", "provider.lib"), ("consumer.def", "consumer.lib")] {
+        tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", def, "-l", lib]);
+    }
+    for (source, object, define) in [("provider.c", "provider.obj", ""), ("consumer.c", "consumer.obj", ""), ("consumer.c", "failed.obj", "-DFAIL_ATTACH"), ("program.c", "program.obj", "")] {
+        let mut args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", source, "-o", object];
+        if !define.is_empty() { args.push(define); }
+        tool(root, "x86_64-w64-mingw32-clang", &args);
+    }
+    tool(root, "lld-link", &["/dll", "/entry:DllMain", "/nodefaultlib", "/dynamicbase", "/out:PROVIDER.DLL", "provider.obj"]);
+    tool(root, "lld-link", &["/dll", "/entry:DllMain", "/nodefaultlib", "/dynamicbase", "/out:consumer.dll", "consumer.obj", "provider.lib"]);
+    tool(root, "lld-link", &["/dll", "/entry:DllMain", "/nodefaultlib", "/dynamicbase", "/out:failed/consumer.dll", "failed.obj", "provider.lib"]);
+    tool(root, "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:program.exe", "program.obj", "consumer.lib"]);
+    let exe = root.join("program.exe");
+    let provider = root.join("PROVIDER.DLL");
+    let consumer = root.join("consumer.dll");
+    let failed = root.join("failed/consumer.dll");
+    // Deliberately provide the dependent DLL first and vary the provider's
+    // filename case; attachment must still follow the import graph.
+    let args = ["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), consumer.as_os_str(), "--dll".as_ref(), provider.as_os_str()];
+    let dry = cli(&args);
+    assert!(dry.status.success(), "{}", String::from_utf8_lossy(&dry.stderr));
+    assert!(String::from_utf8_lossy(&dry.stdout).contains("entry not executed"));
+    let mut exec_args = args.to_vec();
+    exec_args.push("--execute".as_ref());
+    let executed = cli(&exec_args);
+    assert!(executed.status.success(), "{}", String::from_utf8_lossy(&executed.stderr));
+    assert!(String::from_utf8_lossy(&executed.stdout).contains("fixture entry returned 42"));
+    // This DLL rejects process attach, so mapping succeeds only if dry-run
+    // leaves DLL entry points untouched.
+    let failed_dry = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), failed.as_os_str(), "--dll".as_ref(), provider.as_os_str()]);
+    assert!(failed_dry.status.success(), "{}", String::from_utf8_lossy(&failed_dry.stderr));
+    let failed_attach = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), failed.as_os_str(), "--dll".as_ref(), provider.as_os_str(), "--execute".as_ref()]);
+    assert!(!failed_attach.status.success());
+    assert!(String::from_utf8_lossy(&failed_attach.stderr).contains("attaching consumer.dll"));
+    let missing = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), consumer.as_os_str()]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("is_live"));
+    let duplicate = root.join("different/CONSUMER.DLL");
+    let duplicate = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), consumer.as_os_str(), "--dll".as_ref(), duplicate.as_os_str()]);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate DLL filename"));
+    let invalid = root.join("invalid.dll");
+    std::fs::write(&invalid, b"not a PE").unwrap();
+    assert!(!cli(&["native-fixture".as_ref(), exe.as_os_str(), "--dll".as_ref(), invalid.as_os_str()]).status.success());
+}
