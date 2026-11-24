@@ -1122,3 +1122,145 @@ unsigned entry(void) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{}", String::from_utf8_lossy(&output.stdout));
 }
+
+// A small PE32+ assembled in memory, so the census test does not depend on a
+// linker choosing a particular section layout. Its entry point is UD2.
+fn census_pe() -> Vec<u8> {
+    fn u16_at(b: &mut [u8], o: usize, v: u16) { b[o..o + 2].copy_from_slice(&v.to_le_bytes()); }
+    fn u32_at(b: &mut [u8], o: usize, v: u32) { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); }
+    fn u64_at(b: &mut [u8], o: usize, v: u64) { b[o..o + 8].copy_from_slice(&v.to_le_bytes()); }
+    fn rva(r: usize) -> usize { r - 0x1000 + 0x200 }
+    fn string(b: &mut [u8], r: usize, s: &str) {
+        let o = rva(r);
+        b[o..o + s.len()].copy_from_slice(s.as_bytes());
+        b[o + s.len()] = 0;
+    }
+    let mut b = vec![0; 0xa00];
+    b[0..2].copy_from_slice(b"MZ");
+    u32_at(&mut b, 0x3c, 0x80);
+    b[0x80..0x84].copy_from_slice(b"PE\0\0");
+    u16_at(&mut b, 0x84, 0x8664);
+    u16_at(&mut b, 0x86, 1);
+    u16_at(&mut b, 0x94, 0xf0);
+    u16_at(&mut b, 0x96, 0x22);
+    let opt = 0x98;
+    u16_at(&mut b, opt, 0x20b);
+    u32_at(&mut b, opt + 16, 0x1000);
+    u32_at(&mut b, opt + 20, 0x1000);
+    u64_at(&mut b, opt + 24, 0x140000000);
+    u32_at(&mut b, opt + 32, 0x1000);
+    u32_at(&mut b, opt + 36, 0x200);
+    u32_at(&mut b, opt + 56, 0x2000);
+    u32_at(&mut b, opt + 60, 0x200);
+    u16_at(&mut b, opt + 68, 3);
+    u64_at(&mut b, opt + 72, 0x100000);
+    u64_at(&mut b, opt + 80, 0x1000);
+    u64_at(&mut b, opt + 88, 0x100000);
+    u64_at(&mut b, opt + 96, 0x1000);
+    u32_at(&mut b, opt + 108, 16);
+    for (index, address, size) in [(1, 0x1100, 60), (3, 0x1450, 12), (9, 0x1400, 40), (10, 0x1460, 4), (13, 0x1300, 64)] {
+        u32_at(&mut b, opt + 112 + index * 8, address);
+        u32_at(&mut b, opt + 116 + index * 8, size);
+    }
+    let section = 0x188;
+    b[section..section + 5].copy_from_slice(b".text");
+    u32_at(&mut b, section + 8, 0x800);
+    u32_at(&mut b, section + 12, 0x1000);
+    u32_at(&mut b, section + 16, 0x800);
+    u32_at(&mut b, section + 20, 0x200);
+    u32_at(&mut b, section + 36, 0xe0000020);
+    b[rva(0x1000)..rva(0x1000) + 2].copy_from_slice(&[0x0f, 0x0b]);
+
+    // Two ordinary import descriptors, followed by their null terminator.
+    for (d, lookup, dll, iat) in [(0x1100, 0x1180, 0x1270, 0x11c0), (0x1114, 0x11b0, 0x1280, 0x11f0)] {
+        u32_at(&mut b, rva(d), lookup);
+        u32_at(&mut b, rva(d + 12), dll);
+        u32_at(&mut b, rva(d + 16), iat);
+    }
+    for (i, (address, name)) in [(0x1200, "VirtualAlloc"), (0x1210, "CreateFileW"), (0x1220, "CensusUnknown"), (0x1230, "QueryPerformanceCounter"), (0x1250, "GetLastError")].iter().enumerate() {
+        u64_at(&mut b, rva(0x1180) + i * 8, *address);
+        u64_at(&mut b, rva(0x11c0) + i * 8, *address);
+        string(&mut b, *address as usize + 2, name);
+    }
+    u64_at(&mut b, rva(0x11b0), 0x1298);
+    u64_at(&mut b, rva(0x11f0), 0x1298);
+    string(&mut b, 0x1270, "kernel32.dll");
+    string(&mut b, 0x1280, "xgameruntime.dll");
+    string(&mut b, 0x129a, "QueryApiImpl");
+
+    // Delay import of a known symbol: resolving it is not loader support.
+    u32_at(&mut b, rva(0x1300), 1);
+    u32_at(&mut b, rva(0x1304), 0x13a0);
+    u32_at(&mut b, rva(0x130c), 0x1380);
+    u32_at(&mut b, rva(0x1310), 0x1360);
+    u64_at(&mut b, rva(0x1360), 0x13c0);
+    u64_at(&mut b, rva(0x1380), 0x13c0);
+    string(&mut b, 0x13a0, "kernel32.dll");
+    string(&mut b, 0x13c2, "VirtualAlloc");
+    // Valid TLS directory with an image-backed index and no callbacks.
+    u64_at(&mut b, rva(0x1410), 0x140001480);
+    b
+}
+
+#[test]
+fn native_census_reports_imports_scope_and_loader_limitations_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let pe = dir.path().join("census.exe");
+    let file_root = dir.path().join("files");
+    let save_root = dir.path().join("saves");
+    std::fs::create_dir(&file_root).unwrap();
+    std::fs::create_dir(&save_root).unwrap();
+    std::fs::write(&pe, census_pe()).unwrap();
+    let run = |roots: &[&std::ffi::OsStr]| {
+        let mut args = vec!["native-census".as_ref(), pe.as_os_str()];
+        args.extend_from_slice(roots);
+        let output = cli(&args);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let unscoped = run(&[]);
+    let scoped = run(&["--file-root".as_ref(), file_root.as_os_str(), "--save-root".as_ref(), save_root.as_os_str()]);
+    for report in [&unscoped, &scoped] {
+        for line in [
+            "ordinary kernel32.dll!VirtualAlloc: resolved",
+            "ordinary kernel32.dll!CensusUnknown: missing",
+            "ordinary kernel32.dll!QueryPerformanceCounter: resolved",
+            "ordinary kernel32.dll!GetLastError: resolved",
+            "ordinary xgameruntime.dll!QueryApiImpl: resolved",
+            "delay kernel32.dll!VirtualAlloc: resolved",
+            "native loader: unsupported",
+            "no image is mapped or executed",
+            "game compatibility is not assessed",
+            "TLS: rejected",
+            "exception: rejected",
+            "delay imports: rejected",
+            "load config: rejected",
+        ] {
+            assert!(report.contains(line), "missing {line:?} in {report}");
+        }
+    }
+    assert!(unscoped.contains("ordinary kernel32.dll!CreateFileW: missing"), "{unscoped}");
+    assert!(unscoped.contains("imports: 6 ordinary, 1 delay; 5 resolved, 2 missing"), "{unscoped}");
+    assert!(scoped.contains("imports: 6 ordinary, 1 delay; 6 resolved, 1 missing"), "{scoped}");
+    let file_only = run(&["--file-root".as_ref(), file_root.as_os_str()]);
+    assert!(unscoped.contains("File scope: disabled"), "{unscoped}");
+    assert!(scoped.contains("File scope: enabled"), "{scoped}");
+    assert!(scoped.contains("Save scope: enabled"), "{scoped}");
+    assert!(file_only.contains("ordinary kernel32.dll!CreateFileW: resolved"), "{file_only}");
+    // Removing the optional directories must change the limitation report,
+    // without changing the ordinary imports.
+    let mut plain = census_pe();
+    for index in [3, 9, 10, 13] {
+        plain[0x98 + 112 + index * 8..0x98 + 120 + index * 8].fill(0);
+    }
+    std::fs::write(&pe, plain).unwrap();
+    let absent = run(&[]);
+    for line in ["TLS: absent", "exception: absent", "delay imports: absent", "load config: absent",
+        "imports: 6 ordinary, 0 delay; 4 resolved, 2 missing"] {
+        assert!(absent.contains(line), "missing {line:?} in {absent}");
+    }
+    assert!(scoped.contains("ordinary kernel32.dll!CreateFileW: resolved"), "{scoped}");
+    let bad = cli(&["native-census".as_ref(), pe.as_os_str(), "--save-root".as_ref(), save_root.as_os_str()]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("--file-root"));
+}

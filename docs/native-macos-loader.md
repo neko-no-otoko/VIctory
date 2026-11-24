@@ -204,6 +204,19 @@ only unmaps memory and never invokes arbitrary code. Export addresses remain
 valid only while the image is alive. Calling an export executes arbitrary
 machine code.
 
+## Native resolver census
+
+On x86-64 macOS, `victory native-census <image>` parses a PE without mapping
+or executing it and reports every ordinary and delay import against the actual
+native resolver. It identifies TLS, exception tables, delay imports, and load
+configuration that the native loader rejects. A resolved delay import is still
+rejected by the loader. `--file-root <directory>` and optional
+`--save-root <directory>` configure the same scoped resolver as
+`native-fixture`; without a file root, scoped file imports report missing.
+The roots are opened and validated but no guest code runs. DLL providers are
+not inferred, and a resolved symbol does not mean every operation on it is
+supported. This diagnostic is not a game compatibility assessment.
+
 ## Trusted fixture CLI
 
 An x86-64 macOS build of `victory` exposes `native-fixture`. On Apple Silicon,

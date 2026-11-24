@@ -9,6 +9,8 @@ mod inspect;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod native_census;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_fixture;
 #[cfg(windows)]
 mod run;
@@ -114,6 +116,18 @@ enum Command {
         #[arg(long, value_enum)]
         stage: metal::Stage,
     },
+    /// Report native resolver coverage without mapping or executing a PE.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    NativeCensus {
+        /// PE32+ image to inspect.
+        file: PathBuf,
+        /// Enable the scoped file provider for resolution reporting.
+        #[arg(long)]
+        file_root: Option<PathBuf>,
+        /// Configure the separate writable save root.
+        #[arg(long, requires = "file_root")]
+        save_root: Option<PathBuf>,
+    },
     /// Map a trusted, controlled PE fixture; never Windows process startup.
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     #[command(long_about = "Map a trusted, controlled PE fixture and explicitly supplied DLLs. With --execute, call its normally returning extern win64 fn() -> u32 entry in this process, without isolation. This is not Windows process startup or game support; Windows process state, TLS, exception handling and CRT startup are absent.")]
@@ -216,6 +230,8 @@ fn main() -> Result<()> {
         } => metal::convert(&input, &output, &library, stage),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Command::NativeFixture { exe, dll, execute, file_root, save_root } => native_fixture::run(&exe, &dll, execute, file_root.as_deref(), save_root.as_deref()),
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        Command::NativeCensus { file, file_root, save_root } => native_census::run(&file, file_root.as_deref(), save_root.as_deref()),
         #[cfg(windows)]
         Command::Run {
             exe,
