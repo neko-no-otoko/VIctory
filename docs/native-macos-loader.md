@@ -213,11 +213,16 @@ The API provides `CreateFileW`, `ReadFile`, `WriteFile`, `SetFilePointerEx`,
 `GetFileSizeEx`, `FlushFileBuffers`, `CloseHandle`, `GetLastError`, and
 `SetLastError`. Game files support only regular read-only `OPEN_EXISTING`
 with `FILE_SHARE_READ`. Save files support regular synchronous reads/writes,
-`OPEN_EXISTING`, `CREATE_NEW`, and `OPEN_ALWAYS`, with both `FILE_SHARE_READ`
-and `FILE_SHARE_WRITE`; writable hard-linked files are rejected. Truncation,
-deletion, other access/creation modes and flags, and overlapped I/O are not
-supported. Windows sharing restrictions against external host processes are
-not enforced.
+`OPEN_EXISTING`, `CREATE_NEW`, and `OPEN_ALWAYS`, with exactly
+`FILE_SHARE_READ | FILE_SHARE_WRITE`; writable hard-linked files are rejected.
+`CreateDirectoryW`, `MoveFileExW`, and `DeleteFileW` operate only on `T:`
+paths. Moves support regular single-link files and flags zero or
+`MOVEFILE_REPLACE_EXISTING`; replacement is atomic. Directory and case-only
+moves are unsupported. Delete accepts only regular single-link files.
+Open save handles prevent moves, replacement and deletion in cooperating
+processes; Windows sharing restrictions against other host processes are not
+enforced. Truncation, other creation modes and flags, and overlapped I/O are
+not supported.
 Without `--file-root`, these imports remain unresolved. This path binding is
 not a process sandbox: guest machine code and host callbacks execute
 unsandboxed and must be trusted.

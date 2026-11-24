@@ -4,6 +4,9 @@
 //! threads are not supported. This is not a process sandbox. The host must
 //! not mutate the root trees concurrently: advisory locks coordinate only
 //! cooperating file scopes, not arbitrary host processes.
+//! Save handles hold shared advisory file locks; rename and deletion require
+//! exclusive locks, including across cooperating processes. Mutations only
+//! support single-link regular files, not directories or case-only renames.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -23,7 +26,9 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_SHARING_VIOLATION: u32 = 32;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const ERROR_NOT_SAME_DEVICE: u32 = 17;
 const ERROR_INVALID_DATA: u32 = 13;
 const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_DUP_NAME: u32 = 52;
@@ -115,6 +120,9 @@ pub(crate) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
     let ImportSymbol::Name { name, .. } = symbol else { return None };
     Some(match name.as_str() {
         "CreateFileW" => create_file_w as *const () as usize,
+        "CreateDirectoryW" => create_directory_w as *const () as usize,
+        "MoveFileExW" => move_file_ex_w as *const () as usize,
+        "DeleteFileW" => delete_file_w as *const () as usize,
         "ReadFile" => read_file as *const () as usize,
         "WriteFile" => write_file as *const () as usize,
         "FlushFileBuffers" => flush_file_buffers as *const () as usize,
@@ -137,6 +145,8 @@ fn error_code(error: &io::Error, intermediate: bool) -> u32 {
         Some(libc::ENOTDIR) => ERROR_PATH_NOT_FOUND,
         Some(libc::EEXIST) => ERROR_FILE_EXISTS,
         Some(libc::EACCES | libc::EPERM | libc::ELOOP) => ERROR_ACCESS_DENIED,
+        Some(libc::EXDEV) => ERROR_NOT_SAME_DEVICE,
+        Some(libc::ENOTSUP) => ERROR_NOT_SUPPORTED,
         Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE) => ERROR_NOT_ENOUGH_MEMORY,
         Some(libc::ENAMETOOLONG) => ERROR_INVALID_NAME,
         Some(libc::EINVAL | libc::EOVERFLOW) => ERROR_INVALID_PARAMETER,
@@ -201,6 +211,202 @@ fn consider_component(selected: &mut Option<CString>, wanted: &[u8], name: &CStr
         *selected = Some(name.to_owned());
     }
     Ok(())
+}
+// The save root lock serializes case-folded resolution with mutations and
+// with acquiring the lifetime locks on open save files.
+struct SaveLock<'a>(&'a File);
+impl Drop for SaveLock<'_> {
+    fn drop(&mut self) { unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); } }
+}
+
+fn lock_save(root: &File) -> Result<SaveLock<'_>, u32> {
+    if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(error_code(&io::Error::last_os_error(), false));
+    }
+    Ok(SaveLock(root))
+}
+
+fn save_relative(path: &str) -> Result<&str, u32> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].eq_ignore_ascii_case(&b'T') || bytes[1] != b':'
+        || !matches!(bytes[2], b'/' | b'\\')
+    {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    Ok(&path[3..])
+}
+
+// Resolve every parent as a directory without following links. Return the
+// final component separately so callers can safely create or rename it.
+fn save_parent(root: &File, path: &str) -> Result<(File, CString), u32> {
+    if path.is_empty() { return Err(ERROR_INVALID_NAME); }
+    if path.starts_with(['/', '\\']) || path.contains(':') { return Err(ERROR_ACCESS_DENIED); }
+    let mut parts = path.split(['/', '\\']).peekable();
+    let fd = unsafe { libc::openat(root.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(error_code(&io::Error::last_os_error(), true)); }
+    let mut parent = unsafe { File::from_raw_fd(fd) };
+    while let Some(part) = parts.next() {
+        if part.is_empty() || part == "." || part == ".." { return Err(ERROR_ACCESS_DENIED); }
+        if parts.peek().is_none() {
+            return Ok((parent, CString::new(part).map_err(|_| ERROR_INVALID_NAME)?));
+        }
+        let name = find_component(&parent, part, true)?;
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } == 0
+                && unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK
+            {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            return Err(error_code(&error, true));
+        }
+        parent = unsafe { File::from_raw_fd(fd) };
+    }
+    Err(ERROR_INVALID_NAME)
+}
+
+fn selected_name(parent: &File, name: &CStr) -> Result<Option<CString>, u32> {
+    let name = name.to_str().map_err(|_| ERROR_INVALID_NAME)?;
+    match find_component(parent, name, false) {
+        Ok(name) => Ok(Some(name)),
+        Err(ERROR_FILE_NOT_FOUND) => Ok(None),
+        Err(code) => Err(code),
+    }
+}
+
+// Only single-link regular files can be removed or replaced. The exclusive
+// lock conflicts with every cooperating open save handle until it is closed.
+fn lock_mutation_file(parent: &File, name: &CStr) -> Result<File, u32> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(error_code(&io::Error::last_os_error(), false));
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(error_code(&io::Error::last_os_error(), false)); }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|e| error_code(&e, false))?;
+    if !metadata.is_file() || metadata.nlink() != 1
+        || metadata.dev() != stat.st_dev as u64 || metadata.ino() != stat.st_ino as u64
+    {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+            ERROR_SHARING_VIOLATION
+        } else { error_code(&error, false) });
+    }
+    Ok(file)
+}
+
+unsafe extern "win64" fn create_directory_w(path: *const u16, security: *const c_void) -> i32 {
+    if !security.is_null() { fail(ERROR_NOT_SUPPORTED); return 0; }
+    let result = (|| {
+        let path = unsafe { guest_path(path) }?;
+        let relative = save_relative(&path)?;
+        CONTEXT.with(|slot| {
+            let slot = slot.borrow();
+            let root = slot.as_ref().ok_or(ERROR_INVALID_HANDLE)?.save.as_ref().ok_or(ERROR_ACCESS_DENIED)?;
+            let _lock = lock_save(root)?;
+            let (parent, name) = save_parent(root, relative)?;
+            if let Some(existing) = selected_name(&parent, &name)? {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe { libc::fstatat(parent.as_raw_fd(), existing.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                    return Err(error_code(&io::Error::last_os_error(), false));
+                }
+                if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    return Err(ERROR_ACCESS_DENIED);
+                }
+                return Err(ERROR_ALREADY_EXISTS);
+            }
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+                let error = io::Error::last_os_error();
+                return Err(if error.raw_os_error() == Some(libc::EEXIST) { ERROR_ALREADY_EXISTS } else { error_code(&error, false) });
+            }
+            Ok(())
+        })
+    })();
+    match result { Ok(()) => 1, Err(code) => { fail(code); 0 } }
+}
+
+unsafe extern "win64" fn move_file_ex_w(source: *const u16, destination: *const u16, flags: u32) -> i32 {
+    if flags & !1 != 0 { fail(ERROR_NOT_SUPPORTED); return 0; }
+    let result = (|| {
+        let source = unsafe { guest_path(source) }?;
+        let destination = unsafe { guest_path(destination) }?;
+        let source = save_relative(&source)?;
+        let destination = save_relative(&destination)?;
+        CONTEXT.with(|slot| {
+            let slot = slot.borrow();
+            let root = slot.as_ref().ok_or(ERROR_INVALID_HANDLE)?.save.as_ref().ok_or(ERROR_ACCESS_DENIED)?;
+            let _lock = lock_save(root)?;
+            let (source_parent, source_name) = save_parent(root, source)?;
+            let (dest_parent, dest_name) = save_parent(root, destination)?;
+            let source_name = selected_name(&source_parent, &source_name)?.ok_or(ERROR_FILE_NOT_FOUND)?;
+            let dest_existing = selected_name(&dest_parent, &dest_name)?;
+            let source_file = lock_mutation_file(&source_parent, &source_name)?;
+            let _dest_file = if let Some(name) = &dest_existing {
+                // Avoid trying to lock the same inode twice.
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe { libc::fstatat(dest_parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                    return Err(error_code(&io::Error::last_os_error(), false));
+                }
+                let stat = unsafe { stat.assume_init() };
+                let source_stat = source_file.metadata().map_err(|e| error_code(&e, false))?;
+                if source_stat.dev() == stat.st_dev as u64 && source_stat.ino() == stat.st_ino as u64 {
+                    return Err(if source_name.as_bytes() == dest_name.as_bytes() {
+                        ERROR_ALREADY_EXISTS
+                    } else {
+                        ERROR_NOT_SUPPORTED
+                    });
+                }
+                Some(lock_mutation_file(&dest_parent, name)?)
+            } else { None };
+            if dest_existing.is_some() && flags == 0 { return Err(ERROR_ALREADY_EXISTS); }
+            let final_name = dest_existing.as_ref().unwrap_or(&dest_name);
+            // RENAME_EXCL guarantees no replacement even if a non-cooperating
+            // process races the lookup; replacing uses the atomic rename.
+            let rename_flags = if flags == 0 { 0x0000_0004 } else { 0 }; // RENAME_EXCL
+            let rc = unsafe { renameatx_np(source_parent.as_raw_fd(), source_name.as_ptr(), dest_parent.as_raw_fd(), final_name.as_ptr(), rename_flags) };
+            if rc != 0 {
+                let error = io::Error::last_os_error();
+                return Err(if error.raw_os_error() == Some(libc::EEXIST) { ERROR_ALREADY_EXISTS } else { error_code(&error, false) });
+            }
+            Ok(())
+        })
+    })();
+    match result { Ok(()) => 1, Err(code) => { fail(code); 0 } }
+}
+
+// Declared here because not all libc versions expose Darwin's renameatx_np.
+unsafe extern "C" {
+    fn renameatx_np(fromfd: libc::c_int, from: *const libc::c_char, tofd: libc::c_int, to: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+}
+
+unsafe extern "win64" fn delete_file_w(path: *const u16) -> i32 {
+    let result = (|| {
+        let path = unsafe { guest_path(path) }?;
+        let relative = save_relative(&path)?;
+        CONTEXT.with(|slot| {
+            let slot = slot.borrow();
+            let root = slot.as_ref().ok_or(ERROR_INVALID_HANDLE)?.save.as_ref().ok_or(ERROR_ACCESS_DENIED)?;
+            let _lock = lock_save(root)?;
+            let (parent, name) = save_parent(root, relative)?;
+            let name = selected_name(&parent, &name)?.ok_or(ERROR_FILE_NOT_FOUND)?;
+            let _file = lock_mutation_file(&parent, &name)?;
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(error_code(&io::Error::last_os_error(), false));
+            }
+            Ok(())
+        })
+    })();
+    match result { Ok(()) => 1, Err(code) => { fail(code); 0 } }
 }
 
 fn open_relative(root: &File, path: &str, readable: bool, writable: bool, disposition: u32) -> Result<(File, bool), u32> {
@@ -296,20 +502,16 @@ unsafe extern "win64" fn create_file_w(
         } else { (None, path.as_str()) };
         let save = drive == Some(b'T') && context.save.is_some();
         if writable && !save { return Err(ERROR_NOT_SUPPORTED); }
-        if save && share & 3 != 3 { return Err(ERROR_NOT_SUPPORTED); }
+        if save && share != 3 { return Err(ERROR_NOT_SUPPORTED); }
         let root = if save { context.save.as_ref().unwrap() } else { &context.root };
-        // The advisory lock covers all case-folded lookups and creation.
-        struct Lock<'a>(&'a File);
-        impl Drop for Lock<'_> {
-            fn drop(&mut self) { unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); } }
-        }
-        let _lock = if save {
-            if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(error_code(&io::Error::last_os_error(), false));
-            }
-            Some(Lock(root))
-        } else { None };
+        let _lock = if save { Some(lock_save(root)?) } else { None };
         let (file, created) = open_relative(root, relative, readable, writable, disposition)?;
+        if save && unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                ERROR_SHARING_VIOLATION
+            } else { error_code(&error, false) });
+        }
         let handle = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             (value != INVALID_HANDLE).then(|| value + 1)
         }).map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
@@ -550,10 +752,12 @@ mod tests {
         std::fs::write(game.join("data"), b"game").unwrap();
         let scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
         unsafe {
-            for path in ["data", "C:\\data", "T:\\..\\data"] {
+            for path in ["data", "C:\\data"] {
                 assert_eq!(save_open(path, 4), INVALID_HANDLE);
-                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+                assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
             }
+            assert_eq!(save_open("T:\\..\\data", 4), INVALID_HANDLE);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
             let h = save_open("t:\\Save.DAT", 4);
             assert_ne!(h, INVALID_HANDLE);
             assert_eq!(get_last_error(), 0);
@@ -582,7 +786,7 @@ mod tests {
         unsafe {
             assert_ne!(open("T:\\data"), INVALID_HANDLE);
             assert_eq!(save_open("T:\\data", 3), INVALID_HANDLE);
-            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
         }
     }
 
@@ -636,6 +840,127 @@ mod tests {
             assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
             assert_eq!(flush_file_buffers(h), 0);
             assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn save_directory_move_delete_and_restrictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(game.join("game"), b"game").unwrap();
+        let _scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            let mkdir = |path: &str| create_directory_w(wide(path).as_ptr(), null());
+            let mv = |from: &str, to: &str, flags| move_file_ex_w(wide(from).as_ptr(), wide(to).as_ptr(), flags);
+            let delete = |path: &str| delete_file_w(wide(path).as_ptr());
+            assert_eq!(mkdir("T:\\Folder"), 1);
+            assert_eq!(mkdir("t:\\folder"), 0);
+            assert_eq!(get_last_error(), ERROR_ALREADY_EXISTS);
+            assert_eq!(mkdir("T:\\missing\\child"), 0);
+            assert_eq!(get_last_error(), ERROR_PATH_NOT_FOUND);
+            assert_eq!(mkdir("folder"), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(create_directory_w(wide("T:\\other").as_ptr(), 1usize as *const c_void), 0);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            std::fs::write(save.join("Folder/Source"), b"source").unwrap();
+            std::fs::write(save.join("Folder/Dest"), b"dest").unwrap();
+            assert_eq!(mv("T:\\folder\\source", "T:\\folder\\dest", 0), 0);
+            assert_eq!(get_last_error(), ERROR_ALREADY_EXISTS);
+            assert_eq!(std::fs::read(save.join("Folder/Dest")).unwrap(), b"dest");
+            assert_eq!(mv("T:\\folder\\source", "T:\\folder\\dest", 2), 0);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            assert_eq!(mv("T:\\folder\\source", "C:\\game", 1), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(mv("game", "T:\\folder\\new", 0), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(mv("T:\\folder\\source", "T:\\folder\\dest", 1), 1);
+            assert_eq!(std::fs::read(save.join("Folder/Dest")).unwrap(), b"source");
+            assert_eq!(mv("T:\\folder\\dest", "T:\\folder\\DEST", 1), 0);
+            assert_eq!(get_last_error(), ERROR_NOT_SUPPORTED);
+            assert_eq!(mv("T:\\folder\\dest", "T:\\folder\\new", 0), 1);
+            assert_eq!(delete("T:\\FOLDER\\NEW"), 1);
+            assert_eq!(delete("T:\\folder\\new"), 0);
+            assert_eq!(get_last_error(), ERROR_FILE_NOT_FOUND);
+            assert_eq!(delete("T:\\folder"), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(delete("C:\\game"), 0);
+            assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(std::fs::read(game.join("game")).unwrap(), b"game");
+        }
+    }
+
+    #[test]
+    fn save_mutations_reject_links_and_open_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(save.join("source"), b"source").unwrap();
+        std::fs::write(save.join("dest"), b"dest").unwrap();
+        std::fs::write(save.join("linked"), b"linked").unwrap();
+        std::fs::hard_link(save.join("linked"), game.join("alias")).unwrap();
+        symlink("source", save.join("symlink")).unwrap();
+        symlink(&game, save.join("dirlink")).unwrap();
+        let _scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            let mv = |from: &str, to: &str| move_file_ex_w(wide(from).as_ptr(), wide(to).as_ptr(), 1);
+            let delete = |path: &str| delete_file_w(wide(path).as_ptr());
+            for path in ["T:\\symlink", "T:\\linked", "T:\\dirlink\\alias"] {
+                assert_eq!(delete(path), 0);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+                assert_eq!(mv(path, "T:\\new"), 0);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+                assert_eq!(mv("T:\\source", path), 0);
+                assert_eq!(get_last_error(), ERROR_ACCESS_DENIED);
+            }
+            let source = save_open("T:\\source", 3);
+            assert_ne!(source, INVALID_HANDLE);
+            assert_eq!(delete("T:\\source"), 0);
+            assert_eq!(get_last_error(), ERROR_SHARING_VIOLATION);
+            assert_eq!(mv("T:\\source", "T:\\new"), 0);
+            assert_eq!(get_last_error(), ERROR_SHARING_VIOLATION);
+            assert_eq!(close_handle(source), 1);
+            let dest = save_open("T:\\dest", 3);
+            assert_ne!(dest, INVALID_HANDLE);
+            assert_eq!(mv("T:\\source", "T:\\dest"), 0);
+            assert_eq!(get_last_error(), ERROR_SHARING_VIOLATION);
+            assert_eq!(close_handle(dest), 1);
+            assert_eq!(mv("T:\\source", "T:\\dest"), 1);
+        }
+    }
+
+    #[test]
+    fn save_mutation_respects_other_scope_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let save = dir.path().join("save");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(save.join("file"), b"data").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let thread_game = game.clone();
+        let thread_save = save.clone();
+        let thread = std::thread::spawn(move || {
+            let _scope = FileScope::enter_with_save(&thread_game, Some(&thread_save)).unwrap();
+            let handle = unsafe { save_open("T:\\file", 3) };
+            assert_ne!(handle, INVALID_HANDLE);
+            ready_tx.send(()).unwrap();
+            close_rx.recv().unwrap();
+            assert_eq!(close_handle(handle), 1);
+        });
+        ready_rx.recv().unwrap();
+        let _scope = FileScope::enter_with_save(&game, Some(&save)).unwrap();
+        unsafe {
+            assert_eq!(delete_file_w(wide("T:\\file").as_ptr()), 0);
+            assert_eq!(get_last_error(), ERROR_SHARING_VIOLATION);
+            close_tx.send(()).unwrap();
+            thread.join().unwrap();
+            assert_eq!(delete_file_w(wide("T:\\file").as_ptr()), 1);
         }
     }
 

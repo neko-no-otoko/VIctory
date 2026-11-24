@@ -487,3 +487,104 @@ unsigned entry(void) {
     let no_game = cli(&["native-fixture".as_ref(), verify.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
     assert!(!no_game.status.success(), "--save-root must require --file-root");
 }
+
+#[test]
+fn native_fixture_mutates_only_scoped_save_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("game");
+    let save = dir.path().join("save");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::create_dir(&save).unwrap();
+    std::fs::write(game.join("game.bin"), b"game").unwrap();
+    std::fs::write(dir.path().join("outside.bin"), b"outside").unwrap();
+    std::fs::write(save.join("source.bin"), b"source").unwrap();
+    std::fs::write(save.join("destination.bin"), b"destination").unwrap();
+    std::fs::hard_link(game.join("game.bin"), save.join("hardlink")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside.bin"), save.join("link")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), save.join("dirlink")).unwrap();
+    std::fs::write(dir.path().join("kernel32.def"), "LIBRARY kernel32.dll\nEXPORTS\nCreateDirectoryW\nMoveFileExW\nDeleteFileW\n").unwrap();
+    std::fs::write(dir.path().join("save_ops.c"), r#"
+typedef unsigned long DWORD;
+typedef int BOOL;
+typedef unsigned short WCHAR;
+__declspec(dllimport) BOOL CreateDirectoryW(const WCHAR *, void *);
+__declspec(dllimport) BOOL MoveFileExW(const WCHAR *, const WCHAR *, DWORD);
+__declspec(dllimport) BOOL DeleteFileW(const WCHAR *);
+#define W(s) ((const WCHAR *)L##s)
+int marker = 7; int *volatile relocated_marker = &marker;
+unsigned entry(void) {
+    if (*relocated_marker != 7) return 1;
+#ifdef CREATE
+    if (!CreateDirectoryW(W("T:\\Folder"), 0)) return 2;
+    if (CreateDirectoryW(W("t:\\fOLDER"), 0)) return 3;
+    if (!MoveFileExW(W("T:\\source.bin"), W("t:\\folder\\renamed.bin"), 0)) return 4;
+#elif defined(REJECT)
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\destination.bin"), 0)) return 5;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\other.bin"), 2)) return 6;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\other.bin"), 0x80000000UL)) return 7;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("C:\\game.bin"), 1)) return 8;
+    if (MoveFileExW(W("C:\\game.bin"), W("T:\\other.bin"), 0)) return 9;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("relative.bin"), 0)) return 10;
+    if (MoveFileExW(W("relative.bin"), W("T:\\other.bin"), 0)) return 11;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\..\\outside.bin"), 1)) return 12;
+    if (MoveFileExW(W("T:\\..\\outside.bin"), W("T:\\other.bin"), 0)) return 13;
+    if (MoveFileExW(W("T:\\link"), W("T:\\other.bin"), 0)) return 14;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\link"), 1)) return 15;
+    if (MoveFileExW(W("T:\\hardlink"), W("T:\\other.bin"), 0)) return 16;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\hardlink"), 1)) return 17;
+    if (MoveFileExW(W("T:\\Folder\\renamed.bin"), W("T:\\dirlink\\outside.bin"), 1)) return 18;
+    if (DeleteFileW(W("T:\\link"))) return 19;
+    if (DeleteFileW(W("T:\\hardlink"))) return 20;
+    if (DeleteFileW(W("T:\\dirlink\\outside.bin"))) return 21;
+    if (DeleteFileW(W("T:\\..\\outside.bin"))) return 22;
+    if (DeleteFileW(W("C:\\game.bin"))) return 23;
+    if (DeleteFileW(W("game.bin"))) return 24;
+    if (CreateDirectoryW(W("C:\\newdir"), 0)) return 25;
+    if (CreateDirectoryW(W("newdir"), 0)) return 26;
+    if (CreateDirectoryW(W("T:\\..\\newdir"), 0)) return 27;
+    if (CreateDirectoryW(W("T:\\dirlink\\newdir"), 0)) return 28;
+    if (CreateDirectoryW(W("T:\\otherdir"), (void *)1)) return 29;
+#elif defined(REPLACE)
+    if (!MoveFileExW(W("t:\\folder\\RENAMED.bin"), W("T:\\destination.bin"), 1)) return 30;
+#else
+    if (!DeleteFileW(W("t:\\DESTINATION.bin"))) return 31;
+    if (DeleteFileW(W("T:\\destination.bin"))) return 32;
+#endif
+    return 42;
+}
+"#).unwrap();
+    tool(dir.path(), "llvm-dlltool", &["-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"]);
+    for (name, define) in [("create", "-DCREATE"), ("reject", "-DREJECT"), ("replace", "-DREPLACE"), ("delete", "")] {
+        let obj = format!("{name}.obj");
+        let exe = format!("{name}.exe");
+        let mut args = vec!["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "save_ops.c", "-o", &obj];
+        if !define.is_empty() { args.push(define); }
+        tool(dir.path(), "x86_64-w64-mingw32-clang", &args);
+        tool(dir.path(), "lld-link", &["/entry:entry", "/subsystem:console", "/nodefaultlib", "/dynamicbase", &format!("/out:{exe}"), &obj, "kernel32.lib"]);
+    }
+    let run = |name: &str| {
+        let exe = dir.path().join(format!("{name}.exe"));
+        let output = cli(&["native-fixture".as_ref(), exe.as_os_str(), "--file-root".as_ref(), game.as_os_str(), "--save-root".as_ref(), save.as_os_str(), "--execute".as_ref()]);
+        assert!(output.status.success(), "{name}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "{name}: {}", String::from_utf8_lossy(&output.stdout));
+    };
+    run("create");
+    assert!(!save.join("source.bin").exists());
+    assert_eq!(std::fs::read(save.join("Folder/renamed.bin")).unwrap(), b"source");
+    run("reject");
+    assert_eq!(std::fs::read(save.join("Folder/renamed.bin")).unwrap(), b"source");
+    assert_eq!(std::fs::read(save.join("destination.bin")).unwrap(), b"destination");
+    assert!(!save.join("other.bin").exists());
+    assert!(!save.join("otherdir").exists());
+    assert!(!dir.path().join("newdir").exists());
+    assert!(!game.join("newdir").exists());
+    assert_eq!(std::fs::read(game.join("game.bin")).unwrap(), b"game");
+    assert_eq!(std::fs::read(dir.path().join("outside.bin")).unwrap(), b"outside");
+    run("replace");
+    assert!(!save.join("Folder/renamed.bin").exists());
+    assert_eq!(std::fs::read(save.join("destination.bin")).unwrap(), b"source");
+    run("delete");
+    assert!(!save.join("destination.bin").exists());
+    assert_eq!(std::fs::read(game.join("game.bin")).unwrap(), b"game");
+    assert_eq!(std::fs::read(dir.path().join("outside.bin")).unwrap(), b"outside");
+}
