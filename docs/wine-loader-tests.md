@@ -204,3 +204,99 @@ library in the release. Review its packaged agreement before use or
 redistribution. Microsoft DXC is distributed under its
 [license](https://github.com/microsoft/DirectXShaderCompiler/blob/main/LICENSE.TXT).
 No third-party binaries are included in VIctory.
+
+## Experimental Wine-to-native-Metal pipe
+
+An isolated prototype runs a normal x86-64 PE process under Wine and connects
+its test DLL over private inherited standard-input/output pipes to the
+`wine_metal_bridge` macOS example. The DLL sends bounded, synchronous RGBA8
+clear requests; the host uses `victory-metal` and returns the actual Metal
+readback. The channel is reserved for this protocol and cannot carry guest
+console output. An invalid frame or Metal failure terminates the bridge.
+This is a trusted-fixture experiment, not a sandbox or an Xbox graphics API.
+
+The ignored integration test builds the self-authored PE and DLL with
+LLVM-MinGW, uses an isolated Wine prefix, and verifies two Windows threads'
+compiler-generated static TLS, TLS callbacks, and independently colored Metal
+readbacks. On the M3 Max with Wine 11 under Rosetta it passed:
+
+```sh
+WINE=/opt/homebrew/bin/wine \
+cargo test -p victory-metal --target x86_64-apple-darwin \
+  --test wine_bridge wine_guest_tls_and_metal_readback -- --ignored --nocapture
+```
+
+The LLVM-MinGW tools must be on `PATH`; a working macOS Metal device is
+required. Wine is responsible for the PE process, TLS and Windows thread
+environment; its own macOS/Rosetta transitions are runtime implementation
+details, not a stable macOS GS API. This proof does **not** use VIctory's
+Xbox HLE, the VIctory Windows loader, game shaders or presentation, and it
+does not establish game compatibility or ARM-native PE execution.
+
+## Experimental Wine D3D12.X-to-Metal compute proxy
+
+The opt-in proxy keeps the Windows D3D12.X HLE objects and vtables inside the
+Wine PE process. It copies bounded shader, buffer, constant and dispatch data
+over authenticated loopback TCP to a separate x86-64 macOS host, which uses
+VIctory's Metal compute path and synchronously copies the result back. No
+guest pointers or COM objects cross the process boundary. Wine and the native
+host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
+execution. This is a trusted-workload experiment, not a process sandbox.
+
+Only the restricted compute path is supported: one committed default raw UAV
+buffer, a one-entry shader-visible heap, root constants in slot 0, descriptor
+table in slot 1, and synchronous dispatch/readback. Limits are 4 MiB shader,
+16 MiB buffer and 64 constant dwords. Graphics, presentation, root CBVs,
+general resource states and arbitrary D3D12.X methods are unsupported; some
+unsupported void methods abort rather than pretend to succeed. The loopback
+bearer token is not a boundary against other processes with access to it.
+
+The fixture below uses compiler-generated static TLS, two Windows threads and
+TLS callbacks before dispatching the existing synthetic D3D12.X shader and
+checking GPU readback `42`. The positive case and wrong-token rejection
+passed together on an M3 Max with Wine 11 under Rosetta. This goes through
+VIctory's existing Windows EXE-as-DLL loader, which currently redirects a
+byte-matched TLS instruction sequence; this single fixture does not prove
+arbitrary TLS, host signals, exceptions, or game startup are correct. The
+native macOS loader's TLS and unwind rejections remain unchanged.
+
+With the LLVM-MinGW and Wine setup above, build the fixture:
+
+```sh
+mkdir -p /tmp/victory-wine-hle-tls
+printf 'LIBRARY kernel32.dll\nEXPORTS\nGetStdHandle\nWriteFile\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle\n' > /tmp/victory-wine-hle-tls/kernel32.def
+printf 'LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n' > /tmp/victory-wine-hle-tls/d3d12_xs.def
+llvm-dlltool -m i386:x86-64 -d /tmp/victory-wine-hle-tls/kernel32.def -l /tmp/victory-wine-hle-tls/kernel32.lib
+llvm-dlltool -m i386:x86-64 -d /tmp/victory-wine-hle-tls/d3d12_xs.def -l /tmp/victory-wine-hle-tls/d3d12_xs.lib
+x86_64-w64-mingw32-clang -O2 -fno-emulated-tls -c tests/fixtures/windows_d3d12x_tls_compute.c -o /tmp/victory-wine-hle-tls/tls_compute.obj
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /include:_tls_used \
+  /out:/tmp/victory-wine-hle-tls/tls_compute.exe /tmp/victory-wine-hle-tls/tls_compute.obj \
+  /tmp/victory-wine-hle-tls/kernel32.lib /tmp/victory-wine-hle-tls/d3d12_xs.lib \
+  "$LLVM_MINGW/x86_64-w64-mingw32/lib/libmingw32.a"
+```
+
+Build the macOS service in a separate target directory, choose an unused
+loopback port and a fresh secret 32-hex-digit token, then run the service in
+one terminal with the Apple Metal Shader Converter dylib configured:
+
+```sh
+export VICTORY_WINE_METAL_ADDR=127.0.0.1:39471
+export VICTORY_WINE_METAL_TOKEN="$(openssl rand -hex 16)"
+export VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
+CARGO_TARGET_DIR=/tmp/victory-metal-host-target cargo build -p victory-gpu \
+  --example wine_metal_compute_host --target x86_64-apple-darwin
+/tmp/victory-metal-host-target/x86_64-apple-darwin/debug/examples/wine_metal_compute_host "$VICTORY_WINE_METAL_ADDR"
+```
+
+In another terminal with the same address and token, run the Windows target
+under Wine with its isolated prefix and the existing Windows runner setup:
+
+```sh
+export VICTORY_TEST_D3D12X_TLS_COMPUTE_PE="$(winepath -w /tmp/victory-wine-hle-tls/tls_compute.exe)"
+CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
+  --test windows_run --target x86_64-pc-windows-gnullvm \
+  executes_tls_d3d12x_compute_through_wine_metal_proxy -- --ignored --nocapture
+```
+
+Stop the service after the test. No compatible game files were used or
+configured; these results are not evidence of game compatibility.
