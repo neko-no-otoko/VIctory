@@ -48,6 +48,27 @@ only unmaps memory and never invokes arbitrary code. Export addresses remain
 valid only while the image is alive. Calling an export executes arbitrary
 machine code.
 
+## Static TLS remains unsupported
+
+The Windows loader's existing TLS rewrite is not a macOS TLS implementation:
+it expects Windows to allocate the per-thread TLS array and its generated
+thunks still read `gs:[0x58]`. Its byte matcher covers one instruction form
+and is not a decoder. For example, the byte sequence
+`48 b8 65 48 8b 04 25 58 00 00 00 c3` decodes as a `movabs` followed by an
+`add`, but the matcher sees its nine-byte GS pattern at offset 2, inside the
+`movabs` immediate. Applying that rewrite to arbitrary code can corrupt it.
+
+In isolated child-process experiments on an Apple M3 Max running macOS 27.3
+under Rosetta, `gs:[0x58]` read zero, and both `rdgsbase` and `wrgsbase`
+raised SIGILL; CPUID did not advertise FSGSBASE. Reading Mach's translated
+`x86_THREAD_STATE64` succeeded and showed a zero GS selector, but did not
+establish a supported way to install a Windows TEB. These observations do
+not rule out other emulation or rewriting designs. Correct support would
+require safe instruction identification, PE TLS template/index handling,
+per-thread storage, and process/thread callback ordering, including threads
+not created by this loader. Until those are implemented and tested together,
+images containing TLS remain explicitly rejected.
+
 ## Synthetic test under Rosetta
 
 The test builds the repository's own fixture with LLVM-MinGW. It needs no game
