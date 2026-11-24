@@ -199,6 +199,30 @@ Neither establishes a public, stable contract for this loader; Apple's
 itself warns that its implementation details are not ABI. In particular,
 writing a zero-valued slot is not proof that the slot is available.
 
+An isolated x86-64 child-process probe on the same M3 Max, macOS 27.3
+(build 26C5047e), tested Apple's private `_thread_set_tsd_base` without
+`rdgsbase`/`wrgsbase`. It saved the host base from Mach
+`THREAD_IDENTIFIER_INFO.thread_handle` and compared the values read from
+`gs:[0]` and `gs:[0x58]` before switching and after restoration:
+
+- Nested fake bases yielded `0x1111`, `0x2222`, then `0x1111`; both host
+  slot values matched after restoring, and a subsequent `getpid()` succeeded.
+- `getpid()` also succeeded while a fake GS base was installed. This single
+  library call does not establish safety of other host calls.
+- Raising `SIGUSR1` while the fake base was installed terminated that child
+  with SIGSEGV. The probe did not establish whether failure occurred inside
+  `raise`, signal delivery, or the handler.
+- Two synchronized-start pthreads performed 100,000 reads each with distinct
+  fake GS slot values; both saw their own value and restored their original
+  `gs:[0]`. This does not establish arbitrary thread-lifecycle safety.
+
+These are observations for one OS build and do not establish a public ABI.
+The private function and Mach thread-handle interpretation may change, and
+signals, asynchronous interruptions, nested host callbacks, and teardown need
+correct transition handling. The probe did not implement or test PE template
+allocation, module indices, TLS callbacks, or loader lifecycle; it is not
+native TLS support.
+
 A viable design needs either a supported host interface for that slot, or a
 controlled execution engine that correctly translates all guest GS accesses
 without scanning arbitrary instruction bytes. It must also copy the PE TLS
