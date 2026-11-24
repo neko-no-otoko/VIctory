@@ -910,15 +910,50 @@ Windows, System, System32 and SysWOW64 directories. Unreadable directories,
 ambiguous Windows directory components and dangling provider links fail the
 check. These are snapshots, not pinned opens.
 
-Direct executable imports from the six providers are checked against their
-named exports; provider ordinal imports are rejected. Transitive and dynamic
-imports, activation contexts, Known DLLs, loaded modules, path-specific
-registry overrides, guest-controlled search paths and changes after preflight
-are not enforced. `WINEPATH` adds a search directory; it does not prove which
-file Wine loads. Check loaded module paths when possible, but a post-load
-check does not undo initialization. The launcher does not modify or copy
-guest files; the unsandboxed guest can modify files and Wine may write to the
-prefix.
+The same offline import diagnostic runs before Wine or the Metal host starts,
+and can be run separately without either:
+
+```sh
+"$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/victory" wine-imports \
+  /path/to/trusted-guest.exe \
+  --dll-dir "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug" \
+  --guest-dll required-title-library.dll
+```
+
+It parses the executable and reachable guest DLL candidates beside it,
+following ordinary and delay imports with ASCII case-insensitive DLL names and
+handling cycles. It checks imports of the six selected providers against their
+named exports; unsupported symbols and ordinals fail before launch.
+`chad.dll` and `xcrdapi.dll` are reported as having no VIctory Wine provider,
+without assuming Wine cannot resolve them. Use `--provision-gameinput` when
+the separate GameInput provider will be used. The optional repeatable
+`--guest-dll` declares a DLL that must exist beside the executable; a declared
+DLL that is missing or case-ambiguous is an error. The same options are
+available on `wine-run`. The report lists other imports not found in that
+directory as unclassified external dependencies, **not** as missing: they
+could be supplied by Wine, Windows DLLs or another search directory.
+
+This is a snapshot of candidates, not Wine's actual DLL resolution. It cannot
+establish that Wine selects an inspected DLL, resolve its system DLLs, follow
+runtime `LoadLibrary`/`GetProcAddress`, inspect guest directories not searched
+by this diagnostic, or account for activation contexts, Known DLLs, loaded
+modules, path-specific registry overrides, guest-controlled search paths and
+changes after preflight. `WINEPATH` adds a search directory; it does not prove
+which file Wine loads. Check loaded module paths when possible, but a
+post-load check does not undo initialization. The launcher does not modify or
+copy guest files; the unsandboxed guest can modify files and Wine may write to
+the prefix. No report establishes title compatibility.
+
+The focused synthetic diagnostics tests need LLVM-MinGW but not Wine or Metal:
+
+```sh
+LLVM_MINGW=/path/to/llvm-mingw cargo test --locked -p victory \
+  --target x86_64-apple-darwin --test wine_imports -- --ignored --nocapture
+```
+
+On this workstation both tests passed; the case-collision subcase was checked
+on a temporary case-sensitive APFS volume. The existing normal-Wine TLS and
+Metal readback launcher regression also passed. No game files were configured.
 
 For a trusted title that expects its files on `G:`, an optional
 `--title-root /absolute/path/to/title` checks that the existing

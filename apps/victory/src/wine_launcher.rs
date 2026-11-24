@@ -16,16 +16,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use victory_pe::{ImageInfo, ImportSymbol, layout};
 
 const PROVIDERS: [&str; 6] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "acphal.dll", "xapu.dll"];
 const XMEM_BACKEND: &str = "victory_xmem_backend.dll";
-const XMEM_EXPORTS: [&str; 13] = [
-    "XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
-    "XMemIsToolsMemAvailable", "XMemAllocatePhysicalPages", "XMemFreePhysicalPages",
-    "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc",
-    "XMemVirtualQuery", "XMemGetWorkingSetStatistics", "XMemTransferMemory",
-];
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
@@ -319,81 +312,6 @@ fn wine_overrides(gameinput: bool) -> Result<OsString> {
     Ok(result)
 }
 
-fn image(path: &Path, is_dll: bool) -> Result<(ImageInfo, usize)> {
-    let data = fs::read(path).with_context(|| format!("reading PE {}", path.display()))?;
-    let info = ImageInfo::parse(&data).with_context(|| format!("parsing AMD64 PE {}", path.display()))?;
-    if info.characteristics & 0x0002 == 0 {
-        bail!("{} is not an executable PE image", path.display());
-    }
-    if (info.characteristics & layout::file_flags::DLL != 0) != is_dll {
-        bail!("{} is not a PE {}", path.display(), if is_dll { "DLL" } else { "executable" });
-    }
-    Ok((info, data.len()))
-}
-
-fn require_export(provider: &ImageInfo, file_len: usize, dll: &str, name: &str) -> Result<()> {
-    let export = provider.exports.iter().find(|export| export.name.as_deref() == Some(name))
-        .with_context(|| format!("{dll} does not export {name}"))?;
-    let rva = export.rva.filter(|rva| *rva != 0 && export.forward.is_none())
-        .with_context(|| format!("{dll} export {name} is forwarded or unbacked"))?;
-    let backed = provider.sections.iter().any(|section| {
-        rva.checked_sub(section.rva).is_some_and(|offset| {
-            offset < section.file_size
-                && (u64::from(section.file_offset) + u64::from(offset)) < file_len as u64
-        })
-    });
-    if !backed { bail!("{dll} export {name} is not file-backed"); }
-    Ok(())
-}
-
-// This checks only imports in the executable, not dynamically loaded symbols
-// or imports of other DLLs. Wine remains authoritative about DLL selection.
-fn preflight(exe: &Path, dll_dir: &Path, gameinput: bool) -> Result<()> {
-    let (guest, _) = image(exe, false)?;
-    let mut providers = Vec::new();
-    for name in PROVIDERS {
-        providers.push(image(&dll_dir.join(name), true)?);
-    }
-    let (backend, backend_len) = image(&dll_dir.join(XMEM_BACKEND), true)?;
-    for name in XMEM_EXPORTS.into_iter().chain(std::iter::once("VIctoryXMemMapAlias")) {
-        require_export(&backend, backend_len, XMEM_BACKEND, name)?;
-    }
-    let input = if gameinput {
-        let (provider, len) = image(&dll_dir.join("gameinput.dll"), true)?;
-        require_export(&provider, len, "gameinput.dll", "GameInputCreate")?;
-        let export = provider.exports.iter().find(|entry| entry.name.as_deref() == Some("GameInputCreate"))
-            .context("gameinput.dll is missing GameInputCreate")?;
-        if export.ordinal != 1 {
-            bail!("gameinput.dll must export GameInputCreate at ordinal 1");
-        }
-        Some(provider)
-    } else { None };
-    for module in guest.imports.iter().chain(&guest.delay_imports) {
-        if module.dll.eq_ignore_ascii_case("gameinput.dll") {
-            if input.is_none() {
-                bail!("{} imports GameInput.dll; use --provision-gameinput with a dedicated prefix", exe.display());
-            }
-            for entry in &module.entries {
-                match &entry.symbol {
-                    ImportSymbol::Ordinal(1) => {}
-                    ImportSymbol::Name { name, .. } if name == "GameInputCreate" => {}
-                    _ => bail!("unsupported GameInput import {}", entry.symbol),
-                }
-            }
-            continue;
-        }
-        let Some(index) = PROVIDERS.iter().position(|name| module.dll.eq_ignore_ascii_case(name)) else { continue };
-        let (provider, file_len) = &providers[index];
-        for entry in &module.entries {
-            let name = match &entry.symbol {
-                ImportSymbol::Name { name, .. } => name,
-                ImportSymbol::Ordinal(ordinal) => bail!("{} imports {} by ordinal #{ordinal}; provider ordinals are not a stable ABI", exe.display(), module.dll),
-            };
-            require_export(provider, *file_len, &module.dll, name)?;
-        }
-    }
-    Ok(())
-}
 // These are snapshot checks only: Wine performs its own later opens and also
 // supports activation contexts, registry overrides and guest-directed loads.
 fn reject_shadow_dlls(dir: &Path, selected: &[PathBuf]) -> Result<()> {
@@ -625,7 +543,7 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -646,7 +564,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         Some(checked_storage_drive(&wine_prefix, save, letter)?)
     } else { None };
     reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
-    preflight(&exe, &dll_dir, provision_gameinput)?;
+    crate::wine_imports::run(&exe, &dll_dir, provision_gameinput, guest_dll)?;
     let overrides = wine_overrides(provision_gameinput)?;
     if !allow_unverified_dll_search {
         bail!("Wine cannot guarantee exact provider DLL identity; use --allow-unverified-dll-search only with a trusted, stable guest, prefix and search paths");
@@ -743,8 +661,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, storage_drive, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

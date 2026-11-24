@@ -13,6 +13,8 @@ mod native_census;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_fixture;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod wine_imports;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod wine_launcher;
 #[cfg(windows)]
 mod run;
@@ -149,6 +151,22 @@ enum Command {
         #[arg(long)]
         execute: bool,
     },
+    /// Inspect Wine title imports offline without running Wine or the guest.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[command(long_about = "Inspect the executable and guest DLL candidates beside it, including delay imports, against the selected VIctory providers. Wine's system and DLL search resolution is not inspected; this is not a compatibility claim.")]
+    WineImports {
+        /// Windows x86-64 executable to inspect.
+        exe: PathBuf,
+        /// Directory containing the VIctory HLE DLLs and private XMem backend.
+        #[arg(long)]
+        dll_dir: PathBuf,
+        /// Check the separately provisioned GameInput provider.
+        #[arg(long)]
+        provision_gameinput: bool,
+        /// Declare a required guest DLL basename expected beside the executable.
+        #[arg(long)]
+        guest_dll: Vec<String>,
+    },
     /// Run a trusted PE as a Wine process with the native Metal bridge.
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     #[command(long_about = "Run a trusted PE as a normal Wine process using explicit HLE DLLs and a native Metal bridge. Wine's DLL search order still applies. This is not a sandbox or a claim of game compatibility.")]
@@ -179,6 +197,9 @@ enum Command {
         /// Provision GameInput only in a new empty prefix, or reuse an exact existing installation.
         #[arg(long)]
         provision_gameinput: bool,
+        /// Declare a required guest DLL basename expected beside the executable.
+        #[arg(long)]
+        guest_dll: Vec<String>,
         /// Require the existing Wine G: drive to point at this title directory.
         #[arg(long)]
         title_root: Option<PathBuf>,
@@ -278,8 +299,11 @@ fn main() -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Command::NativeCensus { file, file_root, save_root } => native_census::run(&file, file_root.as_deref(), save_root.as_deref()),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, storage_drive, guest_args } => {
-            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root.as_deref(), save_root.as_deref(), storage_drive, &guest_args)?;
+        Command::WineImports { exe, dll_dir, provision_gameinput, guest_dll } =>
+            wine_imports::run(&exe, &dll_dir, provision_gameinput, &guest_dll),
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, guest_dll, title_root, save_root, storage_drive, guest_args } => {
+            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, &guest_dll, title_root.as_deref(), save_root.as_deref(), storage_drive, &guest_args)?;
             if code != 0 { std::process::exit(code); }
             Ok(())
         }
