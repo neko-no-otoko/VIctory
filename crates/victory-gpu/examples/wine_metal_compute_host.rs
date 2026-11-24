@@ -147,7 +147,7 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 3 | 4) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5) {
             return Err("invalid protocol header".into());
         }
         if fields[1] == 1 {
@@ -159,7 +159,7 @@ mod host {
                 return Err("invalid request lengths or dispatch dimensions".into());
             }
         }
-        if fields[1] == 3 && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
+        if fields[1] == 5 && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
             || fields[3..].iter().any(|&v| v != 0))
         {
             return Err("invalid batch request length or reserved fields".into());
@@ -172,7 +172,7 @@ mod host {
         match fields[1] {
             1 => compute_request(stream, fields, cache),
             2 => graphics_request(stream, fields),
-            3 => {
+            5 => {
                 let mut payload = vec![0; fields[2] as usize];
                 stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
                 let batch = victory_gpu::wine_transport::decode_batch(&payload)?;
@@ -280,6 +280,18 @@ mod host {
             let client = TcpStream::connect(endpoint).unwrap();
             let (server, _) = listener.accept().unwrap();
             drop((client, server));
+        }
+
+        #[test]
+        fn rejects_old_batch_opcode() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            for word in [MAGIC, 3, 0, 0, 0, 0, 0, 0] {
+                client.write_all(&word.to_le_bytes()).unwrap();
+            }
+            let (mut server, _) = listener.accept().unwrap();
+            let error = request(&mut server, &[0; 16], &mut None, false).unwrap_err();
+            assert!(error.contains("invalid protocol header"));
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Copied, bounded, little-endian Wine graphics batch protocol (version 3).
+//! Copied, bounded, little-endian Wine graphics batch protocol (version 5).
 use std::collections::HashSet;
 
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
@@ -6,12 +6,33 @@ const MAX_ITEMS: usize = 4096;
 const MAX_RESOURCE: usize = 16 * 1024 * 1024;
 const MAX_SHADER: usize = 4 * 1024 * 1024;
 
+/// Returns tightly packed RGBA8 mip dimensions, offset and length.
+pub fn mip_layout(width:u32,height:u32,mips:u32,mip:u32)->Option<(u32,u32,usize,usize)> {
+    if width==0 || height==0 || mips==0 || mips>u32::BITS-width.max(height).leading_zeros() || mip>=mips {return None}
+    let mut offset=0usize;
+    let mut result=None;
+    for level in 0..mips {
+        let w=(width>>level).max(1);
+        let h=(height>>level).max(1);
+        let len=(w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+        if level==mip {result=Some((w,h,offset,len));}
+        offset=offset.checked_add(len)?;
+    }
+    result
+}
+
+/// Returns the byte length of all tightly packed RGBA8 mip levels.
+pub fn texture_size(width:u32,height:u32,mips:u32)->Option<usize> {
+    let (_,_,offset,len)=mip_layout(width,height,mips,mips.checked_sub(1)?)?;
+    offset.checked_add(len)
+}
+
 #[derive(Clone, Debug)]
 pub struct Batch { pub resources: Vec<Resource>, pub pipelines: Vec<Pipeline>, pub commands: Vec<Command> }
 #[derive(Clone, Debug)]
 pub struct Resource { pub id: u64, pub state: u32, pub kind: ResourceKind, pub bytes: Vec<u8> }
 #[derive(Clone, Copy, Debug)]
-pub enum ResourceKind { Buffer, Texture { width: u32, height: u32, format: u32 } }
+pub enum ResourceKind { Buffer, Texture { width: u32, height: u32, format: u32, mips: u32 } }
 #[derive(Clone, Debug)]
 pub enum Command {
     Clear { target: u64, color: [f32; 4] }, Draw(Draw),
@@ -26,7 +47,7 @@ pub struct Draw {
     pub vertex_stride:u32,
     pub vertex_count: u32, pub instance_count: u32, pub first_vertex: u32, pub first_instance: u32,
     pub viewport: [f32; 6], pub scissor: [i32; 4], pub topology: u32,
-    pub constants: Vec<u32>, pub texture: Option<u64>,
+    pub constants: Vec<u32>, pub texture: Option<u64>, pub first_mip:u32, pub mip_count:u32,
     pub index: Option<Index>, pub depth: Option<u64>, pub linear_filter: bool,
     pub constant_slot:Option<u32>, pub texture_slot:Option<u32>, pub sampler_slot:Option<u32>,
 }
@@ -41,7 +62,7 @@ pub struct Blend { pub enabled:bool, pub write_mask:u8, pub alpha_source:bool }
 #[derive(Clone, Debug)]
 pub struct CopyTexture {
     pub src: u64, pub dst: u64, pub offset: u64, pub pitch: u32,
-    pub width: u32, pub height: u32, pub format: u32, pub buffer_to_texture: bool,
+    pub width: u32, pub height: u32, pub format: u32, pub mip:u32, pub buffer_to_texture: bool,
 }
 
 struct Writer(Vec<u8>);
@@ -53,8 +74,9 @@ impl Writer {
         self.u32(b.len() as u32); self.0.extend_from_slice(b); Ok(())
     }
     fn resource(&mut self, r:&Resource) -> Result<(),String> {
+        validate_resource(r)?;
         self.u64(r.id); self.u32(r.state);
-        match r.kind { ResourceKind::Buffer => self.u32(0), ResourceKind::Texture {width,height,format} => { self.u32(1); self.u32(width); self.u32(height); self.u32(format); } }
+        match r.kind { ResourceKind::Buffer => self.u32(0), ResourceKind::Texture {width,height,format,mips} => { self.u32(1); self.u32(width); self.u32(height); self.u32(format); self.u32(mips); } }
         self.bytes(&r.bytes,MAX_RESOURCE)
     }
 }
@@ -66,8 +88,41 @@ impl<'a> Reader<'a> {
     fn boolean(&mut self)->Result<bool,String> {match self.u32()? {0=>Ok(false),1=>Ok(true),_=>Err("invalid wire boolean".into())}}
     fn bytes(&mut self,max:usize)->Result<Vec<u8>,String> { let n=self.u32()? as usize; if n>max { return Err("wire field exceeds limit".into()); } Ok(self.take(n)?.to_vec()) }
     fn count(&mut self)->Result<usize,String> { let n=self.u32()? as usize; if n>MAX_ITEMS { return Err("too many wire items".into()); } Ok(n) }
-    fn resource(&mut self)->Result<Resource,String> { let id=self.u64()?; let state=self.u32()?; let kind=match self.u32()? { 0=>ResourceKind::Buffer, 1=>ResourceKind::Texture {width:self.u32()?,height:self.u32()?,format:self.u32()?}, _=>return Err("unknown resource kind".into()) }; Ok(Resource {id,state,kind,bytes:self.bytes(MAX_RESOURCE)?}) }
+    fn resource(&mut self)->Result<Resource,String> { let id=self.u64()?; let state=self.u32()?; let kind=match self.u32()? { 0=>ResourceKind::Buffer, 1=>ResourceKind::Texture {width:self.u32()?,height:self.u32()?,format:self.u32()?,mips:self.u32()?}, _=>return Err("unknown resource kind".into()) }; let resource=Resource {id,state,kind,bytes:self.bytes(MAX_RESOURCE)?}; validate_resource(&resource)?; Ok(resource) }
     fn done(&self)->Result<(),String> { if self.pos!=self.data.len() { Err("trailing wire data".into()) } else { Ok(()) } }
+}
+fn validate_resource(r:&Resource)->Result<(),String> {
+    if let ResourceKind::Texture {width,height,mips,..}=r.kind {
+        if texture_size(width,height,mips)!=Some(r.bytes.len()) {return Err("invalid texture dimensions, mip count or byte length".into())}
+    }
+    Ok(())
+}
+fn validate_commands(resources:&[Resource],commands:&[Command])->Result<(),String> {
+    for command in commands {
+        match command {
+            Command::Draw(d)=>match d.texture {
+                None if d.first_mip!=0 || d.mip_count!=0 => return Err("texture view without texture".into()),
+                Some(id)=>{
+                    let mips=match resources.iter().find(|r|r.id==id).map(|r|r.kind) {
+                        Some(ResourceKind::Texture {mips,..})=>mips,
+                        _=>return Err("unknown sampled texture".into()),
+                    };
+                    if d.mip_count==0 || d.first_mip.checked_add(d.mip_count).is_none_or(|end|end>mips) {return Err("invalid texture view range".into())}
+                },
+                None=>{},
+            },
+            Command::CopyTexture(c)=>{
+                let id=if c.buffer_to_texture {c.dst} else {c.src};
+                let (width,height,mips)=match resources.iter().find(|r|r.id==id).map(|r|r.kind) {
+                    Some(ResourceKind::Texture {width,height,mips,..})=>(width,height,mips),
+                    _=>return Err("unknown copy texture".into()),
+                };
+                if mip_layout(width,height,mips,c.mip).is_none() {return Err("invalid copy mip".into())}
+            },
+            _=>{},
+        }
+    }
+    Ok(())
 }
 fn count(w:&mut Writer,n:usize)->Result<(),String> { if n>MAX_ITEMS { return Err("too many wire items".into()); } w.u32(n as u32); Ok(()) }
 fn resources(w:&mut Writer,rs:&[Resource])->Result<(),String> { count(w,rs.len())?; let mut ids=HashSet::new(); for r in rs { if r.id==0 || !ids.insert(r.id) { return Err("duplicate or zero resource id".into()); } w.resource(r)?; } Ok(()) }
@@ -76,19 +131,20 @@ fn finish(w:Writer)->Result<Vec<u8>,String> { if w.0.len()>MAX_PAYLOAD { Err("wi
 pub fn encode_results(rs:&[Resource])->Result<Vec<u8>,String> { let mut w=Writer(Vec::new()); resources(&mut w,rs)?; finish(w) }
 pub fn decode_results(data:&[u8])->Result<Vec<Resource>,String> { if data.len()>MAX_PAYLOAD { return Err("wire payload exceeds limit".into()); } let mut r=Reader {data,pos:0}; let out=read_resources(&mut r)?; r.done()?; Ok(out) }
 pub fn encode_batch(batch:&Batch)->Result<Vec<u8>,String> {
+    validate_commands(&batch.resources,&batch.commands)?;
     let mut w=Writer(Vec::new()); resources(&mut w,&batch.resources)?; count(&mut w,batch.pipelines.len())?;
     let mut ids=HashSet::new(); for p in &batch.pipelines {if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())} w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;w.u32(p.vertex_stride);w.u32(p.format);if let Some(z)=&p.depth {w.u32(1);w.u32(z.write as u32);w.u32(z.compare);} else {w.u32(0);} w.u32(p.blend.enabled as u32);w.u32(p.blend.write_mask as u32);w.u32(p.blend.alpha_source as u32);}
     count(&mut w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
-        Command::Draw(d) => {w.u32(1);w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));
+        Command::Draw(d) => {w.u32(1);w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
             if d.texture==Some(0) || d.depth==Some(0) || [d.constant_slot,d.texture_slot,d.sampler_slot].contains(&Some(u32::MAX)) {return Err("invalid optional identifier or slot".into())}
             if let Some(i)=&d.index {w.u32(1);w.u64(i.buffer);w.u64(i.offset);for v in [i.size,i.format,i.first,i.base_vertex as u32] {w.u32(v);}} else {w.u32(0);}
             w.u64(d.depth.unwrap_or(0));w.u32(d.linear_filter as u32);
             w.u32(d.vertex_stride);for slot in [d.constant_slot,d.texture_slot,d.sampler_slot] {w.u32(slot.unwrap_or(u32::MAX));}
         },
         Command::Barrier {id,before,after} => {w.u32(2);w.u64(*id);w.u32(*before);w.u32(*after);},
-        Command::CopyTexture(c) => {w.u32(3);w.u64(c.src);w.u64(c.dst);w.u64(c.offset);for v in [c.pitch,c.width,c.height,c.format,c.buffer_to_texture as u32] {w.u32(v);}},
+        Command::CopyTexture(c) => {w.u32(3);w.u64(c.src);w.u64(c.dst);w.u64(c.offset);for v in [c.pitch,c.width,c.height,c.format,c.mip,c.buffer_to_texture as u32] {w.u32(v);}},
         Command::CopyBuffer {src,dst,src_offset,dst_offset,size} => {w.u32(4);for v in [src,dst,src_offset,dst_offset,size] {w.u64(*v);}},
         Command::ClearDepth {target,depth}=>{w.u32(5);w.u64(*target);w.u32(depth.to_bits());},
     }} finish(w)
@@ -99,16 +155,16 @@ pub fn decode_batch(data:&[u8])->Result<Batch,String> {
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
-        1=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};
+        1=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
             let index=if r.boolean()? {Some(Index {buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,format:r.u32()?,first:r.u32()?,base_vertex:r.u32()? as i32})} else {None};
             let depth=match r.u64()? {0=>None,id=>Some(id)};let linear_filter=r.boolean()?;let vertex_stride=r.u32()?;let mut slot=|| -> Result<Option<u32>,String> {Ok(match r.u32()? {u32::MAX=>None,v=>Some(v)})};let constant_slot=slot()?;let texture_slot=slot()?;let sampler_slot=slot()?;
-            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot})},
+            Command::Draw(Draw {target,pipeline,vertex_buffer,vertex_offset,vertex_size,vertex_stride,vertex_count,instance_count,first_vertex,first_instance,viewport,scissor,topology,constants,texture,first_mip,mip_count,index,depth,linear_filter,constant_slot,texture_slot,sampler_slot})},
         2=>Command::Barrier {id:r.u64()?,before:r.u32()?,after:r.u32()?},
-        3=> {let src=r.u64()?;let dst=r.u64()?;let offset=r.u64()?;let pitch=r.u32()?;let width=r.u32()?;let height=r.u32()?;let format=r.u32()?;let buffer_to_texture=match r.u32()? {0=>false,1=>true,_=>return Err("invalid copy direction".into())};Command::CopyTexture(CopyTexture {src,dst,offset,pitch,width,height,format,buffer_to_texture})},
+        3=> {let src=r.u64()?;let dst=r.u64()?;let offset=r.u64()?;let pitch=r.u32()?;let width=r.u32()?;let height=r.u32()?;let format=r.u32()?;let mip=r.u32()?;let buffer_to_texture=match r.u32()? {0=>false,1=>true,_=>return Err("invalid copy direction".into())};Command::CopyTexture(CopyTexture {src,dst,offset,pitch,width,height,format,mip,buffer_to_texture})},
         4=>Command::CopyBuffer {src:r.u64()?,dst:r.u64()?,src_offset:r.u64()?,dst_offset:r.u64()?,size:r.u64()?},
         5=>Command::ClearDepth {target:r.u64()?,depth:f32::from_bits(r.u32()?)},
         _=>return Err("unknown wire command".into()),
-    }); } r.done()?;Ok(Batch {resources,pipelines,commands})
+    }); } r.done()?;validate_commands(&resources,&commands)?;Ok(Batch {resources,pipelines,commands})
 }
 
 #[cfg(test)]
@@ -119,7 +175,7 @@ mod tests {
         Batch {
             resources: vec![
                 Resource { id:1, state:4, kind:ResourceKind::Buffer, bytes:vec![1,2,3,4] },
-                Resource { id:2, state:8, kind:ResourceKind::Texture {width:1,height:1,format:28}, bytes:vec![4,3,2,1] },
+                Resource { id:2, state:8, kind:ResourceKind::Texture {width:1,height:1,format:28,mips:1}, bytes:vec![4,3,2,1] },
             ],
             pipelines: vec![],
             commands: vec![
@@ -167,11 +223,58 @@ mod tests {
             depth:Some(PipelineDepth {write:true,compare:4}),blend:Blend {enabled:true,write_mask:15,alpha_source:false}});
         b.commands.push(Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
-            topology:4,constants:vec![10,20],texture:Some(2),index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
+            topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
             depth:Some(3),linear_filter:true,constant_slot:Some(3),texture_slot:Some(2),sampler_slot:Some(1)}));
         let encoded=encode_batch(&b).unwrap();
         assert_eq!(encode_batch(&decode_batch(&encoded).unwrap()).unwrap(),encoded);
         b.pipelines.push(b.pipelines[0].clone());
         assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
+    fn mip_layout_odd_dimensions_and_invalid_levels() {
+        assert_eq!(mip_layout(7,3,3,0),Some((7,3,0,84)));
+        assert_eq!(mip_layout(7,3,3,1),Some((3,1,84,12)));
+        assert_eq!(mip_layout(7,3,3,2),Some((1,1,96,4)));
+        assert_eq!(texture_size(7,3,3),Some(100));
+        assert_eq!(mip_layout(1,5,3,1),Some((1,2,20,8)));
+        for (w,h,n,level) in [(0,1,1,0),(1,0,1,0),(1,1,0,0),(7,3,4,0),(7,3,3,3)] {
+            assert_eq!(mip_layout(w,h,n,level),None);
+        }
+        assert_eq!(texture_size(u32::MAX,u32::MAX,1),None);
+    }
+
+    #[test]
+    fn mip_views_copies_and_invalid_wire() {
+        let mut b=batch();
+        b.resources[1].kind=ResourceKind::Texture {width:7,height:3,format:28,mips:3};
+        b.resources[1].bytes=vec![42;100];
+        b.commands=vec![Command::Draw(Draw {target:2,pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
+            vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
+            topology:4,constants:vec![],texture:Some(2),first_mip:1,mip_count:2,index:None,depth:None,linear_filter:false,
+            constant_slot:None,texture_slot:Some(0),sampler_slot:Some(0)})];
+        let encoded=encode_batch(&b).unwrap();
+        for end in 0..encoded.len() {assert!(decode_batch(&encoded[..end]).is_err());}
+        let decoded=decode_batch(&encoded).unwrap();
+        assert!(matches!(&decoded.commands[0],Command::Draw(Draw {texture:Some(2),first_mip:1,mip_count:2,..})));
+        assert_eq!(encode_batch(&decoded).unwrap(),encoded);
+        let mut invalid=encoded.clone();
+        let view=invalid.len()-40;
+        invalid[view..view+4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_batch(&invalid).is_err());
+        if let Command::Draw(d)=&mut b.commands[0] {d.first_mip=u32::MAX;}
+        assert!(encode_batch(&b).is_err());
+        if let Command::Draw(d)=&mut b.commands[0] {d.texture=None;d.first_mip=0;d.mip_count=1;}
+        assert!(encode_batch(&b).is_err());
+        b.commands=vec![Command::CopyTexture(CopyTexture {src:1,dst:2,offset:0,pitch:12,width:3,height:1,format:28,mip:1,buffer_to_texture:true})];
+        let encoded=encode_batch(&b).unwrap();
+        assert!(matches!(&decode_batch(&encoded).unwrap().commands[0],Command::CopyTexture(CopyTexture {mip:1,..})));
+        let mut invalid=encoded.clone();
+        let pos=invalid.len()-8;
+        invalid[pos..pos+4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode_batch(&invalid).is_err());
+        b.resources[1].bytes.pop();
+        assert!(encode_batch(&b).is_err());
+        assert!(encode_results(&b.resources).is_err());
     }
 }

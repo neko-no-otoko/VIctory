@@ -1,15 +1,19 @@
 //! Synchronous execution of copied Wine graphics batches on the Metal renderer.
 use std::collections::HashMap;
 use crate::metal_graphics::{GraphicsState, Prepared, Texture, Vertices};
-use crate::wine_transport::{Batch, Command, CopyTexture, Draw, Pipeline, Resource, ResourceKind};
+use crate::wine_transport::{mip_layout, texture_size, Batch, Command, CopyTexture, Draw, Pipeline, Resource, ResourceKind};
 use victory_metal::{BlendState, ColorFormat, DepthState, IndexData, TextureFilter, TextureFormat};
 use victory_shader::native::RootType;
 
 fn format(n:u32)->Result<ColorFormat,String> { match n {28=>Ok(ColorFormat::Rgba8),29=>Ok(ColorFormat::Rgba8Srgb),87=>Ok(ColorFormat::Bgra8),91=>Ok(ColorFormat::Bgra8Srgb),_=>Err("unsupported texture format".into())} }
-fn image(r:&Resource)->Result<(u32,u32,ColorFormat),String> {
-    let ResourceKind::Texture {width,height,format:fmt}=r.kind else {return Err("expected texture".into())};
-    let size=(width as usize).checked_mul(height as usize).and_then(|n|n.checked_mul(4)).ok_or("texture size overflow")?;
-    if width==0 || height==0 || size!=r.bytes.len() {return Err("invalid texture dimensions or byte length".into())} Ok((width,height,format(fmt)?))
+fn image(r:&Resource)->Result<(u32,u32,u32,ColorFormat),String> {
+    let ResourceKind::Texture {width,height,format:fmt,mips}=r.kind else {return Err("expected texture".into())};
+    let size=texture_size(width,height,mips).ok_or("invalid texture dimensions or mip count")?;
+    if size!=r.bytes.len() {return Err("invalid texture byte length".into())} Ok((width,height,mips,format(fmt)?))
+}
+fn target_image(r:&Resource)->Result<(u32,u32,ColorFormat),String> {
+    let (width,height,mips,format)=image(r)?;
+    if mips!=1 {return Err("render target must have one mip".into())} Ok((width,height,format))
 }
 fn range(offset:u64,size:u64,len:usize)->Result<std::ops::Range<usize>,String> {
     let start=usize::try_from(offset).map_err(|_|"offset overflow")?;
@@ -33,30 +37,31 @@ fn copy_texture(rs:&mut HashMap<u64,Resource>,c:CopyTexture)->Result<(),String> 
     if c.src==c.dst {return Err("texture copy aliases itself".into())}
     let (tid,bid)=if c.buffer_to_texture {(c.dst,c.src)} else {(c.src,c.dst)};
     let texture=rs.get(&tid).ok_or("unknown texture")?;
-    let ResourceKind::Texture {width,height,format:fmt}=texture.kind else {return Err("expected texture".into())};
+    let ResourceKind::Texture {width,height,format:fmt,mips}=texture.kind else {return Err("expected texture".into())};
     if fmt==40 {depth_image(texture)?;} else {image(texture)?;}
-    if width!=c.width || height!=c.height || c.format!=fmt {return Err("copy texture description mismatch".into())}
-    let row=(width as usize).checked_mul(4).ok_or("row overflow")?;
-    let pitch=c.pitch as usize; if pitch<row {return Err("texture copy pitch too small".into())}
+    let (mip_width,mip_height,mip_offset,_)=mip_layout(width,height,mips,c.mip).ok_or("invalid texture mip")?;
+    if mip_width!=c.width || mip_height!=c.height || c.format!=fmt {return Err("copy texture description mismatch".into())}
+    let row=(mip_width as usize).checked_mul(4).ok_or("row overflow")?;
+    let pitch=c.pitch as usize; if pitch<row || pitch%256!=0 || c.offset%512!=0 {return Err("invalid texture copy pitch or offset".into())}
     let buf=rs.get(&bid).ok_or("unknown buffer")?; buffer(buf)?;
-    let span=(height as usize-1).checked_mul(pitch).and_then(|n|n.checked_add(row)).ok_or("copy size overflow")?;
-    let start=range(c.offset,span as u64,buf.bytes.len())?.start;
+    let span=(mip_height as usize-1).checked_mul(pitch).and_then(|n|n.checked_add(row)).ok_or("copy size overflow")?;
+    let start=range(c.offset,u64::try_from(span).map_err(|_|"copy size overflow")?,buf.bytes.len())?.start;
     let mut dst=rs.remove(&c.dst).ok_or("unknown destination")?;
     let src=rs.get(&c.src).ok_or("unknown source")?;
-    for y in 0..height as usize { let a=y*row; let b=start+y*pitch; if c.buffer_to_texture {dst.bytes[a..a+row].copy_from_slice(&src.bytes[b..b+row]);} else {dst.bytes[b..b+row].copy_from_slice(&src.bytes[a..a+row]);} }
+    for y in 0..mip_height as usize { let a=mip_offset+y*row; let b=start+y*pitch; if c.buffer_to_texture {dst.bytes[a..a+row].copy_from_slice(&src.bytes[b..b+row]);} else {dst.bytes[b..b+row].copy_from_slice(&src.bytes[a..a+row]);} }
     rs.insert(c.dst,dst); Ok(())
 }
 enum Indices { U16(Vec<u16>), U32(Vec<u32>) }
 fn depth_image(r:&Resource)->Result<(u32,u32),String> {
-    let ResourceKind::Texture {width,height,format:40}=r.kind else {return Err("expected D32_FLOAT texture".into())};
-    let size=(width as usize).checked_mul(height as usize).and_then(|n|n.checked_mul(4)).ok_or("depth size overflow")?;
-    if width==0 || height==0 || r.bytes.len()!=size {return Err("invalid depth texture size".into())} Ok((width,height))
+    let ResourceKind::Texture {width,height,format:40,mips:1}=r.kind else {return Err("expected single-mip D32_FLOAT texture".into())};
+    let size=texture_size(width,height,1).ok_or("invalid depth texture dimensions")?;
+    if r.bytes.len()!=size {return Err("invalid depth texture size".into())} Ok((width,height))
 }
 fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:&mut HashMap<u64,Prepared>,d:Draw)->Result<(),String> {
     let p=pipelines.get(&d.pipeline).ok_or("unknown pipeline")?;
     if d.instance_count!=1 || d.first_instance!=0 || d.topology!=4 || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride || d.vertex_count==0 || d.vertex_count%3!=0 {return Err("unsupported draw topology, instances or vertex layout".into())}
     if d.target==d.vertex_buffer || d.texture==Some(d.target) || d.depth==Some(d.target) || d.depth==d.texture && d.depth.is_some() {return Err("draw resource alias is unsupported".into())}
-    let target=rs.get(&d.target).ok_or("unknown target")?; let (width,height,color_format)=image(target)?;
+    let target=rs.get(&d.target).ok_or("unknown target")?; let (width,height,color_format)=target_image(target)?;
     if format(p.format)?!=color_format || p.depth.is_some()!=d.depth.is_some() {return Err("pipeline attachment mismatch".into())}
     let vb=rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?; buffer(vb)?;
     let view=range(d.vertex_offset,d.vertex_size as u64,vb.bytes.len())?;
@@ -92,7 +97,15 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
     let viewport=d.viewport.map(f64::from); let scissor=[left,top,right-left,bottom-top];
     let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} Some(r.bytes.chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
     let mut target=rs.remove(&d.target).ok_or("unknown target")?;
-    let sampled=if let Some(id)=d.texture {let r=rs.get(&id).ok_or("unknown sampled texture")?;let (w,h,f)=image(r)?;Some(Texture {width:w,height:h,levels:1,pixels:&r.bytes,filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:TextureFormat::from(f),min_lod:0.,max_lod:0.})} else {None};
+    let sampled=if let Some(id)=d.texture {
+        let r=rs.get(&id).ok_or("unknown sampled texture")?;let (w,h,mips,f)=image(r)?;
+        let end=d.first_mip.checked_add(d.mip_count).ok_or("texture view range overflow")?;
+        if d.mip_count==0 || end>mips {return Err("invalid texture view range".into())}
+        let (view_width,view_height,start,_)=mip_layout(w,h,mips,d.first_mip).ok_or("invalid texture view range")?;
+        let (_,_,last,last_len)=mip_layout(w,h,mips,end-1).ok_or("invalid texture view range")?;
+        let end_offset=last.checked_add(last_len).ok_or("texture view size overflow")?;
+        Some(Texture {width:view_width,height:view_height,levels:d.mip_count,pixels:&r.bytes[start..end_offset],filter:if d.linear_filter {TextureFilter::Linear} else {TextureFilter::Nearest},format:TextureFormat::from(f),min_lod:0.,max_lod:0.})
+    } else {if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())} None};
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
     let result=if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),&constants,sampled,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),&constants,sampled,&mut target.bytes)};
     rs.insert(d.target,target);result?;
@@ -101,7 +114,10 @@ fn draw(rs:&mut HashMap<u64,Resource>,pipelines:&HashMap<u64,Pipeline>,prepared:
 }
 /// Execute a complete batch in order. Returned snapshots are the only committed state.
 pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
-    let mut rs=HashMap::new(); for r in batch.resources {if r.id==0 || rs.insert(r.id,r).is_some() {return Err("duplicate resource id".into())}}
+    let mut rs=HashMap::new(); for r in batch.resources {
+        if let ResourceKind::Texture {format:fmt,..}=r.kind {if fmt==40 {depth_image(&r)?;} else {image(&r)?;}}
+        if r.id==0 || rs.insert(r.id,r).is_some() {return Err("duplicate resource id".into())}
+    }
     let mut pipelines=HashMap::new();for p in batch.pipelines {if p.id==0 || pipelines.insert(p.id,p).is_some() {return Err("duplicate pipeline id".into())}}
     let mut prepared=HashMap::new();let mut touched=HashMap::new();
     for c in batch.commands {match c {
@@ -110,7 +126,7 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
             if !supports_state(texture,before) || !supports_state(texture,after) || (r.state!=before && !(r.state==0 && promotable(texture,before))) {return Err("resource barrier state mismatch or unsupported state".into())}
             let decay=touched.entry(id).or_insert(!texture);if texture {*decay=false;} r.state=after;
         },
-        Command::Clear {target,color}=>{access(&mut rs,&mut touched,target,4)?;let r=rs.get_mut(&target).ok_or("unknown clear target")?;let (w,h,f)=image(r)?; victory_metal::clear_color_float(f,w,h,w as usize*4,&mut r.bytes,color,&[]).map_err(|e|e.to_string())?;},
+        Command::Clear {target,color}=>{access(&mut rs,&mut touched,target,4)?;let r=rs.get_mut(&target).ok_or("unknown clear target")?;let (w,h,f)=target_image(r)?; victory_metal::clear_color_float(f,w,h,w as usize*4,&mut r.bytes,color,&[]).map_err(|e|e.to_string())?;},
         Command::Draw(d)=>{
             access(&mut rs,&mut touched,d.target,4)?;access(&mut rs,&mut touched,d.vertex_buffer,1)?;
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}

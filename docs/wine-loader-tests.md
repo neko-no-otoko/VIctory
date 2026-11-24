@@ -323,8 +323,9 @@ The supported subset includes multiple full color/depth clears, buffer copies,
 full texture uploads and readbacks, resource transitions, and multiple
 nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
 and pipeline changes. Committed default-heap resources are limited to
-single-mip RGBA8_UNORM color/sampled textures, D32_FLOAT depth textures, and
-buffers. Graphics supports POSITION float4, optionally followed by TEXCOORD0
+RGBA8_UNORM sampled textures (including multiple mips), single-mip
+RGBA8_UNORM color targets, single-mip D32_FLOAT depth textures, and buffers.
+Graphics supports POSITION float4, optionally followed by TEXCOORD0
 float2; one color target and optional depth target per draw; the native depth
 comparison/write subset; source-alpha blending and color write masks; and a
 single sampled texture and point or linear clamp sampler. Shader constants
@@ -332,12 +333,34 @@ must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
 This remains restricted: no partial clears, cross-process shared fences,
-multi-mip or tiled textures, BGRA/sRGB/BC formats through this proxy, stencil,
-arbitrary sampler/address modes, or general D3D12 resource or pipeline states.
+tiled textures, BGRA/sRGB/BC formats through this proxy, stencil, arbitrary
+sampler/address modes, or general D3D12 resource or pipeline states.
 Unsupported combinations fail or trap rather than being ignored. Limits are
 4 MiB per shader, 16 MiB per resource, 64 constant dwords, 4096 batch items,
 and 64 MiB per request. Shader translation and drawing use the existing
 native Metal path, not MetalVulkan.
+
+Sampled multi-mip textures use 2D `TEXTURE_LAYOUT_UNKNOWN`, one array layer,
+one sample, explicit nonzero mip count and no render/depth flags. Null SRVs
+cover all levels; explicit RGBA8 Texture2D SRVs support a validated first
+mip and count, including `UINT_MAX` for the remaining levels, with default
+component mapping, plane zero and zero resource LOD clamp. The existing point
+or linear clamp sampler has min/max LOD zero, so sampling selects level zero
+relative to the SRV's first mip; arbitrary sampler LOD is not supported.
+CopyTextureRegion supports full selected mips with 512-byte buffer offsets
+and 256-byte row pitches; partial regions and per-subresource barriers are
+rejected. Packed mip bytes in the internal transport are not console tiling.
+This incompatible mip-aware batch uses opcode 5; old opcode 3 is rejected
+rather than misdecoded.
+
+On Wine 11 under Rosetta, a normally launched TLS guest uploaded odd-sized
+7x5, 3x2 and 1x1 mips with independent offsets/pitches, sampled each through
+an explicit SRV in translated Metal draws, and verified pixels and mip
+readback including preserved row padding. Invalid ranges, mip counts, formats,
+layouts, subresources, offsets and pitches were rejected. With the launcher
+test environment below, run `cargo test --locked -p victory --target
+x86_64-apple-darwin --test wine_mips -- --ignored --nocapture`. No game binary
+or console tiled layout was tested.
 
 On an M3 Max with Wine 11 and the Apple converter, the compiled TLS-bearing
 guest uploaded two textures, sampled them in multiple draws across two
