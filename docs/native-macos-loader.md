@@ -172,12 +172,31 @@ In isolated child-process experiments on an Apple M3 Max running macOS 27.3
 under Rosetta, `gs:[0x58]` read zero, and both `rdgsbase` and `wrgsbase`
 raised SIGILL; CPUID did not advertise FSGSBASE. Reading Mach's translated
 `x86_THREAD_STATE64` succeeded and showed a zero GS selector, but did not
-establish a supported way to install a Windows TEB. These observations do
-not rule out other emulation or rewriting designs. Correct support would
-require safe instruction identification, PE TLS template/index handling,
-per-thread storage, and process/thread callback ordering, including threads
-not created by this loader. Until those are implemented and tested together,
-images containing TLS remain explicitly rejected.
+establish a supported way to install a Windows TEB. A zero value at
+`gs:[0x58]` is a zero *slot value*, not evidence that GS base is zero.
+
+The unresolved issue is how to expose the Windows TLS array at that address
+without corrupting macOS thread-specific data or depending on an undocumented
+host ABI. A [Wine developer's macOS investigation](https://list.winehq.org/hyperkitty/list/wine-gitlab@list.winehq.org/message/NROQNDTC4ZB2MNFQGQPC3BEQHTINZPVT/)
+describes both a compatibility-slot approach and a private GS-base switching
+approach, including the need to switch around host calls and signal handlers.
+Neither establishes a public, stable contract for this loader; Apple's
+[TSD implementation](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/os/tsd.h)
+itself warns that its implementation details are not ABI. In particular,
+writing a zero-valued slot is not proof that the slot is available.
+
+A viable design needs either a supported host interface for that slot, or a
+controlled execution engine that correctly translates all guest GS accesses
+without scanning arbitrary instruction bytes. It must also copy the PE TLS
+template and zero-fill, assign module indices, initialize an array for each
+participating thread, run callbacks and DLL notifications in the correct
+order, and keep mappings and blocks alive through teardown. The PE parser
+exposes and validates the template RVA range, zero-fill count, index RVA and
+callbacks; parsing does not allocate or execute TLS. The native loader has no
+managed thread lifecycle, and the existing controlled-entry API cannot enforce
+setup for threads created outside it. Until an execution model and lifecycle
+satisfy these constraints and are tested together, images containing TLS
+remain explicitly rejected.
 
 ## Synthetic test under Rosetta
 
