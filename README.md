@@ -127,6 +127,19 @@ The caller must not access mapped resources concurrently with submission.
 This experimental path is not wired into a macOS title loader and is not
 an Xbox GPU backend.
 
+Native macOS presentation is not implemented: the queue's `PresentX` returns
+`E_NOTIMPL`, and the runtime has no AppKit window or `CAMetalLayer` event-loop
+integration. A presentation implementation needs a real window and drawable
+lifecycle, serialized access to the rendered resource and its console state,
+and validation of the supported plane and present-parameter ABI rather than
+silently ignoring fields. It also needs an unlocked graphical session to verify
+that a submitted frame actually reaches a visible surface; offscreen readback
+alone does not establish that.
+
+A safer independently testable graphics increment is ordered
+`ClearRenderTargetView` support for the existing linear RGBA8 target subset,
+with resource-state and pixel readback checks.
+
 To run the synthetic device/list/queue test on a Metal GPU (no title assets):
 
 ```sh
