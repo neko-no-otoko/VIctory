@@ -18,6 +18,7 @@ pub(crate) struct Prepared {
     raw_views: bool,
     raw_accesses: Vec<(usize, ResourceType)>,
     raw_required: Vec<(usize, usize)>,
+    uav_required: usize,
     threads: [u32; 3],
 }
 
@@ -70,6 +71,7 @@ impl Prepared {
         }
         let mut raw_accesses = Vec::new();
         let mut raw_required: Vec<(usize, usize)> = Vec::new();
+        let mut uav_required = 0;
         if raw_views {
             if root.slot == 0 || root.slot >= 64 || traced.scalar.is_empty()
                 || p.used.iter().any(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
@@ -151,6 +153,26 @@ impl Prepared {
                 return Err("unsupported compute descriptor role".into());
             }
             if raw_views || d.source == descriptor.source {
+                if !raw_views {
+                    let inst = program.blocks.get(d.site.0).and_then(|b| b.insts.get(d.site.1))
+                        .ok_or("invalid UAV access")?;
+                    if !(inst.name().starts_with("buffer_load_dword")
+                        || inst.name().starts_with("buffer_store_dword")) {
+                        return Err("unsupported UAV buffer access".into());
+                    }
+                    let victory_shader::gfx10::Fields::Buffer {
+                        data: Some(victory_shader::gfx10::Operand::Vector { dwords, .. }),
+                        soffset, offset, offen: false, idxen: false,
+                        format: None, lds: false, tfe: false, ..
+                    } = &inst.fields else {
+                        return Err("dynamic or unsupported UAV buffer addressing".into());
+                    };
+                    if !matches!(soffset, victory_shader::gfx10::Operand::Const(128)
+                        | victory_shader::gfx10::Operand::Scalar { code: victory_shader::gfx10::NULL, .. }) {
+                        return Err("dynamic UAV buffer offset is unsupported".into());
+                    }
+                    uav_required = uav_required.max(usize::from(*offset) + usize::from(*dwords) * 4);
+                }
                 continue;
             }
             let resource::Source::Built { address, bits: 0x100000, words: [u32::MAX, 0x11014fac] } = &d.source else {
@@ -222,6 +244,7 @@ impl Prepared {
             raw_views,
             raw_accesses,
             raw_required,
+            uav_required,
             root_cbv,
             threads: io.threads,
         })
@@ -373,6 +396,9 @@ impl WineMetalCompute {
             return Err("invalid compute request dimensions or lengths".into());
         }
         let p = &mut self.prepared;
+        if buffer.len() < p.uav_required {
+            return Err("UAV range is too small for shader access".into());
+        }
         let cbv = match (p.root_cbv, cbv) {
             (None, None) => None,
             (Some((expected, required, offset)), Some((slot, bytes)))
@@ -1456,6 +1482,10 @@ impl State {
         let resource = resource as This;
         if resource.is_null() || crate::resource::buffer_bytes(resource).is_none() {
             return Err("UAV is not a buffer".into());
+        }
+        if crate::resource::buffer_bytes(resource)
+            .is_none_or(|(_, size)| size < p.uav_required as u64) {
+            return Err("UAV range is too small for shader access".into());
         }
         let cbv = if let Some((slot, required, _)) = p.root_cbv {
             let Some(Root::Cbv { resource: cbv, offset, size }) = self.roots.get(slot as usize) else {

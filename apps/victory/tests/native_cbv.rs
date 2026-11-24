@@ -8,8 +8,7 @@ fn put64(b: &mut [u8], at: usize, n: u64) { b[at..at + 8].copy_from_slice(&n.to_
 // GFX10: build a buffer descriptor from root address s[0:1], read the CBV
 // dword at byte 16 into s6, load UAV word 1 through the table in s4, add, and store
 // the result in UAV word 0. Both resource descriptions are real FSSM metadata.
-fn shader() -> Vec<u8> {
-    let words: &[u32] = &[
+const WORDS: &[u32] = &[
         0xbe8c0300,             // s_mov_b32 s12, s0
         0x880dff01, 0x00100000, // s_or_b32 s13, s1, 0x100000
         0xbe8e03c1,             // s_mov_b32 s14, -1
@@ -22,7 +21,11 @@ fn shader() -> Vec<u8> {
         0x4a000006,             // v_add_nc_u32 v0, s6, v0
         0xe0700000, 0x80020000, // buffer_store_dword v0, off, s[8:11], 0
         0xbf810000,
-    ];
+];
+
+fn shader() -> Vec<u8> { shader_with_words(WORDS) }
+
+fn shader_with_words(words: &[u32]) -> Vec<u8> {
     let mut p = vec![0; 0x68]; put64(&mut p, 0, 6);
     for at in [8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] { put64(&mut p, at, 0xdeadbeefdeadbeef); }
     let record = p.len(); put64(&mut p, 0x60, record as u64);
@@ -77,5 +80,54 @@ fn synthetic_root_cbv_through_native_cli() {
         } else {
             assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("fixture entry returned 42"), "case {case}: status {}\nstdout: {}\nstderr: {}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }
+    }
+}
+
+#[test]
+#[ignore = "requires LLVM MinGW, a trusted Apple Metal Shader Converter and Metal GPU"]
+fn native_compute_rejects_accesses_outside_single_uav_and_cbv_views() {
+    assert!(std::env::var_os("VICTORY_METAL_CONVERTER").is_some());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("d3d.def"), "LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n").unwrap();
+    tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "d3d.def", "-l", "d3d.lib"]);
+
+    // The native path accepts only a whole-buffer UAV; use an 8-byte
+    // resource so byte 8 is the first out-of-range address.
+    let original = include_str!("../../../tests/fixtures/macos_d3d12x_cbv.c");
+    let flags = "rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;";
+    assert!(original.contains(flags));
+    let source = original.replace(flags, "rd.Width=8; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;");
+    let close_check = "#if (CASE >= 1 && CASE <= 4) || CASE == 7 || CASE == 8";
+    assert!(source.contains(close_check));
+    let reject_at_close = source.replace(close_check, "#if 1");
+    let pipeline_check = "if (SLOT(dev,0x58,CreatePipeline)(dev,&pd,&IID_ID3D12PipelineState,&pipeline)!=S_OK || !pipeline) return 7;";
+    assert!(reject_at_close.contains(pipeline_check));
+    let dynamic_source = reject_at_close.replace(pipeline_check, "HRESULT hr=SLOT(dev,0x58,CreatePipeline)(dev,&pd,&IID_ID3D12PipelineState,&pipeline); if (hr==E_NOTIMPL && !pipeline) return 42; if (hr!=S_OK || !pipeline) return 7;");
+
+    for case in ["control", "uav_load", "uav_store", "uav_dynamic_load", "uav_dynamic_store", "uav_vector_load", "uav_vector_store", "cbv_dynamic"] {
+        let mut words = WORDS.to_vec();
+        let dynamic = case.contains("dynamic") || case.contains("vector");
+        match case {
+            "control" => {}
+            "uav_load" => words[11] = 0xe0300008,
+            "uav_store" => words[15] = 0xe0700008,
+            // s2 is runtime shader state, not an immediate offset.
+            "uav_dynamic_load" => { words[12] = 0x02020000; words.insert(0, 0xbe820388); }
+            "uav_dynamic_store" => { words[16] = 0x02020000; words.insert(0, 0xbe820388); }
+            // Vector offsets exercise per-lane dynamic addressing as well.
+            "uav_vector_load" => { words[11] = 0xe0301000; words[12] = 0x80020001; words.insert(0, 0x7e020288); }
+            "uav_vector_store" => { words[15] = 0xe0701000; words[16] = 0x80020001; words.insert(0, 0x7e020288); }
+            // Root CBV starts at byte 16; byte 48 is one past its allocation.
+            "cbv_dynamic" => { words[7] = 0x04000000; words.insert(0, 0xbe8203b0); }
+            _ => unreachable!(),
+        }
+        let array = shader_with_words(&words).iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        std::fs::write(root.join("shaders.h"), format!("static const unsigned char shader[] = {{{array}}};\n")).unwrap();
+        std::fs::write(root.join("cbv.c"), if case == "control" { &source } else if dynamic { &dynamic_source } else { &reject_at_close }).unwrap();
+        tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-DCASE=0", "-c", "cbv.c", "-o", "cbv.obj"]);
+        tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:cbv.exe", "cbv.obj", "d3d.lib"]);
+        let out = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("cbv.exe")).arg("--execute").output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("fixture entry returned 42"), "case {case}: status {}\nstdout: {}\nstderr: {}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 }

@@ -2,7 +2,9 @@
 //!
 //! Legacy dispatch uses a writable raw buffer at heap index 0. Raw heap
 //! dispatch accepts ordered SRV and UAV entries. Callers must check the
-//! converted shader's binding layout.
+//! converted shader's binding layout and ensure every shader access stays
+//! within its view. This API validates slice containment, not shader accesses;
+//! Metal descriptor lengths alone do not provide that guarantee.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::NonNull;

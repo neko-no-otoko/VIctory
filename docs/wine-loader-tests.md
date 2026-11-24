@@ -288,9 +288,10 @@ completes. Opcode 8 carries general tables; the prior two-entry opcode 7
 remains supported.
 
 Only raw dword loads/stores with statically provable immediate byte offsets
-are accepted on these table paths. The host checks every access width and
-offset against its view length before dispatch; indexed, dynamic and
-out-of-range accesses are rejected. This restriction matters: in a test on
+are accepted on all these compute paths, including the whole-buffer UAV
+path. The host checks every access width and offset against its view length
+before dispatch; indexed, dynamic and out-of-range accesses are rejected.
+This restriction matters: in a test on
 the Apple converter and M3 Max, a load outside an SRV view but inside its
 backing allocation returned the backing byte rather than zero. Do not rely
 on Metal descriptor length alone to enforce D3D out-of-bounds semantics.
@@ -298,6 +299,10 @@ Aliased views, structured or typed buffers, counters and mixing these
 tables with root CBVs are rejected. This is pipeline-metadata binding, not
 general D3D12 root-signature support. Metal uses the buffer descriptor
 encoding documented by [Apple](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
+
+The `wine_compute_bounds` fixture exercises legacy, paired-view and
+multi-view access checks using real translated shaders, including boundary
+loads and stores and dynamic addressing.
 
 On an M3 Max under Rosetta with Wine 11 and Apple's converter, a normally
 launched TLS guest sampled a nonzero-offset raw SRV and wrote a nonzero-offset
