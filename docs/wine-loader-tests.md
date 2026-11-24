@@ -961,9 +961,9 @@ With no option the launcher removes any inherited
 This is the existing local, offline XGameSave implementation, not Xbox cloud
 sync. It implements its supported asynchronous operations and versioned
 container updates; blocking slots and other unimplemented methods remain
-unsupported. Persistent-local-storage path, space and prompt requests return
-unsupported in this mode instead of exposing VIctory's custom-loader virtual
-drive, which Wine's normal file imports cannot use.
+unsupported. Without an explicit storage-drive option, persistent-local-storage
+requests also return unsupported rather than exposing VIctory's custom-loader
+virtual drive, which Wine's ordinary file imports cannot use.
 The runtime DLL pins itself when returning provider objects, so their method
 tables remain available if the guest releases its explicit DLL reference.
 
@@ -974,6 +974,42 @@ not prevent a guest, another program, a nested save root, or a detached child
 from accessing the data. Do not use the same save data concurrently outside
 that coordination. Wine and the guest can write elsewhere with the user's
 permissions.
+
+### Wine persistent local storage
+
+For PLS, first create a real `storage` directory inside the dedicated save
+root and configure an existing Wine prefix drive link to that directory (for
+example, configure `P:` in `winecfg`). Then add
+`--save-root /absolute/path/to/dedicated-data --storage-drive P` to the
+launcher command. The launcher does not create directories or alter drive
+links. It accepts letters D–Y except G and T, rejects duplicate mappings to
+the storage directory, requires the lowercase `dosdevices/p:` link and
+checks its target and Wine's path conversion. A missing or mismatched link,
+symlinked storage directory, or conflicting drive fails before guest startup.
+These checks are repeated around Wine initialization; mappings can still
+change afterward.
+
+The PLS API returns the real Wine drive root, and ordinary Win32 file APIs
+access its mapped directory. Space reporting and prompts use the existing
+manifest quota and local disk accounting; they do not enforce a filesystem
+quota. Game saves remain in the separate `saves` directory. The preexisting
+save-root advisory lock covers cooperating launchers only; Wine, the guest,
+other programs, and symlinks are not sandboxed. This is offline storage, not
+cloud synchronization.
+
+With the launcher test environment above:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_pls -- --ignored --nocapture --test-threads=1
+```
+
+On Wine 11 under Rosetta, two synthetic tests passed. A normally launched
+TLS-bearing PE wrote and reopened a file through the returned drive across
+launches, checked quota reporting and prompts, and used two isolated roots.
+Other cases covered unsupported configuration, invalid or duplicate drive
+mappings, invalid letters, and advisory lock contention.
+
+### Wine XGameSave regression
 
 With the launcher test environment above:
 

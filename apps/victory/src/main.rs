@@ -185,6 +185,9 @@ enum Command {
         /// Enable offline XGameSave under this existing, dedicated directory.
         #[arg(long)]
         save_root: Option<PathBuf>,
+        /// Use an existing Wine drive mapped to the save root's storage directory.
+        #[arg(long, requires = "save_root")]
+        storage_drive: Option<char>,
         /// Arguments passed to the guest after `--`.
         #[arg(last = true)]
         guest_args: Vec<std::ffi::OsString>,
@@ -275,8 +278,8 @@ fn main() -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Command::NativeCensus { file, file_root, save_root } => native_census::run(&file, file_root.as_deref(), save_root.as_deref()),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, guest_args } => {
-            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root.as_deref(), save_root.as_deref(), &guest_args)?;
+        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, storage_drive, guest_args } => {
+            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root.as_deref(), save_root.as_deref(), storage_drive, &guest_args)?;
             if code != 0 { std::process::exit(code); }
             Ok(())
         }

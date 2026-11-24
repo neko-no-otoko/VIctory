@@ -160,35 +160,44 @@ fn elements(text: &str) -> Vec<(String, String)> {
     out
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageMode {
+    #[default]
+    Virtual,
+    WineUnavailable,
+    WineDrive(u8),
+}
+
 #[derive(Default)]
 struct TitleState {
     title: Option<Title>,
-    wine_configured: bool,
+    storage_mode: StorageMode,
 }
 
 static TITLE: Mutex<TitleState> = Mutex::new(TitleState {
     title: None,
-    wine_configured: false,
+    storage_mode: StorageMode::Virtual,
 });
 
 pub fn set_title(title: Title) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = TitleState {
         title: Some(title),
-        wine_configured: false,
+        storage_mode: StorageMode::Virtual,
     };
 }
 
-/// Installs the Wine title without exposing the custom loader's virtual drive.
-pub fn set_wine_title(title: Title) {
+/// Installs a Wine title and its actual drive, if one was configured.
+pub fn set_wine_title(title: Option<Title>, drive: Option<u8>) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = TitleState {
-        title: Some(title),
-        wine_configured: true,
+        title,
+        storage_mode: drive.map_or(StorageMode::WineUnavailable, StorageMode::WineDrive),
     };
 }
 
-/// Whether this title runs under Wine's ordinary file imports.
-pub fn wine_title_configured() -> bool {
-    TITLE.lock().unwrap_or_else(|e| e.into_inner()).wine_configured
+/// Takes a consistent snapshot of the title and its storage mode.
+pub fn title_storage() -> (Title, StorageMode) {
+    let state = TITLE.lock().unwrap_or_else(|e| e.into_inner());
+    (state.title.clone().unwrap_or_default(), state.storage_mode)
 }
 
 /// The running title; the default (id 0, no storage) until set.

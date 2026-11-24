@@ -46,6 +46,22 @@ mod windows {
         Ok(title)
     }
 
+    fn configured_drive(value: &std::ffi::OsStr, title: Option<&Title>) -> Result<u8, HRESULT> {
+        let bytes = value.to_str().ok_or(E_INVALIDARG)?.as_bytes();
+        if bytes.len() != 1 {
+            return Err(E_INVALIDARG);
+        }
+        let drive = bytes[0].to_ascii_uppercase();
+        if !(b'D'..=b'Y').contains(&drive) || matches!(drive, b'G' | b'T') {
+            return Err(E_INVALIDARG);
+        }
+        let title = title.ok_or(E_INVALIDARG)?;
+        if !title.storage.is_dir() || !Path::new(&format!("{}:\\", char::from(drive))).is_dir() {
+            return Err(E_INVALIDARG);
+        }
+        Ok(drive)
+    }
+
     static INITIALIZED: LazyLock<Result<(), HRESULT>> = LazyLock::new(|| {
         let executable = std::env::current_exe().ok();
         let title = match std::env::var_os("VICTORY_WINE_TITLE_DATA") {
@@ -55,6 +71,9 @@ mod windows {
             )?),
             None => None,
         };
+        let drive = std::env::var_os("VICTORY_WINE_PLS_DRIVE")
+            .map(|value| configured_drive(&value, title.as_ref()))
+            .transpose()?;
 
         // A null name asks Windows for the process image, not this DLL.
         let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
@@ -64,9 +83,7 @@ mod windows {
                 title_runtime::set_image_path(base, path);
             }
         }
-        if let Some(title) = title {
-            title_runtime::set_wine_title(title);
-        }
+        title_runtime::set_wine_title(title, drive);
         Ok(())
     });
 
@@ -170,6 +187,28 @@ mod windows {
             assert_eq!(configured_title(&dir.join("missing"), &exe), Err(E_INVALIDARG));
             assert_eq!(configured_title(&dir.join("MicrosoftGame.config"), &exe), Err(E_INVALIDARG));
             std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn drive_requires_valid_letter_and_existing_title_storage() {
+            use std::ffi::OsStr;
+
+            for value in ["", "C", "G", "g", "T", "t", "Z", "PP", "1", "é"] {
+                assert_eq!(configured_drive(OsStr::new(value), None), Err(E_INVALIDARG));
+            }
+            assert_eq!(configured_drive(OsStr::new("P"), None), Err(E_INVALIDARG));
+            let title = Title {
+                storage: std::env::temp_dir().join(format!(
+                    "victory-missing-storage-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )),
+                ..Default::default()
+            };
+            assert_eq!(configured_drive(OsStr::new("p"), Some(&title)), Err(E_INVALIDARG));
         }
 
         #[test]

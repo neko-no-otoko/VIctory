@@ -200,7 +200,8 @@ fn directory(path: &Path, name: &str) -> Result<PathBuf> {
 fn clean_bridge_env(command: &mut Command) {
     command.env_remove("VICTORY_WINE_METAL_ADDR")
         .env_remove("VICTORY_WINE_METAL_TOKEN")
-        .env_remove("VICTORY_WINE_TITLE_DATA");
+        .env_remove("VICTORY_WINE_TITLE_DATA")
+        .env_remove("VICTORY_WINE_PLS_DRIVE");
 }
 
 fn nonblocking(reader: &impl AsRawFd) -> Result<()> {
@@ -472,6 +473,47 @@ fn checked_title_root(prefix: &Path, root: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+// Wine uses prefix drive links for ordinary Win32 opens. Never create or
+// replace them: only accept a dedicated, already configured storage drive.
+fn checked_storage_drive(prefix: &Path, save: &Path, letter: char) -> Result<PathBuf> {
+    let letter = letter.to_ascii_uppercase();
+    if !('D'..='Y').contains(&letter) || matches!(letter, 'G' | 'T') {
+        bail!("storage drive must be D through Y, excluding G and T");
+    }
+    let storage = save.join("storage");
+    let metadata = fs::symlink_metadata(&storage).context("reading save-root storage directory")?;
+    if !metadata.file_type().is_dir() {
+        bail!("save-root storage must be an existing directory, not a symlink");
+    }
+    let storage = directory(&storage, "persistent storage")?;
+    let dosdevices = prefix.join("dosdevices");
+    let wanted = format!("{}:", letter.to_ascii_lowercase());
+    let mut found = false;
+    for entry in fs::read_dir(&dosdevices).context("reading Wine drive mappings")? {
+        let entry = entry.context("reading Wine drive mapping")?;
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if bytes.eq_ignore_ascii_case(wanted.as_bytes()) {
+            if found || bytes != wanted.as_bytes() {
+                bail!("ambiguous or noncanonical Wine storage drive mapping");
+            }
+            found = true;
+            if !fs::symlink_metadata(entry.path())?.file_type().is_symlink() {
+                bail!("Wine storage drive mapping must be a symlink");
+            }
+            if fs::canonicalize(entry.path()).context("resolving Wine storage drive")? != storage {
+                bail!("Wine storage drive does not map to save-root storage");
+            }
+        } else if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            if fs::canonicalize(entry.path()).ok().as_deref() == Some(storage.as_path()) {
+                bail!("another Wine drive maps to the storage directory");
+            }
+        }
+    }
+    if !found { bail!("Wine storage drive mapping is missing"); }
+    Ok(storage)
+}
+
 // Wine's system32 GameInput placeholder shadows WINEPATH. Provision only in
 // a prefix that was empty at entry; never replace anything in an existing one.
 fn gameinput_file(dir: &Path) -> Result<Option<PathBuf>> {
@@ -583,7 +625,7 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 
 
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
     let wine = executable_file(wine, "Wine executable")?;
     let winepath = executable_file(winepath, "winepath executable")?;
@@ -598,6 +640,11 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
             bail!("title root and save root must be separate directories");
         }
     }
+    let storage_drive = storage_drive.map(|letter| letter.to_ascii_uppercase());
+    let storage = if let Some(letter) = storage_drive {
+        let (save, _) = save_root.as_ref().context("storage drive requires a save root")?;
+        Some(checked_storage_drive(&wine_prefix, save, letter)?)
+    } else { None };
     reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
     preflight(&exe, &dll_dir, provision_gameinput)?;
     let overrides = wine_overrides(provision_gameinput)?;
@@ -624,6 +671,14 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         }
         Some(OsString::from_vec(windows))
     } else { None };
+    if let (Some(letter), Some(storage), Some((save, _))) = (storage_drive, &storage, &save_root) {
+        checked_storage_drive(&wine_prefix, save, letter)?;
+        let drive = format!("{letter}:\\");
+        let host = winepath_output(&winepath, &wine_prefix, "-u", OsStr::new(&drive))?;
+        if directory(&PathBuf::from(OsString::from_vec(host)), "Wine storage drive")? != *storage {
+            bail!("Wine storage drive does not resolve to the selected directory");
+        }
+    }
     if let Some(root) = &title_root { checked_title_root(&wine_prefix, root)?; }
     if let Some(provider) = &input_provider {
         if fresh_prefix { install_gameinput(&wine_prefix, provider)?; }
@@ -653,12 +708,16 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         checked_title_root(&wine_prefix, root)?;
         eprintln!("Wine G: currently maps to {}; the mapping and guest file access are not sandboxed.", root.display());
     }
+    if let (Some(letter), Some((save, _))) = (storage_drive, &save_root) {
+        checked_storage_drive(&wine_prefix, save, letter)?;
+    }
     let mut wine_command = Command::new(&wine);
     wine_command.arg(&exe).args(args).env("WINEPREFIX", &wine_prefix)
         .env("WINEPATH", wine_path).env("WINEDLLOVERRIDES", overrides);
     clean_bridge_env(&mut wine_command);
     wine_command.env("VICTORY_WINE_METAL_ADDR", address.to_string()).env("VICTORY_WINE_METAL_TOKEN", &token);
     if let Some(root) = &windows_save_root { wine_command.env("VICTORY_WINE_TITLE_DATA", root); }
+    if let Some(letter) = storage_drive { wine_command.env("VICTORY_WINE_PLS_DRIVE", letter.to_string()); }
     let mut guest = ManagedChild::spawn(&mut wine_command, "Wine")?;
     loop {
         check_signal()?;
@@ -684,8 +743,8 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
 }
 
 pub fn run(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
-    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, args: &[OsString]) -> Result<i32> {
-    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, args) {
+    dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, args: &[OsString]) -> Result<i32> {
+    match run_inner(exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, allow_unverified_dll_search, provision_gameinput, title_root, save_root, storage_drive, args) {
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
             Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0)
         }

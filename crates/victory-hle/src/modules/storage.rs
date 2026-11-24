@@ -46,17 +46,20 @@ type This = *const Object;
 /// drive, so a host folder such as `C:\Users\..` would make it write to the
 /// root of `C:`. None (the path calls fail) before the title is set.
 fn folder() -> Option<String> {
-    if runtime::wine_title_configured() {
-        return None;
+    let (title, mode) = runtime::title_storage();
+    match mode {
+        runtime::StorageMode::WineUnavailable => None,
+        runtime::StorageMode::WineDrive(letter) => Some(format!("{}:\\", char::from(letter))),
+        runtime::StorageMode::Virtual => {
+            if title.storage.as_os_str().is_empty() {
+                return None;
+            }
+            #[cfg(windows)]
+            return super::files::mount(&title.storage).map(|letter| format!("{letter}:\\"));
+            #[cfg(not(windows))]
+            None
+        }
     }
-    let storage = runtime::title().storage;
-    if storage.as_os_str().is_empty() {
-        return None;
-    }
-    #[cfg(windows)]
-    return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(windows))]
-    None
 }
 
 extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
@@ -124,8 +127,7 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
     u64::MAX
 }
 
-fn space() -> SpaceInfo {
-    let title = runtime::title();
+fn space(title: &runtime::Title) -> SpaceInfo {
     let used = used_bytes(&title.storage);
     let free = title.storage_bytes.saturating_sub(used);
     SpaceInfo {
@@ -138,10 +140,11 @@ fn space() -> SpaceInfo {
 }
 
 extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
-    if runtime::wine_title_configured() {
+    let (title, mode) = runtime::title_storage();
+    if mode == runtime::StorageMode::WineUnavailable {
         return NOT_SUPPORTED;
     }
-    put(out, space())
+    put(out, space(&title))
 }
 
 /// Tells our prompts apart from other calls on the same block.
@@ -149,9 +152,10 @@ static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
 extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
-    let hr = if runtime::wine_title_configured() {
+    let (title, mode) = runtime::title_storage();
+    let hr = if mode == runtime::StorageMode::WineUnavailable {
         NOT_SUPPORTED
-    } else if bytes <= space().total_free {
+    } else if bytes <= space(&title).total_free {
         S_OK
     } else {
         E_ABORT
