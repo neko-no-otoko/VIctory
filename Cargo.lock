@@ -668,6 +668,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-metal",
+ "victory-native",
  "victory-pe",
  "victory-shader",
  "walkdir",

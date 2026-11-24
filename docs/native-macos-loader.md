@@ -81,6 +81,35 @@ only unmaps memory and never invokes arbitrary code. Export addresses remain
 valid only while the image is alive. Calling an export executes arbitrary
 machine code.
 
+## Trusted fixture CLI
+
+An x86-64 macOS build of `victory` exposes `native-fixture`. On Apple Silicon,
+install Rosetta, the Rust `x86_64-apple-darwin` target and Apple command-line
+tools, then build or run that target. For a self-authored PE executable:
+
+```sh
+cargo run -p victory --target x86_64-apple-darwin -- native-fixture /path/to/fixture.exe
+cargo run -p victory --target x86_64-apple-darwin -- native-fixture /path/to/fixture.exe --execute
+```
+
+Without `--execute`, the command maps and binds but does not call the entry.
+With it, code runs **unsandboxed in the CLI process** and can crash, hang or
+corrupt it. Only pass a trusted fixture with a normally returning
+`extern "win64" fn() -> u32` entry, and ensure its callbacks and thread
+lifetime satisfy the safety requirements above. The returned integer is
+printed; it is not used as the CLI exit status. This command cannot supply
+dependent DLLs, rejects unsupported images and missing imports, and exposes
+only the combined native services described above. It does not supply a
+Windows environment, start Windows processes, or support games.
+
+With LLVM-MinGW on `PATH` as in the test setup below, the following builds
+and runs a self-authored synthetic PE using both native services, verifies
+the opt-in and exercises missing-import and invalid-image failures:
+
+```sh
+cargo test -p victory --target x86_64-apple-darwin --test native_fixture
+```
+
 ## Static TLS remains unsupported
 
 The Windows loader's existing TLS rewrite is not a macOS TLS implementation:

@@ -8,6 +8,8 @@ mod census;
 mod inspect;
 #[cfg(target_os = "macos")]
 mod metal;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod native_fixture;
 #[cfg(windows)]
 mod run;
 mod shader;
@@ -112,6 +114,16 @@ enum Command {
         #[arg(long, value_enum)]
         stage: metal::Stage,
     },
+    /// Map a trusted, controlled PE fixture; never Windows process startup.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[command(long_about = "Map a trusted, controlled PE fixture. With --execute, call its normally returning extern win64 fn() -> u32 entry in this process, without isolation. This is not Windows process startup or game support; Windows process state, TLS, exception handling and CRT startup are absent. No dependent DLLs can be supplied.")]
+    NativeFixture {
+        /// Self-authored PE executable with a controlled Windows x64 entry.
+        exe: PathBuf,
+        /// Execute trusted code in this process (unsafe; no isolation).
+        #[arg(long)]
+        execute: bool,
+    },
     #[cfg(windows)]
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -193,6 +205,8 @@ fn main() -> Result<()> {
             library,
             stage,
         } => metal::convert(&input, &output, &library, stage),
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        Command::NativeFixture { exe, execute } => native_fixture::run(&exe, execute),
         #[cfg(windows)]
         Command::Run {
             exe,
