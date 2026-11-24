@@ -1466,6 +1466,7 @@ extern "system" fn heap_properties(
 }
 
 /// IUnknown 3, object 4, device child 1, heap 1.
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static HEAP_FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<HEAP, 24>());
     f[0] = heap_query as *const ();
@@ -1477,6 +1478,7 @@ static HEAP_FUNCTIONS: Table<24> = {
 
 /// IUnknown 3, object 4, device child 1, resource 10 (7 as on PC, then 3
 /// console ones).
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static RESOURCE_FUNCTIONS: Table<32> = {
     let mut f = object::d3d12_object(object::missing_table::<RESOURCE, 32>());
     f[0] = resource_query as *const ();
@@ -1489,6 +1491,49 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        super::heap_query(this, iid, out)
+    }
+    extern "win64" fn heap_release(this: This) -> u32 { super::heap_release(this) }
+    extern "win64" fn resource_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        super::resource_query(this, iid, out)
+    }
+    extern "win64" fn resource_release(this: This) -> u32 { super::resource_release(this) }
+    extern "win64" fn map(this: This, sub: u32, read: *const c_void, out: *mut *mut u8) -> HRESULT {
+        super::map(this, sub, read, out)
+    }
+    extern "win64" fn unmap(this: This, sub: u32, written: *const c_void) {
+        super::unmap(this, sub, written)
+    }
+    extern "win64" fn gpu_address(this: This) -> u64 { super::gpu_address(this) }
+
+    pub(super) static HEAP_FUNCTIONS: Table<24> = {
+        let mut f = object::native_table::<24>();
+        f[0] = heap_query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = heap_release as *const ();
+        Table(f)
+    };
+    pub(super) static RESOURCE_FUNCTIONS: Table<32> = {
+        let mut f = object::native_table::<32>();
+        f[0] = resource_query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = resource_release as *const ();
+        f[8] = map as *const ();
+        f[9] = unmap as *const ();
+        f[11] = gpu_address as *const ();
+        Table(f)
+    };
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+use native::{HEAP_FUNCTIONS, RESOURCE_FUNCTIONS};
 
 #[cfg(test)]
 mod tests {

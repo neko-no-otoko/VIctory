@@ -120,6 +120,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
 /// one among them).
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<FENCE, 24>());
     f[0] = query as *const ();
@@ -132,6 +133,32 @@ static FUNCTIONS: Table<24> = {
     f[12] = gpu_address as *const (); // 0x60
     Table(f)
 };
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        super::query(this, iid, out)
+    }
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn release(this: This) -> u32 { super::release(this) }
+    extern "win64" fn completed(this: This) -> u64 { super::completed(this) }
+    extern "win64" fn signal(this: This, value: u64) -> HRESULT { super::signal(this, value) }
+
+    pub(super) static FUNCTIONS: Table<24> = {
+        let mut f = object::native_table::<24>();
+        f[0] = query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = release as *const ();
+        f[8] = completed as *const ();
+        f[10] = signal as *const ();
+        Table(f)
+    };
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+use native::FUNCTIONS;
 
 #[cfg(test)]
 mod tests {

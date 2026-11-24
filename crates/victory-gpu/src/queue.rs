@@ -527,8 +527,45 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
     f
 }
 
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static FUNCTIONS: Table<36> = Table(queue_table(false));
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        super::query(this, iid, out)
+    }
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn release(this: This) -> u32 { super::release(this) }
+    extern "win64" fn execute(this: This, count: u32, lists: *const This) {
+        super::execute(this, count, lists);
+        if this.is_null() || queue(this).failed.load(Ordering::Acquire) {
+            std::process::abort();
+        }
+    }
+    extern "win64" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+        super::signal(this, fence, value)
+    }
+
+    const fn table(newer: bool) -> Table<36> {
+        let mut f = object::native_table::<36>();
+        f[0] = query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = release as *const ();
+        f[10] = execute as *const ();
+        f[if newer { 16 } else { 14 }] = signal as *const ();
+        Table(f)
+    }
+    pub(super) static FUNCTIONS: Table<36> = table(false);
+    pub(super) static NEWER_FUNCTIONS: Table<36> = table(true);
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+use native::{FUNCTIONS, NEWER_FUNCTIONS};
 
 #[cfg(test)]
 mod tests {

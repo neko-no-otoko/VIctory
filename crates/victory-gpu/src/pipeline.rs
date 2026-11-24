@@ -568,6 +568,7 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1, pipeline 3.
+#[cfg(not(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64")))]
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
     f[0] = query as *const ();
@@ -575,6 +576,28 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+mod native {
+    use super::*;
+
+    extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        super::query(this, iid, out)
+    }
+    extern "win64" fn add_ref(this: This) -> u32 { object::add_ref(this) }
+    extern "win64" fn release(this: This) -> u32 { super::release(this) }
+
+    pub(super) static FUNCTIONS: Table<24> = {
+        let mut f = object::native_table::<24>();
+        f[0] = query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = release as *const ();
+        Table(f)
+    };
+}
+
+#[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
+use native::FUNCTIONS;
 
 #[cfg(windows)]
 pub(crate) mod host;
