@@ -629,3 +629,75 @@ XSystem/XUser identity, handle, gamertag and error checks. The existing
 normally launched D3D12.X-to-Metal compute regression also passed with real
 GPU readback. No game files were used; these results do not establish game
 compatibility or ARM-native PE execution.
+
+## Integrated Wine launcher
+
+On x86-64 macOS (including Rosetta on Apple Silicon), `victory wine-run`
+launches a trusted PE as a normal Wine process and starts a separate native
+Metal host. Supply the Wine executable, `winepath`, Metal host, Apple
+converter, Wine prefix and HLE DLL directory explicitly. The directory must
+contain `d3d12_xs.dll`, `xg_xs.dll` and `xgameruntime.dll`. For example,
+after the toolchain and Wine setup above:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/victory-launcher-target
+cargo build -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
+  --target x86_64-pc-windows-gnullvm
+cargo build -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
+cargo build -p victory --target x86_64-apple-darwin
+export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
+mkdir -p /tmp/victory-launch-prefix
+"$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/victory" wine-run /path/to/trusted-guest.exe \
+  --wine /opt/homebrew/bin/wine --winepath /opt/homebrew/bin/winepath \
+  --metal-host "$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/examples/wine_metal_compute_host" \
+  --converter /path/to/libmetalirconverter.dylib \
+  --dll-dir "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug" \
+  --wine-prefix /tmp/victory-launch-prefix -- --guest-argument
+```
+
+The launcher generates a 128-bit token from `/dev/urandom`; the host binds an
+OS-assigned loopback port and announces readiness. The token is passed in the
+child environments, not printed. Other same-user processes may be able to
+read those environments; the token is not a sandbox or a boundary against
+such processes. The launcher preserves unrelated environment settings,
+prepends the selected DLL directory to `WINEPATH`, and requires native loading
+for those three providers; conflicting existing provider overrides are
+rejected. `VICTORY_WINE_METAL_PRESENT=1` remains an inherited opt-in for the
+existing presentation path.
+
+Direct imports from these three provider DLLs are checked against their named
+exports; provider ordinal imports and an obvious same-named DLL conflict in
+the guest executable directory are rejected. This does not inspect transitive
+or dynamic imports and does not force Wine to use a particular module: Wine's
+other earlier DLL search locations may still win. The launcher prints the
+selected search directory and warns about this; verify loaded module paths.
+Wine, the executable, the converter and all DLLs must be trusted. The launcher
+does not modify or copy guest files, but the unsandboxed guest can modify files
+and Wine may write to the selected prefix.
+
+The host readiness signal confirms binding, not converter ABI or shader
+support; converter loading and shader errors can occur on first use. Wine and
+Metal operation coverage remains limited as described above. The launcher
+monitors both children, returns the guest's exit status, and handles INT, TERM
+and HUP with bounded child-group cleanup. It does not terminate a shared Wine
+server or track descendants that detach into another session. This is not
+ARM-native PE execution or evidence of game compatibility.
+
+For the focused launcher tests, set the following paths (using the same
+target directory and LLVM-MinGW setup as above):
+
+```sh
+export VICTORY_TEST_WINE=/opt/homebrew/bin/wine
+export VICTORY_TEST_WINEPATH=/opt/homebrew/bin/winepath
+export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
+export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/x86_64-apple-darwin/debug/examples/wine_metal_compute_host"
+export VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
+export VICTORY_TEST_DLL_DIR="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug"
+cargo test -p victory --target x86_64-apple-darwin --test wine_launcher -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta on an M3 Max, the five tests passed: a real
+TLS-bearing Wine PE called the provider DLLs and verified Metal readback 42;
+failure, host exit and signal paths cleaned up the host; and two simultaneous
+launches used distinct loopback ports and tokens. This uses synthetic files,
+not a configured game.

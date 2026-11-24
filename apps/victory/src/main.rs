@@ -1,7 +1,7 @@
 //! `victory`: the command-line front end.
 //!
-//! Every command reads the user's own files and writes only to stdout or to
-//! the user's cache directory (outside the repository).
+//! Inspection commands read the user's own files. `wine-run` executes trusted
+//! guest code without a sandbox and Wine may write to its selected prefix.
 
 #[cfg(windows)]
 mod census;
@@ -12,6 +12,8 @@ mod metal;
 mod native_census;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_fixture;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod wine_launcher;
 #[cfg(windows)]
 mod run;
 mod shader;
@@ -147,6 +149,34 @@ enum Command {
         #[arg(long)]
         execute: bool,
     },
+    /// Run a trusted PE as a Wine process with the native Metal bridge.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[command(long_about = "Run a trusted PE as a normal Wine process using explicit HLE DLLs and a native Metal bridge. Wine's DLL search order still applies. This is not a sandbox or a claim of game compatibility.")]
+    WineRun {
+        /// Trusted Windows x86-64 executable.
+        exe: PathBuf,
+        /// Wine executable.
+        #[arg(long)]
+        wine: PathBuf,
+        /// Wine's winepath executable.
+        #[arg(long)]
+        winepath: PathBuf,
+        /// Native wine_metal_compute_host executable.
+        #[arg(long)]
+        metal_host: PathBuf,
+        /// Apple Metal Shader Converter dylib.
+        #[arg(long)]
+        converter: PathBuf,
+        /// Directory containing the three named VIctory HLE DLLs.
+        #[arg(long)]
+        dll_dir: PathBuf,
+        /// Existing, explicitly selected Wine prefix directory.
+        #[arg(long)]
+        wine_prefix: PathBuf,
+        /// Arguments passed to the guest after `--`.
+        #[arg(last = true)]
+        guest_args: Vec<std::ffi::OsString>,
+    },
     #[cfg(windows)]
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -232,6 +262,12 @@ fn main() -> Result<()> {
         Command::NativeFixture { exe, dll, execute, file_root, save_root } => native_fixture::run(&exe, &dll, execute, file_root.as_deref(), save_root.as_deref()),
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Command::NativeCensus { file, file_root, save_root } => native_census::run(&file, file_root.as_deref(), save_root.as_deref()),
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        Command::WineRun { exe, wine, winepath, metal_host, converter, dll_dir, wine_prefix, guest_args } => {
+            let code = wine_launcher::run(&exe, &wine, &winepath, &metal_host, &converter, &dll_dir, &wine_prefix, &guest_args)?;
+            if code != 0 { std::process::exit(code); }
+            Ok(())
+        }
         #[cfg(windows)]
         Command::Run {
             exe,

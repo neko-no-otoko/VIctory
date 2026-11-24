@@ -660,6 +660,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "memchr",
  "miniz_oxide",
  "tempfile",
