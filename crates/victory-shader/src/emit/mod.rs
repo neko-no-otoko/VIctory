@@ -337,6 +337,15 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        // A DXIL element describes a contiguous span, not an arbitrary mask.
+        // Do not silently turn holes into different components.
+        let shifted = mask >> mask.trailing_zeros().min(7);
+        if mask & !0xf != 0 || (shifted != 0 && shifted & shifted.wrapping_add(1) != 0) {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a non-contiguous signature mask",
+            });
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -396,6 +405,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             }
         };
         let register = u32_at(part, at + 20)?;
+        if register != u32::MAX
+            && mask != 0
+            && out.iter().any(|e: &container::SigElement| {
+                e.row == Some(register) && (((1u8 << e.cols) - 1) << e.col) & mask != 0
+            })
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "overlapping signature elements",
+            });
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -560,6 +580,37 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    #[test]
+    fn signature_preserves_separate_semantics_and_packed_rows() {
+        let element = |name: &str, index, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let elements = vec![
+            element("TEXCOORD", 2, 0, 0, 2),
+            element("COLOR", 1, 0, 2, 2),
+            element("TEXCOORD", 7, 3, 1, 3),
+        ];
+        let data = super::container::signature(&elements, true);
+        assert_eq!(super::signature(&data).unwrap(), elements);
+
+        let mut sparse = data.clone();
+        sparse[8 + 24] = 0b0101;
+        assert!(super::signature(&sparse).is_err());
+
+        let mut overlap = data;
+        overlap[8 + 32 + 24] = 0b0110;
+        assert!(super::signature(&overlap).is_err());
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

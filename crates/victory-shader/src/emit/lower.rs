@@ -5139,6 +5139,9 @@ impl<'a> Lower<'a> {
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
             let e = &mut l.s.inputs[id];
+            if e.comp != 9 && mode != 1 {
+                return Err("a non-flat integer input");
+            }
             if e.interp != mode && e.usage != 0 {
                 return Err("one input interpolated two ways");
             }

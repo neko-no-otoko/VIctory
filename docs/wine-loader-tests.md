@@ -416,6 +416,14 @@ rates must be nonzero. All declared slots must have bounded vertex buffer views.
 Unsupported formats, system-value vertex inputs, invalid layouts, and
 out-of-range fetches are rejected. This is not general D3D12 vertex input
 support.
+Vertex-to-pixel interfaces accept up to 16 unpacked float32 varyings with
+one semantic and index per signature row. Both stages must declare the same
+set of names, indices and component masks; supported masks cover the first one
+to four components. Each declared component must be exported by the vertex
+shader and read by the pixel shader. The pixel shader may use
+perspective-center interpolation or flat first-vertex interpolation. Other
+interpolation modes, packed or 16-bit varyings, mismatched signatures and
+unsupported system inputs are rejected when the batch is submitted.
 Shader constants must be contiguous and use one root slot. Texture copy row pitch is
 256-byte aligned and buffer offset is 512-byte aligned.
 
