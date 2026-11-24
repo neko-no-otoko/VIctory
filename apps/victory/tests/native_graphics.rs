@@ -71,7 +71,7 @@ fn synthetic_console_graphics_through_native_cli() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let trap = include_str!("../../../tests/fixtures/macos_d3d12x_graphics.c").replace(
         "    D3D12_VERTEX_BUFFER_VIEW view=",
-        "    ((void (*)(void))(*(void ***)list)[13])();\n    D3D12_VERTEX_BUFFER_VIEW view=",
+        "    ((void (*)(void))(*(void ***)list)[18])();\n    D3D12_VERTEX_BUFFER_VIEW view=",
     );
     std::fs::write(root.join("trap.c"), trap).unwrap();
     tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "trap.c", "-o", "trap.obj"]);

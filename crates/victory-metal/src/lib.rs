@@ -49,6 +49,19 @@ unsafe extern "C" {
         error: *mut c_char,
         error_len: usize,
     ) -> bool;
+    fn victory_metal_draw_indexed(
+        renderer: *mut c_void,
+        vertices: *const [f32; 4],
+        vertex_count: u32,
+        indices: *const c_void,
+        index_count: u32,
+        index_size: u32,
+        base_vertex: i32,
+        fragment_constants: *const u32,
+        pixels: *mut u8,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> bool;
     fn victory_metal_set_texture(
         renderer: *mut c_void,
         width: u32,
@@ -132,6 +145,12 @@ pub struct Renderer {
 pub enum TextureFilter {
     Nearest,
     Linear,
+}
+
+/// Indices for a triangle-list draw.
+pub enum IndexData<'a> {
+    U16(&'a [u16]),
+    U32(&'a [u32]),
 }
 
 impl Renderer {
@@ -251,6 +270,56 @@ impl Renderer {
         pixels: &mut [u8],
     ) -> Result<(), RenderError> {
         self.draw_inner(vertices, fragment_constants, pixels, true)
+    }
+
+    /// Draw indexed triangles over the existing tightly packed RGBA8 pixels.
+    /// Each index plus `base_vertex` must identify an element of `vertices`.
+    pub fn draw_indexed_preserving(
+        &mut self,
+        vertices: &[[f32; 4]],
+        indices: IndexData<'_>,
+        base_vertex: i32,
+        fragment_constants: &[u32],
+        pixels: &mut [u8],
+    ) -> Result<(), RenderError> {
+        let valid_index = |index: u32| {
+            let vertex = i64::from(index) + i64::from(base_vertex);
+            vertex >= 0 && (vertex as u64) < vertices.len() as u64
+        };
+        let (ptr, len, index_size, valid) = match indices {
+            IndexData::U16(data) => (data.as_ptr().cast::<c_void>(), data.len(), 2u32,
+                                     data.iter().all(|&i| valid_index(u32::from(i)))),
+            IndexData::U32(data) => (data.as_ptr().cast::<c_void>(), data.len(), 4u32,
+                                     data.iter().all(|&i| valid_index(i))),
+        };
+        if vertices.is_empty() || len == 0 || len % 3 != 0 || !valid
+            || pixels.len() != self.pixel_len
+            || fragment_constants.len() != self.fragment_constant_dwords
+        {
+            return Err(RenderError("expected valid nonempty indexed triangles and exact-sized constants and output buffers".into()));
+        }
+        if self.fragment_texture && !self.texture_bound {
+            return Err(RenderError("fragment texture has not been bound".into()));
+        }
+        let vertex_count = u32::try_from(vertices.len())
+            .map_err(|_| RenderError("too many vertices".into()))?;
+        let index_count = u32::try_from(len)
+            .map_err(|_| RenderError("too many indices".into()))?;
+        vertices.len().checked_mul(std::mem::size_of::<[f32; 4]>())
+            .ok_or_else(|| RenderError("vertex buffer size overflow".into()))?;
+        len.checked_mul(index_size as usize)
+            .ok_or_else(|| RenderError("index buffer size overflow".into()))?;
+        let mut error = [0 as c_char; 1024];
+        // SAFETY: all input and output slices remain live for the synchronous
+        // call; counts, byte sizes, and indexed vertex bounds were checked.
+        let ok = unsafe {
+            victory_metal_draw_indexed(
+                self.handle.as_ptr(), vertices.as_ptr(), vertex_count, ptr,
+                index_count, index_size, base_vertex, fragment_constants.as_ptr(),
+                pixels.as_mut_ptr(), error.as_mut_ptr(), error.len(),
+            )
+        };
+        if ok { Ok(()) } else { Err(native_error(&error)) }
     }
 
     fn draw_inner(

@@ -1408,6 +1408,10 @@ mod state {
         // SAFETY: caller supplies one rectangle.
         with_metal(this, |s| s.set_scissor(unsafe { *values }));
     }
+    pub(super) extern "system" fn index_buffer(this: This, view: *const crate::metal::IndexView) {
+        // SAFETY: a non-null pointer names one index-buffer view.
+        with_metal(this, |s| s.set_index(unsafe { view.as_ref().copied() }));
+    }
     pub(super) extern "system" fn vertex_buffers(
         this: This,
         start: u32,
@@ -1443,12 +1447,16 @@ mod state {
         super::count_draw();
         with_metal(this, |s| s.draw(vertices, instances, first, first_instance));
     }
+    pub(super) extern "system" fn draw_indexed(
+        this: This, indices: u32, instances: u32, first: u32, base_vertex: i32, first_instance: u32,
+    ) {
+        super::count_draw();
+        with_metal(this, |s| s.draw_indexed(indices, instances, first, base_vertex, first_instance));
+    }
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_view;
     pub(super) use super::ignored_state as graphics_view;
-    pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as draw_indexed;
     pub(super) use super::ignored_state as dispatch_mesh;
     pub(super) use super::ignored_state as dispatch_mesh_x;
 }
@@ -1799,6 +1807,12 @@ mod native {
     extern "win64" fn draw_native(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
         state::draw(this, vertices, instances, first, first_instance)
     }
+    extern "win64" fn draw_indexed_native(this: This, indices: u32, instances: u32, first: u32, base_vertex: i32, first_instance: u32) {
+        state::draw_indexed(this, indices, instances, first, base_vertex, first_instance)
+    }
+    extern "win64" fn index_native(this: This, view: *const crate::metal::IndexView) {
+        state::index_buffer(this, view)
+    }
     extern "win64" fn topology_native(this: This, topology: u32) {
         state::topology(this, topology)
     }
@@ -1881,6 +1895,7 @@ mod native {
         f[9] = close_native as *const ();
         f[10] = reset_native as *const ();
         f[12] = draw_native as *const ();
+        f[13] = draw_indexed_native as *const ();
         f[14] = dispatch_native as *const ();
         f[15] = copy_buffer_native as *const ();
         f[16] = copy_texture_native as *const ();
@@ -1897,6 +1912,7 @@ mod native {
         f[38] = graphics_constant_native as *const ();
         f[39] = constants_native as *const ();
         f[40] = graphics_constants_native as *const ();
+        f[47] = index_native as *const ();
         f[48] = vertices_native as *const ();
         f[50] = targets_native as *const ();
         f[52] = clear_rtv_native as *const ();

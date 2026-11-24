@@ -36,6 +36,7 @@ impl Prepared {
         width: u32,
         height: u32,
         vertices: &[[f32; 4]],
+        indices: Option<(victory_metal::IndexData<'_>, i32)>,
         constants: &[u32],
         texture: Option<(u32, u32, &[u8], victory_metal::TextureFilter)>,
         pixels: &mut [u8],
@@ -63,9 +64,10 @@ impl Prepared {
                 .set_fragment_texture(width, height, texels, filter)
                 .map_err(|e| e.to_string())?;
         }
-        renderer
-            .draw_preserving(vertices, constants, pixels)
-            .map_err(|e| e.to_string())
+        match indices {
+            Some((indices, base)) => renderer.draw_indexed_preserving(vertices, indices, base, constants, pixels),
+            None => renderer.draw_preserving(vertices, constants, pixels),
+        }.map_err(|e| e.to_string())
     }
 }
 

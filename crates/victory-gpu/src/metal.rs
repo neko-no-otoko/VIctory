@@ -130,6 +130,7 @@ impl Drop for HeapRef {
 
 const COMMON: u32 = 0;
 const VERTEX_BUFFER: u32 = 1;
+const INDEX_BUFFER: u32 = 2;
 const RENDER_TARGET: u32 = 4;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const UAV: u32 = 0x8;
@@ -161,12 +162,18 @@ fn supports_state(texture: bool, state: u32) -> bool {
     } else {
         matches!(
             state,
-            COMMON | VERTEX_BUFFER | UAV | COPY_DEST | COPY_SOURCE
+            COMMON | VERTEX_BUFFER | INDEX_BUFFER | 3 | UAV | COPY_DEST | COPY_SOURCE
         )
     }
 }
 fn can_promote(texture: bool, state: u32) -> bool {
     !texture || matches!(state, COMMON | COPY_SOURCE | PIXEL_SHADER_RESOURCE)
+}
+
+fn state_permits(current: u32, required: u32) -> bool {
+    current == required
+        || (matches!(required, VERTEX_BUFFER | INDEX_BUFFER)
+            && current == (VERTEX_BUFFER | INDEX_BUFFER))
 }
 struct Touched {
     resource: ResourceRef,
@@ -181,7 +188,7 @@ pub(crate) struct Submission {
 impl Submission {
     fn access(&mut self, resource: This, required: u32) -> Result<(), String> {
         let (texture, current) = state_of(resource)?;
-        if current != required && !(current == COMMON && can_promote(texture, required)) {
+        if !state_permits(current, required) && !(current == COMMON && can_promote(texture, required)) {
             return Err(format!(
                 "resource state {current:#x} does not permit {required:#x}"
             ));
@@ -241,6 +248,13 @@ pub(crate) struct VertexView {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(crate) struct IndexView {
+    pub address: u64,
+    pub size: u32,
+    pub format: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -261,6 +275,19 @@ struct VertexBuffer {
     resource: ResourceRef,
     offset: u64,
     size: u32,
+}
+struct IndexBuffer {
+    resource: ResourceRef,
+    offset: u64,
+    size: u32,
+    element_size: u32,
+}
+struct IndexedDraw {
+    resource: ResourceRef,
+    offset: u64,
+    count: u32,
+    element_size: u32,
+    base_vertex: i32,
 }
 
 struct Sampled {
@@ -293,6 +320,7 @@ enum Command {
         vertex_offset: u64,
         vertices: u32,
         target: ResourceRef,
+        indexed: Option<IndexedDraw>,
         sampled: Option<Sampled>,
         constants: Vec<u32>,
     },
@@ -332,6 +360,7 @@ pub(crate) struct State {
     pipeline: Option<Arc<Mutex<Prepared>>>,
     graphics: Option<Arc<Mutex<crate::metal_graphics::Prepared>>>,
     vertex: Option<VertexBuffer>,
+    index: Option<IndexBuffer>,
     target: Option<ResourceRef>,
     viewport: Option<Viewport>,
     scissor: Option<Scissor>,
@@ -372,13 +401,15 @@ impl State {
             .local_states
             .entry(resource as usize)
             .or_insert(required);
-        if *state != required && !(*state == COMMON && can_promote(texture, required)) {
+        if !state_permits(*state, required) && !(*state == COMMON && can_promote(texture, required)) {
             return Err(format!(
                 "recorded buffer state {:#x} does not permit {required:#x}",
                 *state
             ));
         }
-        *state = required;
+        if *state == COMMON {
+            *state = required;
+        }
         Ok(())
     }
     pub(crate) fn transition(&mut self, resource: This, subresource: u32, before: u32, after: u32) {
@@ -504,6 +535,34 @@ impl State {
             size: view.size,
         });
     }
+    pub(crate) fn set_index(&mut self, view: Option<IndexView>) {
+        if !self.open() {
+            return;
+        }
+        let Some(view) = view else {
+            self.index = None;
+            return;
+        };
+        let element_size = match view.format {
+            57 => 2,
+            42 => 4,
+            _ => return self.reject("only R16_UINT and R32_UINT indices are supported"),
+        };
+        if view.size == 0 || view.address % u64::from(element_size) != 0 || view.size % element_size != 0 {
+            return self.reject("index buffer view is empty or misaligned");
+        }
+        let Some((resource, offset)) =
+            crate::resource::metal_buffer_at(view.address, u64::from(view.size))
+        else {
+            return self.reject("index buffer address is not a live committed buffer");
+        };
+        self.index = Some(IndexBuffer {
+            resource: ResourceRef(resource as usize),
+            offset,
+            size: view.size,
+            element_size,
+        });
+    }
     pub(crate) fn set_target(&mut self, handle: u64) {
         if !self.open() {
             return;
@@ -569,7 +628,15 @@ impl State {
         if !self.open() {
             return;
         }
-        if let Err(error) = self.record_draw(count, instances, first, first_instance) {
+        if let Err(error) = self.record_draw(count, instances, first, first_instance, None) {
+            self.reject(&error);
+        }
+    }
+    pub(crate) fn draw_indexed(&mut self, count: u32, instances: u32, first: u32, base_vertex: i32, first_instance: u32) {
+        if !self.open() {
+            return;
+        }
+        if let Err(error) = self.record_draw(count, instances, first, first_instance, Some(base_vertex)) {
             self.reject(&error);
         }
     }
@@ -579,6 +646,7 @@ impl State {
         instances: u32,
         first: u32,
         first_instance: u32,
+        base_vertex: Option<i32>,
     ) -> Result<(), String> {
         if !self.triangle_list
             || count == 0
@@ -590,19 +658,26 @@ impl State {
         }
         let pipeline = self.graphics.clone().ok_or("no graphics pipeline")?;
         let vertex = self.vertex.as_ref().ok_or("no vertex buffer")?;
-        let first = u64::from(first)
-            .checked_mul(16)
-            .ok_or("vertex offset overflow")?;
-        let bytes = u64::from(count)
-            .checked_mul(16)
-            .ok_or("vertex size overflow")?;
-        if first.checked_add(bytes).ok_or("vertex range overflow")? > u64::from(vertex.size) {
-            return Err("draw exceeds vertex buffer view".into());
-        }
-        let vertex_offset = vertex
-            .offset
-            .checked_add(first)
-            .ok_or("vertex offset overflow")?;
+        let (vertex_offset, vertices, indexed) = if let Some(base_vertex) = base_vertex {
+            let index = self.index.as_ref().ok_or("no index buffer")?;
+            let start = u64::from(first) * u64::from(index.element_size);
+            let bytes = u64::from(count) * u64::from(index.element_size);
+            if start.checked_add(bytes).is_none_or(|end| end > u64::from(index.size)) {
+                return Err("draw exceeds index buffer view".into());
+            }
+            let offset = index.offset.checked_add(start).ok_or("index offset overflow")?;
+            (vertex.offset, vertex.size / 16, Some(IndexedDraw {
+                resource: ResourceRef::new(index.resource.ptr()),
+                offset, count, element_size: index.element_size, base_vertex,
+            }))
+        } else {
+            let start = u64::from(first) * 16;
+            let bytes = u64::from(count) * 16;
+            if start.checked_add(bytes).is_none_or(|end| end > u64::from(vertex.size)) {
+                return Err("draw exceeds vertex buffer view".into());
+            }
+            (vertex.offset.checked_add(start).ok_or("vertex offset overflow")?, count, None)
+        };
         let vertex = ResourceRef::new(vertex.resource.ptr());
         let target = ResourceRef::new(self.target.as_ref().ok_or("no render target")?.ptr());
         let (_, width, height, _) =
@@ -693,6 +768,9 @@ impl State {
         };
         drop(prepared);
         self.use_state(vertex.ptr(), VERTEX_BUFFER)?;
+        if let Some(indexed) = &indexed {
+            self.use_state(indexed.resource.ptr(), INDEX_BUFFER)?;
+        }
         self.use_state(target.ptr(), RENDER_TARGET)?;
         if let Some(sampled) = &sampled {
             self.use_state(sampled.texture.ptr(), PIXEL_SHADER_RESOURCE)?;
@@ -701,7 +779,8 @@ impl State {
             pipeline,
             vertex,
             vertex_offset,
-            vertices: count,
+            vertices,
+            indexed,
             constants,
             sampled,
             target,
@@ -974,6 +1053,7 @@ impl State {
                     vertex,
                     vertex_offset,
                     vertices,
+                    indexed,
                     constants,
                     sampled,
                     target,
@@ -1052,10 +1132,32 @@ impl State {
                             *vertices as usize,
                         )
                     };
+                    let indices = if let Some(indexed) = indexed {
+                        submission.access(indexed.resource.ptr(), INDEX_BUFFER)?;
+                        let (data, size) = crate::resource::buffer_bytes(indexed.resource.ptr())
+                            .ok_or("invalid index buffer")?;
+                        let bytes = u64::from(indexed.count) * u64::from(indexed.element_size);
+                        if indexed.offset.checked_add(bytes).is_none_or(|end| end > size) {
+                            return Err("index buffer range changed".into());
+                        }
+                        // SAFETY: the retained buffer range and element alignment were validated.
+                        let data = unsafe { data.add(indexed.offset as usize) };
+                        let values = unsafe {
+                            if indexed.element_size == 2 {
+                                victory_metal::IndexData::U16(std::slice::from_raw_parts(data.cast(), indexed.count as usize))
+                            } else {
+                                victory_metal::IndexData::U32(std::slice::from_raw_parts(data.cast(), indexed.count as usize))
+                            }
+                        };
+                        Some((values, indexed.base_vertex))
+                    } else {
+                        None
+                    };
                     pipeline.lock().unwrap_or_else(|e| e.into_inner()).draw(
                         width,
                         height,
                         verts,
+                        indices,
                         constants,
                         binding,
                         &mut self.scratch,

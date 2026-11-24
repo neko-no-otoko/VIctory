@@ -79,6 +79,7 @@ bool victory_metal_clear(uint32_t width, uint32_t height, size_t pitch, uint8_t 
 @property(nonatomic, strong) id<MTLTexture> texture;
 @property(nonatomic, strong) id<MTLBuffer> readback;
 @property(nonatomic, strong) id<MTLBuffer> vertices;
+@property(nonatomic, strong) id<MTLBuffer> indices;
 @property(nonatomic, strong) id<MTLBuffer> fragmentConstants;
 @property(nonatomic, strong) id<MTLBuffer> fragmentArguments;
 @property(nonatomic, strong) id<MTLTexture> sampledTexture;
@@ -217,17 +218,29 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, co
     }
 }
 
-bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
-                        const uint32_t *constants, uint8_t *pixels, bool preserve,
-                        char *error, size_t error_len) {
+static bool draw(void *handle, const float *vertices, uint32_t count,
+                 const void *indices, uint32_t index_count, uint32_t index_size,
+                 int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
+                 bool preserve, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
+        if ((size_t)count > SIZE_MAX / (4 * sizeof(float)))
+            return fail(error, error_len, @"vertex buffer size overflow");
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         size_t size = (size_t)count * 4 * sizeof(float);
         if (!r.vertices || r.vertices.length < size)
             r.vertices = [r.device newBufferWithLength:size options:MTLResourceStorageModeShared];
         if (!r.vertices) return fail(error, error_len, @"vertex buffer allocation failed");
         memcpy(r.vertices.contents, vertices, size);
+        if (indices) {
+            if ((index_size != 2 && index_size != 4) || index_count > SIZE_MAX / index_size)
+                return fail(error, error_len, @"invalid index buffer size");
+            size_t indexBytes = (size_t)index_count * index_size;
+            if (!r.indices || r.indices.length < indexBytes)
+                r.indices = [r.device newBufferWithLength:indexBytes options:MTLResourceStorageModeShared];
+            if (!r.indices) return fail(error, error_len, @"index buffer allocation failed");
+            memcpy(r.indices.contents, indices, indexBytes);
+        }
         if (r.fragmentConstants)
             memcpy(r.fragmentConstants.contents, constants, r.fragmentConstantBytes);
         id<MTLCommandBuffer> command = [r.queue commandBuffer];
@@ -263,7 +276,18 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
             [render setFragmentBuffer:r.samplerHeap offset:0 atIndex:1];
             [render useResource:r.sampledTexture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
-        [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
+        if (indices) {
+            [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                               indexCount:index_count
+                                indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                              indexBuffer:r.indices
+                        indexBufferOffset:0
+                            instanceCount:1
+                               baseVertex:(NSInteger)base_vertex
+                             baseInstance:0];
+        } else {
+            [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
+        }
         [render endEncoding];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
         if (!blit) return fail(error, error_len, @"blit command creation failed");
@@ -280,6 +304,21 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
             memcpy(pixels + (size_t)y * row, (const uint8_t *)r.readback.contents + (size_t)y * r.stride, row);
         return true;
     }
+}
+
+bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
+                        const uint32_t *constants, uint8_t *pixels, bool preserve,
+                        char *error, size_t error_len) {
+    return draw(handle, vertices, count, NULL, 0, 0, 0, constants, pixels,
+                preserve, error, error_len);
+}
+
+bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t vertex_count,
+                                const void *indices, uint32_t index_count, uint32_t index_size,
+                                int32_t base_vertex, const uint32_t *constants, uint8_t *pixels,
+                                char *error, size_t error_len) {
+    return draw(handle, vertices, vertex_count, indices, index_count, index_size, base_vertex,
+                constants, pixels, true, error, error_len);
 }
 
 void victory_metal_destroy(void *handle) {
