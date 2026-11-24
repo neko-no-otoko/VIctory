@@ -187,7 +187,7 @@ fn wine_acphal_rejects_collisions_and_unverified_ordinals() {
     assert!(!f.host_pid.exists(), "host started with AcpHal override conflict");
     let incomplete = f.temp.path().join("incomplete-providers");
     fs::create_dir(&incomplete).unwrap();
-    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "victory_xmem_backend.dll"] {
+    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "victory_xmem_backend.dll", "xapu.dll"] {
         fs::copy(f.dll_dir.join(name), incomplete.join(name)).unwrap();
     }
     f.dll_dir = incomplete;

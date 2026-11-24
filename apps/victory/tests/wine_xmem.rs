@@ -196,7 +196,7 @@ fn xmem_and_backend_collisions_fail_before_metal_host() {
     assert!(!fixture.host_pid.exists(), "host started with XMem ordinal import");
     let incomplete = fixture.temp.path().join("incomplete-providers");
     fs::create_dir(&incomplete).unwrap();
-    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll"] {
+    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "acphal.dll", "xapu.dll"] {
         fs::copy(fixture.dll_dir.join(name), incomplete.join(name)).unwrap();
     }
     fixture.dll_dir = incomplete;

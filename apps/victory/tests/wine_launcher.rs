@@ -273,7 +273,7 @@ fn launcher_provisions_gameinput_in_fresh_prefix_without_relocating_guest() {
     let mut f = Fixture::new();
     let providers = f.temp.path().join("providers");
     fs::create_dir(&providers).unwrap();
-    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "victory_xmem_backend.dll", "acphal.dll"] {
+    for name in ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "victory_xmem_backend.dll", "acphal.dll", "xapu.dll"] {
         fs::copy(f.dll_dir.join(name), providers.join(name)).unwrap();
     }
     fs::copy(required_path("VICTORY_TEST_GAMEINPUT_DLL"), providers.join("gameinput.dll")).unwrap();

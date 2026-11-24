@@ -736,12 +736,13 @@ launches a trusted PE as a normal Wine process and starts a separate native
 Metal host. Supply the Wine executable, `winepath`, Metal host, Apple
 converter, Wine prefix and HLE DLL directory explicitly. The directory must
 contain `d3d12_xs.dll`, `xg_xs.dll`, `xgameruntime.dll`, `xmem.dll`,
-`acphal.dll` and the private `victory_xmem_backend.dll`. For example:
+`acphal.dll`, `xapu.dll` and the private `victory_xmem_backend.dll`. For example:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/victory-launcher-target
 cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
-  -p victory-xmem-dll -p victory-xmem-backend -p victory-acphal-dll --target x86_64-pc-windows-gnullvm
+  -p victory-xmem-dll -p victory-xmem-backend -p victory-acphal-dll -p victory-xapu-dll \
+  --target x86_64-pc-windows-gnullvm
 cargo build --locked -p victory-gpu --example wine_metal_compute_host --target x86_64-apple-darwin
 cargo build --locked -p victory --target x86_64-apple-darwin
 export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
@@ -760,7 +761,7 @@ child environments, not printed. Other same-user processes may be able to
 read those environments; the token is not a sandbox or a boundary against
 such processes. The launcher preserves unrelated environment settings,
 prepends the selected DLL directory to `WINEPATH`, and requires native loading
-for those five providers; conflicting existing provider overrides are
+for those six providers; conflicting existing provider overrides are
 rejected. `VICTORY_WINE_METAL_PRESENT=1` remains an inherited opt-in for the
 existing presentation path.
 
@@ -774,7 +775,7 @@ Windows, System, System32 and SysWOW64 directories. Unreadable directories,
 ambiguous Windows directory components and dangling provider links fail the
 check. These are snapshots, not pinned opens.
 
-Direct executable imports from the five providers are checked against their
+Direct executable imports from the six providers are checked against their
 named exports; provider ordinal imports are rejected. Transitive and dynamic
 imports, activation contexts, Known DLLs, loaded modules, path-specific
 registry overrides, guest-controlled search paths and changes after preflight
@@ -814,7 +815,7 @@ export VICTORY_TEST_GAMEINPUT_DLL=/path/to/gameinput.dll
 cargo test --locked -p victory --target x86_64-apple-darwin --test wine_launcher -- --ignored --nocapture
 ```
 
-On Wine 11 under Rosetta on an M3 Max, all seven tests passed: a real
+On Wine 11 under Rosetta on an M3 Max, all eight tests passed: a real
 TLS-bearing Wine PE called the provider DLLs and verified Metal readback 42;
 unacknowledged search and known shadow DLLs were rejected; host exit and
 signal paths cleaned up the host; and two simultaneous launches used distinct
@@ -883,3 +884,35 @@ queues and a synthetic XMA stream; a separate guest verified module pinning
 after `FreeLibrary`; and unsupported imports, ordinal imports and a
 same-named DLL collision failed before host startup. The upstream HLE audio
 regression also passed five Windows tests under Wine.
+
+## Normal Wine XApu HLE DLL
+
+`xapu.dll` forwards the five named exports in the upstream XApu registry to
+the existing HLE. Each connection retains its own decoder, command/result
+queue, memory and optional event. The DLL pins itself on first use so a
+connection cannot outlive its code; pinning failure terminates the process.
+Other names are absent and linker-assigned ordinals are not console mappings.
+These XApu connections are independent of the AcpHal XMA heap and worker.
+
+Only the upstream plain Opus decoding path is implemented; rate conversion
+and decode-convert return `E_NOTIMPL`. Results are produced synchronously as
+commands are submitted. This does not establish a complete audio pipeline or
+title compatibility.
+
+`xcrdapi.dll` (DirectStorage) remains a separate gap: its upstream HLE calls
+the mapped-title file layer and XMem physical-page state. Linking an
+independent copy into another Wine DLL would split that state; it is not
+provided by the launcher.
+
+With the launcher test environment above:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_xapu -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, three synthetic tests passed. A normal PE with
+compiler-generated TLS exercised concurrent independent connections, events,
+command and result queues, and decoded a 20 ms Opus silence packet into 960
+float PCM frames. Another guest verified module pinning after `FreeLibrary`;
+unsupported names and ordinals, provider collisions and override conflicts
+were rejected. The upstream Windows XApu decoding regression also passed.
