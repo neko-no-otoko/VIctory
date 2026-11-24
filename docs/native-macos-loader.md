@@ -56,10 +56,11 @@ The synthetic executable integration test imports and calls both providers,
 checks that an unimplemented import fails to load, and runs without game data:
 `cargo test -p victory-native --target x86_64-apple-darwin --test native_executable`.
 
-The D3D12.X bridge uses typed Windows-x64 entry points for a limited compute
-device, descriptor heap, resource, pipeline, allocator, list, queue and fence
-path backed by the existing Metal implementation. Unsupported vtable slots
-abort the process rather than silently succeed or call host-ABI pointers.
+The D3D12.X bridge uses typed Windows-x64 entry points for limited compute and
+offscreen graphics device, descriptor heap, resource, pipeline, allocator,
+list, queue and fence paths backed by the existing Metal implementation.
+Unsupported vtable slots abort the process rather than silently succeed or call
+host-ABI pointers.
 Guest DLL allocation hooks and the Windows runtime page mapper are not
 installed by this native bridge; it uses the GPU implementation's own
 allocation path. This is not complete D3D12.X, Windows startup, or game support.
@@ -74,6 +75,20 @@ cargo test -p victory --target x86_64-apple-darwin --test native_compute -- --ig
 The synthetic test invokes the PE through the CLI, dispatches its own console
 shader through VIctory's translation and Metal backend, verifies readback 42,
 and checks an unsupported device slot terminates the child process.
+
+The native graphics fixture exercises a restricted vertex/pixel pipeline,
+render-target clear, two triangle draws with different root constants, and a
+texture-to-buffer copy with padded rows through the same CLI. It checks the
+readback pixels and that an unsupported indexed-draw slot aborts safely.
+With the same prerequisites, run:
+
+```sh
+cargo test -p victory --target x86_64-apple-darwin --test native_graphics -- --ignored
+```
+
+On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the
+Apple Metal Shader Converter and LLVM-MinGW. These synthetic shaders are not
+game shaders, and this result does not establish game compatibility.
 
 `Executable::load` also maps a PE executable with explicitly supplied DLLs,
 without executing code. Unsafe `Executable::start` attaches the DLLs, calls

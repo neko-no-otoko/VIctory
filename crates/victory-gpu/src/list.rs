@@ -1796,6 +1796,36 @@ mod native {
     extern "win64" fn reset_native(this: This, allocator: This, pipeline: This) -> HRESULT {
         reset(this, allocator, pipeline)
     }
+    extern "win64" fn draw_native(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+        state::draw(this, vertices, instances, first, first_instance)
+    }
+    extern "win64" fn topology_native(this: This, topology: u32) {
+        state::topology(this, topology)
+    }
+    extern "win64" fn viewports_native(this: This, count: u32, values: *const crate::metal::Viewport) {
+        state::viewports(this, count, values)
+    }
+    extern "win64" fn scissors_native(this: This, count: u32, values: *const crate::metal::Scissor) {
+        state::scissors(this, count, values)
+    }
+    extern "win64" fn vertices_native(this: This, start: u32, count: u32, views: *const crate::metal::VertexView) {
+        state::vertex_buffers(this, start, count, views)
+    }
+    extern "win64" fn targets_native(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
+        state::targets(this, count, handles, one_range, depth)
+    }
+    extern "win64" fn clear_rtv_native(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
+        clear_rtv(this, handle, color, count, rects)
+    }
+    extern "win64" fn graphics_table_native(this: This, slot: u32, handle: u64) {
+        state::graphics_table(this, slot, handle)
+    }
+    extern "win64" fn graphics_constant_native(this: This, slot: u32, value: u32, offset: u32) {
+        state::graphics_constant(this, slot, value, offset)
+    }
+    extern "win64" fn graphics_constants_native(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
+        state::graphics_constants(this, slot, count, values, offset)
+    }
     extern "win64" fn dispatch_native(this: This, x: u32, y: u32, z: u32) {
         state::dispatch(this, x, y, z)
     }
@@ -1850,16 +1880,26 @@ mod native {
         f[2] = list_release_native as *const ();
         f[9] = close_native as *const ();
         f[10] = reset_native as *const ();
+        f[12] = draw_native as *const ();
         f[14] = dispatch_native as *const ();
         f[15] = copy_buffer_native as *const ();
         f[16] = copy_texture_native as *const ();
         f[17] = copy_resource_native as *const ();
+        f[20] = topology_native as *const ();
+        f[21] = viewports_native as *const ();
+        f[22] = scissors_native as *const ();
         f[25] = pipeline_native as *const ();
         f[26] = barrier_native as *const ();
         f[32] = heaps_native as *const ();
         f[35] = table_native as *const ();
+        f[36] = graphics_table_native as *const ();
         f[37] = constant_native as *const ();
+        f[38] = graphics_constant_native as *const ();
         f[39] = constants_native as *const ();
+        f[40] = graphics_constants_native as *const ();
+        f[48] = vertices_native as *const ();
+        f[50] = targets_native as *const ();
+        f[52] = clear_rtv_native as *const ();
         f[if newer { newer_slot(78) } else { 78 }] = dispatch_x_native as *const ();
         f[if newer { newer_slot(83) } else { 83 }] = copy_texture_x_native as *const ();
         f[if newer { newer_slot(84) } else { 84 }] = copy_resource_x_native as *const ();
