@@ -146,6 +146,11 @@ fn offline_saves_persist_and_roots_are_isolated() {
     fs::create_dir(&a).unwrap(); fs::create_dir(&b).unwrap();
     fs::write(a.join("prior-content"), b"preserved").unwrap();
     f.invoke(&exe, &host, "no-root", None, "unconfigured save root denied");
+    let manifest = exe.parent().unwrap().join("MicrosoftGame.config");
+    let manifest_bytes = fs::read(&manifest).unwrap();
+    fs::remove_file(&manifest).unwrap();
+    f.invoke(&exe, &host, "no-manifest", None, "unconfigured save root denied");
+    fs::write(&manifest, manifest_bytes).unwrap();
     f.invoke(&exe, &host, "write", Some(&a), "save written");
     assert!(a.join("saves").is_dir());
     f.invoke(&exe, &host, "read", Some(&a), "save verified");

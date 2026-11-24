@@ -914,6 +914,13 @@ Use only trusted guests and stable prefixes and files. No title files are
 modified by this option; Wine itself can modify its prefix and the guest can
 modify files it can access.
 
+The Windows custom loader also mounts `T:` over a per-title temporary
+directory and translates `T:` and `T:name` relative to that root. The Wine
+launcher does not implement this interception or configure `T:`; an existing
+Wine mapping can serve ordinary Wine file calls, but its drive-relative
+current-directory behavior is not the custom loader's root-relative rule.
+An unsandboxed guest can access other Wine drives and host paths.
+
 With the launcher test environment above, run:
 
 ```sh
@@ -974,10 +981,11 @@ It takes a nonblocking advisory lock on the directory for the launcher's
 lifetime, rejecting a second cooperating launcher using the same directory.
 
 The runtime DLL reads `MicrosoftGame.config` beside the actual executable
-using the upstream manifest parser, and stores its save data under
-`<save-root>/saves` using the upstream per-user and service-configuration
-layout. A missing manifest retains upstream's default title ID and quota;
-choose different save roots for different titles even if their IDs match.
+using the upstream manifest parser, even without a save root, so title and
+package identity do not depend on enabling storage. A missing manifest
+retains upstream's default title ID and quota. Configured saves live under
+`<save-root>/saves` in the upstream per-user and service-configuration
+layout; choose different save roots for different titles even if IDs match.
 With no option the launcher removes any inherited
 `VICTORY_WINE_TITLE_DATA`, so XGameSave remains unconfigured and reports
 `NO_ACCESS` rather than writing in the working directory.
@@ -1044,9 +1052,10 @@ cargo test --locked -p victory --target x86_64-apple-darwin --test wine_saves --
 On Wine 11 under Rosetta, two synthetic tests passed. A compiler-TLS PE wrote
 and reopened a binary save in separate launches, checked a second root was
 isolated, and exercised an explicitly loaded runtime object after
-`FreeLibrary`. The tests also checked unsupported slots and storage paths,
-unconfigured saves, invalid or locked roots, and overlapping title/save
-roots. A focused TLS/Metal launcher regression passed separately.
+`FreeLibrary`. It also verified title and package identity with and without
+a save root, the missing-manifest default, unsupported slots and storage
+paths, unconfigured saves, invalid or locked roots, and overlapping
+title/save roots. A focused TLS/Metal launcher regression passed separately.
 
 ## Normal Wine XMem HLE DLL
 

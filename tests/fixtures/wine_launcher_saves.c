@@ -17,6 +17,8 @@ static const GUID title_id = {0x973a344e,0x24bf,0x4d0f,{0x84,0x57,0x56,0xc5,0x34
 static const GUID title_iid = {0x2549f142,0x6419,0x4a06,{0x97,0xb5,0x93,0x1a,0xab,0x7c,0x2f,0x34}};
 static const GUID storage_id = {0xf4faf4d4,0x2d04,0x4fce,{0xb3,0xe0,0x47,0x4a,0x71,0x3a,0x3e,0x84}};
 static const GUID storage_iid = {0xd29411df,0x0794,0x4553,{0x8b,0x27,0x95,0xfc,0x02,0xd0,0xf7,0x5d}};
+static const GUID package_id = {0xaf406016,0xe850,0x4aa8,{0xa8,0x8d,0x2f,0x3d,0xcb,0x9d,0xac,0x7e}};
+static const GUID package_iid = {0x0b9d556e,0xab70,0x43f4,{0xba,0xa0,0x99,0x99,0xac,0x4c,0xb0,0x40}};
 typedef struct { void *queue, *context, *callback; uintptr_t internal[4]; } Async;
 typedef struct { const char *name; uint32_t size; const void *data; } Blob;
 typedef HRESULT (WINAPI *Init)(void *, const void *, const char *, unsigned char, Async *);
@@ -30,6 +32,7 @@ typedef HRESULT (WINAPI *Read)(void *, void *, const char *const *, uint32_t *, 
 typedef void (WINAPI *Close)(void *, void *);
 typedef HRESULT (WINAPI *Unsupported)(void *);
 typedef HRESULT (WINAPI *TitleId)(void *, uint32_t *);
+typedef HRESULT (WINAPI *PackageId)(void *, size_t, char *);
 typedef HRESULT (WINAPI *PathSize)(void *, size_t *);
 typedef HRESULT (WINAPI *Space)(void *, void *);
 typedef HRESULT (WINAPI *Prompt)(void *, uint64_t, Async *);
@@ -74,7 +77,7 @@ static void say(const char *message) {
     DWORD written; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, (DWORD)strlen(message), &written, NULL);
 }
 int main(void) {
-    char mode[32]; void *save = NULL, *queue = NULL, *title = NULL, *storage = NULL, *provider = NULL, *container = NULL, *update = NULL;
+    char mode[32]; void *save = NULL, *queue = NULL, *title = NULL, *package = NULL, *storage = NULL, *provider = NULL, *container = NULL, *update = NULL;
     uint32_t id = 0, count = 1; unsigned char buffer[512]; const char *names[] = {"blob"};
     Async block = {0}; HRESULT hr;
 #ifdef DYNAMIC_RUNTIME
@@ -84,25 +87,32 @@ int main(void) {
     if (!QueryApiImpl) return 26;
 #endif
     if (!GetEnvironmentVariableA("VICTORY_SAVE_TEST_MODE", mode, sizeof(mode)) || check_tls()) return 10;
+    int no_root = !strcmp(mode, "no-root") || !strcmp(mode, "no-manifest");
+    uint32_t expected_id = !strcmp(mode, "no-manifest") ? 0 : 0x639aa8dd;
     {
         char configured[32768];
         DWORD n = GetEnvironmentVariableA("VICTORY_WINE_TITLE_DATA", configured, sizeof(configured));
-        if ((!strcmp(mode, "no-root") && n != 0) ||
-            (strcmp(mode, "no-root") && (!n || n >= sizeof(configured) ||
+        if ((no_root && n != 0) ||
+            (!no_root && (!n || n >= sizeof(configured) ||
              !strcmp(configured, "Z:\\inherited-should-not-be-used")))) return 23;
     }
     if (QueryApiImpl(&title_id, &title_iid, &title) || !title ||
-        SLOT(title, TitleId, 3)(title, &id) || id != (!strcmp(mode, "no-root") ? 0 : 0x639aa8dd)) return 11;
+        SLOT(title, TitleId, 3)(title, &id) || id != expected_id) return 11;
 #ifdef DYNAMIC_RUNTIME
     if (!FreeLibrary(runtime_module) || !GetModuleHandleW(L"xgameruntime.dll")) return 27;
 #endif
-    if (SLOT(title, TitleId, 3)(title, &id) || id != (!strcmp(mode, "no-root") ? 0 : 0x639aa8dd)) return 28;
+    if (SLOT(title, TitleId, 3)(title, &id) || id != expected_id) return 28;
     SLOT(title, Release, 2)(title);
+    char package_name[33];
+    if (QueryApiImpl(&package_id, &package_iid, &package) || !package ||
+        SLOT(package, PackageId, 3)(package, sizeof(package_name), package_name) ||
+        strcmp(package_name, expected_id ? "639AA8DD" : "00000000")) return 31;
+    SLOT(package, Release, 2)(package);
     size_t path_size = 0;
     if (QueryApiImpl(&storage_id, &storage_iid, &storage) || !storage ||
         (uint32_t)SLOT(storage, PathSize, 3)(storage, &path_size) != 0x80070032u) return 24;
     if (QueryApiImpl(&save_id, &save_id, &save) || !save || QueryApiImpl(&async_id, &async_id, &queue) || !queue) return 12;
-    if (strcmp(mode, "no-root")) {
+    if (!no_root) {
         uint64_t space[4] = {1, 2, 3, 4};
         if ((uint32_t)SLOT(storage, Space, 5)(storage, space) != 0x80070032u ||
             space[0] != 1 || space[1] != 2 || space[2] != 3 || space[3] != 4) return 29;
@@ -114,7 +124,7 @@ int main(void) {
     if ((uint32_t)SLOT(save, Unsupported, 3)(save) != 0x80004001u) return 13;
     if (SLOT(save, Init, 4)(save, NULL, "fixture-scid", 0, &block)) return 14;
     hr = SLOT(queue, Status, 3)(queue, &block, 1);
-    if (!strcmp(mode, "no-root")) {
+    if (no_root) {
         if ((uint32_t)hr != NO_ACCESS) return 15;
         say("unconfigured save root denied\r\n");
     } else {

@@ -34,15 +34,15 @@ mod windows {
         *PIN
     }
 
-    fn configured_title(root: &Path, executable: &Path) -> Result<Title, HRESULT> {
-        if !root.is_absolute() || !root.is_dir() {
+    fn configured_title(root: Option<&Path>, executable: &Path) -> Result<Title, HRESULT> {
+        if root.is_some_and(|root| !root.is_absolute() || !root.is_dir()) {
             return Err(E_INVALIDARG);
         }
         let dir = executable.parent().ok_or(E_INVALIDARG)?;
         let manifest = std::fs::read_to_string(dir.join("MicrosoftGame.config"))
             .unwrap_or_default();
         let mut title = Title::from_manifest(&manifest);
-        title.storage = root.join("storage");
+        if let Some(root) = root { title.storage = root.join("storage"); }
         Ok(title)
     }
 
@@ -63,27 +63,20 @@ mod windows {
     }
 
     static INITIALIZED: LazyLock<Result<(), HRESULT>> = LazyLock::new(|| {
-        let executable = std::env::current_exe().ok();
-        let title = match std::env::var_os("VICTORY_WINE_TITLE_DATA") {
-            Some(root) => Some(configured_title(
-                Path::new(&root),
-                executable.as_deref().ok_or(E_INVALIDARG)?,
-            )?),
-            None => None,
-        };
+        let executable = std::env::current_exe().map_err(|_| E_INVALIDARG)?;
+        let root = std::env::var_os("VICTORY_WINE_TITLE_DATA");
+        let title = configured_title(root.as_deref().map(Path::new), &executable)?;
         let drive = std::env::var_os("VICTORY_WINE_PLS_DRIVE")
-            .map(|value| configured_drive(&value, title.as_ref()))
+            .map(|value| configured_drive(&value, Some(&title)))
             .transpose()?;
 
         // A null name asks Windows for the process image, not this DLL.
         let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
         if base != 0 {
             title_runtime::set_main_image(base);
-            if let Some(path) = executable.as_deref() {
-                title_runtime::set_image_path(base, path);
-            }
+            title_runtime::set_image_path(base, &executable);
         }
-        title_runtime::set_wine_title(title, drive);
+        title_runtime::set_wine_title(Some(title), drive);
         Ok(())
     });
 
@@ -176,16 +169,22 @@ mod windows {
             ));
             std::fs::create_dir(&dir).unwrap();
             let exe = dir.join("game.exe");
-            let default = configured_title(&dir, &exe).unwrap();
+            let default = configured_title(Some(&dir), &exe).unwrap();
             assert_eq!(default.id, 0);
             assert_eq!(default.storage, dir.join("storage"));
             assert_eq!(default.saves(), dir.join("saves"));
             assert!(!default.storage.exists());
+            let no_manifest = configured_title(None, &exe).unwrap();
+            assert_eq!(no_manifest.id, 0);
+            assert!(no_manifest.storage.as_os_str().is_empty());
             std::fs::write(dir.join("MicrosoftGame.config"), "<Game><TitleId>639AA8DD</TitleId></Game>").unwrap();
-            assert_eq!(configured_title(&dir, &exe).unwrap().id, 0x639A_A8DD);
-            assert_eq!(configured_title(Path::new("relative"), &exe), Err(E_INVALIDARG));
-            assert_eq!(configured_title(&dir.join("missing"), &exe), Err(E_INVALIDARG));
-            assert_eq!(configured_title(&dir.join("MicrosoftGame.config"), &exe), Err(E_INVALIDARG));
+            assert_eq!(configured_title(Some(&dir), &exe).unwrap().id, 0x639A_A8DD);
+            let no_root = configured_title(None, &exe).unwrap();
+            assert_eq!(no_root.id, 0x639A_A8DD);
+            assert!(no_root.storage.as_os_str().is_empty());
+            assert_eq!(configured_title(Some(Path::new("relative")), &exe), Err(E_INVALIDARG));
+            assert_eq!(configured_title(Some(&dir.join("missing")), &exe), Err(E_INVALIDARG));
+            assert_eq!(configured_title(Some(&dir.join("MicrosoftGame.config")), &exe), Err(E_INVALIDARG));
             std::fs::remove_dir_all(dir).unwrap();
         }
 
