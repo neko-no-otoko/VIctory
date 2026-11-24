@@ -4,6 +4,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
@@ -62,32 +65,104 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
     put(out, runtime::title().id)
 }
 
-/// As documented: the title ends (suspended first, as on any end) and the
-/// game starts again in a new process; this never returns. Grand Theft
-/// Auto VI relaunches itself (its own path from `GetModuleFileNameA`) with
-/// arguments from its configuration. The new `victory run` gets the same
-/// options, the new executable, and the title's arguments after `--`
-/// (the title reads the whole command line).
+/// Ends the title and launches another game. Native launches restart the
+/// custom loader; Wine launches ask the supervising launcher instead.
 extern "system" fn launch_new_game(
     _: This,
     exe: *const c_char,
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
-    tracing::info!(exe, args, "XLaunchNewGame");
-    let current = runtime::main_image()
-        .and_then(runtime::image_path)
-        .unwrap_or_default();
-    let ours: Vec<_> = std::env::args_os().skip(1).collect();
-    let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
+    if runtime::title_storage().1 != runtime::StorageMode::Virtual {
+        // Copy the title's input before suspension can invalidate it.
+        let request = wine_launch_text(exe).and_then(|exe| {
+            wine_launch_text(args).map(|args| (exe, args))
+        });
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || {
+                let result = request.and_then(|(exe, args)| wine_relaunch(&exe, &args));
+                if let Err(error) = result {
+                    eprintln!("XLaunchNewGame: Wine relaunch failed: {error}");
+                    std::process::exit(1);
+                }
+            }),
+        );
+    } else {
+        let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+        tracing::info!(exe, args, "XLaunchNewGame");
+        let current = runtime::main_image()
+            .and_then(runtime::image_path)
+            .unwrap_or_default();
+        let ours: Vec<_> = std::env::args_os().skip(1).collect();
+        let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+    }
     loop {
         std::thread::park();
     }
+}
+
+const WINE_LAUNCH_LIMIT: usize = 32_767;
+const WINE_LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn wine_launch_text(ptr: *const c_char) -> Result<String, String> {
+    if ptr.is_null() {
+        return Ok(String::new());
+    }
+    // SAFETY: the title supplies a readable NUL-terminated string. Bound the
+    // scan so an overlong input is rejected without copying it.
+    let len = (0..=WINE_LAUNCH_LIMIT)
+        .find(|&i| unsafe { *ptr.add(i) == 0 })
+        .ok_or("launch input exceeds 32767 bytes")?;
+    // SAFETY: the scan above established the readable byte range.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| "launch input is not UTF-8".into())
+}
+
+fn wine_relaunch(exe: &str, args: &str) -> Result<(), String> {
+    if [exe, args].iter().any(|s| s.len() > WINE_LAUNCH_LIMIT || s.as_bytes().contains(&0)) {
+        return Err("invalid launch input".into());
+    }
+    let token = std::env::var("VICTORY_WINE_METAL_TOKEN")
+        .map_err(|_| "missing or invalid Wine launcher token")?;
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid Wine launcher token".into());
+    }
+    let address = std::env::var("VICTORY_WINE_RELAUNCH_ADDR")
+        .map_err(|_| "missing or invalid Wine launcher address")?;
+    if address.len() > 64 {
+        return Err("invalid Wine launcher address".into());
+    }
+    let address: SocketAddr = address.parse().map_err(|_| "invalid Wine launcher address")?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("Wine launcher address is not a loopback endpoint".into());
+    }
+    let mut stream = TcpStream::connect_timeout(&address, WINE_LAUNCH_TIMEOUT)
+        .map_err(|e| format!("connecting to Wine launcher: {e}"))?;
+    stream.set_read_timeout(Some(WINE_LAUNCH_TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(WINE_LAUNCH_TIMEOUT)))
+        .map_err(|e| format!("setting Wine launcher timeouts: {e}"))?;
+    let mut send = || -> std::io::Result<()> {
+        stream.write_all(b"VILNCH01")?;
+        stream.write_all(token.as_bytes())?;
+        stream.write_all(&(exe.len() as u32).to_le_bytes())?;
+        stream.write_all(&(args.len() as u32).to_le_bytes())?;
+        stream.write_all(exe.as_bytes())?;
+        stream.write_all(args.as_bytes())?;
+        let mut ack = [0];
+        stream.read_exact(&mut ack)?;
+        if ack != [1] {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid acknowledgement"));
+        }
+        Ok(())
+    };
+    send().map_err(|e| format!("communicating with Wine launcher: {e}"))
 }
 
 /// Our own arguments for the relaunch: the title's executable replaced by
