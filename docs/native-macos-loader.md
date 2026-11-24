@@ -140,9 +140,17 @@ complete tiled allocation, including its shared mip tail; other tiled
 subresource maps are rejected. Each selected mip is detiled from the retained
 allocation before Metal upload, using the console texture layout. Pipe/bank XOR
 layouts, including `SW_64KB_R_X`, are not addressable and are rejected.
-Formats must match their pipeline, copy footprint and explicit view; default
-views are also supported. Explicit 2D SRVs require identity component mapping,
-zero plane and resource LOD clamp, and a nonempty in-bounds contiguous mip range
+Sampled textures additionally support BC1_UNORM and BC3_UNORM as compressed
+4×4 blocks in the same linear or supported tiled layouts. Linear mapped rows
+are 256-byte aligned in blocks, and partial mip edges occupy whole blocks.
+Metal's `supportsBCTextureCompression` is queried before upload; devices
+without native BC support reject the draw rather than decoding or substituting
+data. The tested Apple M3 Max reports native BC support under Rosetta.
+BC typeless, sRGB and other compressed formats are rejected.
+Render-target formats must match their pipeline and copy footprint; explicit
+views must match their resource, and default views are also supported. 2D SRVs
+require identity component mapping, zero plane and resource LOD clamp, and a
+nonempty in-bounds contiguous mip range
 (or all remaining levels). Point and linear clamp samplers use their corresponding
 nearest or linear mip filter, zero bias and finite nonnegative ordered LOD clamps,
 relative to the SRV's first mip. Other texture layouts and sampler modes are rejected.
@@ -159,6 +167,8 @@ sampling, retained resources, and invalid layouts and subresources.
 The 64-KiB fixture uses independently constructed tiled bytes to verify
 sampled colors and mip-tail offsets for both formats, as well as rejection of
 unsupported swizzles.
+The BC fixture checks known block colors and alpha, mip edges, and invalid
+formats and views through translated guest shaders and Metal readback.
 With the same prerequisites, run:
 
 ```sh
@@ -173,6 +183,7 @@ cargo test -p victory --target x86_64-apple-darwin --test native_bgra -- --ignor
 cargo test -p victory --target x86_64-apple-darwin --test native_mips -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_tiled -- --ignored
 cargo test -p victory --target x86_64-apple-darwin --test native_tiled64 -- --ignored
+cargo test -p victory --target x86_64-apple-darwin --test native_bc -- --ignored
 ```
 
 On Apple M3 Max, macOS 27.3 and Rosetta, this focused test passed with the

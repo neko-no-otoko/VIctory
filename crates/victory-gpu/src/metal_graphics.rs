@@ -38,7 +38,7 @@ pub(crate) struct Texture<'a> {
     pub levels: u32,
     pub pixels: &'a [u8],
     pub filter: victory_metal::TextureFilter,
-    pub format: victory_metal::ColorFormat,
+    pub format: victory_metal::TextureFormat,
     pub min_lod: f32,
     pub max_lod: f32,
 }

@@ -146,6 +146,16 @@ fn color_format(resource: This) -> Option<victory_metal::ColorFormat> {
     }
 }
 
+fn sampled_format(resource: This) -> Option<victory_metal::TextureFormat> {
+    match crate::resource::metal_sampled_format(resource)? {
+        28 => Some(victory_metal::TextureFormat::Rgba8),
+        87 => Some(victory_metal::TextureFormat::Bgra8),
+        71 => Some(victory_metal::TextureFormat::Bc1),
+        77 => Some(victory_metal::TextureFormat::Bc3),
+        _ => None,
+    }
+}
+
 fn state_of(resource: This) -> Result<(bool, u32), String> {
     if let Some(state) =
         crate::resource::metal_buffer_state(resource, |s| s.load(Ordering::Relaxed))
@@ -834,9 +844,9 @@ impl State {
                     return Err("expected a texture SRV".into());
                 };
                 let texture = *texture as This;
-                let format = crate::resource::metal_color_format(texture).ok_or("unsupported sampled texture format")?;
+                let format = crate::resource::metal_sampled_format(texture).ok_or("unsupported sampled texture format")?;
                 let total_mips = crate::resource::metal_sampled_mip_count(texture)
-                    .ok_or("expected a supported linear RGBA8 or BGRA8 sampled texture")?;
+                    .ok_or("unsupported sampled texture layout")?;
                 let (first_mip, mip_count) = if let Some(desc) = desc {
                     if desc[0] != format || desc[1] != 4 || desc[2] != 0x1688
                         || desc[6] != 0 || desc[7] != 0
@@ -1224,7 +1234,7 @@ impl State {
                             levels: sampled.mip_count,
                             pixels: self.texture_scratch.as_slice(),
                             filter: sampled.filter,
-                            format: color_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,
+                            format: sampled_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,
                             min_lod: sampled.min_lod,
                             max_lod: sampled.max_lod,
                         })

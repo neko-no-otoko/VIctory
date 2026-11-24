@@ -999,8 +999,8 @@ pub(crate) fn metal_sampled_copy_mips(
     let mut total = 0usize;
     for mip in first..end_mip {
         let (width, height) = sampled_dimensions(&r.desc, mip)?;
-        total = total.checked_add(usize::try_from(width).ok()?.checked_mul(4)?
-            .checked_mul(usize::try_from(height).ok()?)?)?;
+        let (row, rows) = sampled_rows(r.desc.format, width, height)?;
+        total = total.checked_add(row.checked_mul(rows)?)?;
     }
     dst.clear();
     dst.resize(total, 0);
@@ -1008,8 +1008,8 @@ pub(crate) fn metal_sampled_copy_mips(
     let mut offset = 0usize;
     for mip in first..end_mip {
         let (width, height) = sampled_dimensions(&r.desc, mip)?;
-        let row = usize::try_from(width).ok()?.checked_mul(4)?;
-        let size = row.checked_mul(usize::try_from(height).ok()?)?;
+        let (row, rows) = sampled_rows(r.desc.format, width, height)?;
+        let size = row.checked_mul(rows)?;
         let target = &mut dst[offset..offset + size];
         if let Some(layout) = &layout {
             layout.planes.first()?.layout.detile(source, mip, 0, target, row, size).ok()?;
@@ -1027,7 +1027,7 @@ pub(crate) fn metal_sampled_copy_mips(
 #[cfg(target_os = "macos")]
 fn sampled_desc(d: &ResourceDesc) -> bool {
     // Default 4KB_S, linear, explicit 4KB_S, and explicit 64KB_D.
-    d.dimension == 3 && matches!(d.format, 28 | 87) && d.depth_or_array_size == 1
+    d.dimension == 3 && matches!(d.format, 28 | 87 | 71 | 77) && d.depth_or_array_size == 1
         && d.sample_count == 1 && d.sample_quality == 0 && matches!(d.layout, 0 | 1 | 0x105 | 0x10a) && d.flags == 0
 }
 
@@ -1048,6 +1048,20 @@ fn sampled_dimensions(d: &ResourceDesc, mip: u32) -> Option<(u32, u32)> {
     Some(((width >> mip).max(1), (d.height >> mip).max(1)))
 }
 
+/// Tight row size and row count, in texels for color or blocks for BC.
+#[cfg(target_os = "macos")]
+fn sampled_rows(format: u32, width: u32, height: u32) -> Option<(usize, usize)> {
+    let (bytes, block) = match format {
+        28 | 87 => (4usize, 1u32),
+        71 => (8, 4),
+        77 => (16, 4),
+        _ => return None,
+    };
+    let columns = width.div_ceil(block);
+    let rows = height.div_ceil(block);
+    Some((usize::try_from(columns).ok()?.checked_mul(bytes)?, usize::try_from(rows).ok()?))
+}
+
 /// Returns the offset, dimensions, pitch and end of a mip, with checked arithmetic.
 #[cfg(target_os = "macos")]
 fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, usize, usize)> {
@@ -1058,8 +1072,9 @@ fn sampled_mip_layout(d: &ResourceDesc, mip: u32) -> Option<(usize, u32, u32, us
         let offset = end.checked_next_multiple_of(512)?;
         let w = (width >> level).max(1);
         let h = (d.height >> level).max(1);
-        let pitch = usize::try_from(w).ok()?.checked_mul(4)?.checked_next_multiple_of(256)?;
-        end = offset.checked_add(pitch.checked_mul(usize::try_from(h).ok()?)?)?;
+        let (row, rows) = sampled_rows(d.format, w, h)?;
+        let pitch = row.checked_next_multiple_of(256)?;
+        end = offset.checked_add(pitch.checked_mul(rows)?)?;
         if level == mip {
             return Some((offset, w, h, pitch, end));
         }
@@ -1074,6 +1089,15 @@ pub(crate) fn metal_color_format(this: This) -> Option<u32> {
     }
     let format = resource(this).desc.format;
     matches!(format, 28 | 87).then_some(format)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_sampled_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    let format = resource(this).desc.format;
+    matches!(format, 28 | 87 | 71 | 77).then_some(format)
 }
 
 #[cfg(target_os = "macos")]
@@ -1274,7 +1298,7 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if desc.dimension != 1 && !matches!(desc.format, 28 | 40 | 87) {
+    if desc.dimension != 1 && !matches!(desc.format, 28 | 40 | 87 | 71 | 77) {
         // Unsupported texture formats must not produce a usable native guest resource.
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
@@ -1282,7 +1306,8 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     }
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if (native_multimip_sampled(&desc)
+    if (desc.dimension != BUFFER && matches!(desc.format, 71 | 77)
+        || native_multimip_sampled(&desc)
         || (desc.dimension != BUFFER && matches!(desc.format, 28 | 87)
             && desc.flags == 0 && desc.layout != 1))
         && (heap.kind != 1 || !sampled_desc(&desc))
@@ -1449,7 +1474,9 @@ pub(crate) extern "system" fn create_at_address(
         return E_INVALIDARG;
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if native_multimip_sampled(&desc) {
+    if native_multimip_sampled(&desc)
+        || (desc.dimension != BUFFER && matches!(desc.format, 71 | 77))
+    {
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
         }
@@ -1541,7 +1568,9 @@ pub(crate) extern "system" fn create_placed(
         return E_INVALIDARG;
     };
     #[cfg(all(feature = "native-guest-abi", target_os = "macos", target_arch = "x86_64"))]
-    if native_multimip_sampled(&desc) {
+    if native_multimip_sampled(&desc)
+        || (desc.dimension != BUFFER && matches!(desc.format, 71 | 77))
+    {
         if !out.is_null() {
             unsafe { out.write(std::ptr::null_mut()) };
         }

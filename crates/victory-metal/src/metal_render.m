@@ -347,14 +347,24 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
 }
 
 bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, uint32_t levels,
-                               const uint8_t *rgba, bool linear, bool bgra, float min_lod, float max_lod,
+                               const uint8_t *rgba, bool linear, uint32_t texture_format, float min_lod, float max_lod,
                                char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         if (!r.textureEnabled) return fail(error, error_len, @"texture binding is not enabled");
         id<MTLTexture> texture = r.sampledTexture;
-        MTLPixelFormat format = bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+        MTLPixelFormat format;
+        size_t blockBytes;
+        switch (texture_format) {
+            case 0: format = MTLPixelFormatRGBA8Unorm; blockBytes = 0; break;
+            case 1: format = MTLPixelFormatBGRA8Unorm; blockBytes = 0; break;
+            case 2: format = MTLPixelFormatBC1_RGBA; blockBytes = 8; break;
+            case 3: format = MTLPixelFormatBC3_RGBA; blockBytes = 16; break;
+            default: return fail(error, error_len, @"invalid sampled texture format");
+        }
+        if (blockBytes && ![r.device supportsBCTextureCompression])
+            return fail(error, error_len, @"BC texture compression is not supported by the Metal device");
         if (!texture || texture.width != width || texture.height != height ||
             texture.pixelFormat != format || texture.mipmapLevelCount != levels) {
             MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:YES];
@@ -383,8 +393,9 @@ bool victory_metal_set_texture(void *handle, uint32_t width, uint32_t height, ui
         uint32_t w = width, h = height;
         const uint8_t *levelPixels = rgba;
         for (uint32_t level = 0; level < levels; ++level) {
-            size_t rowBytes = (size_t)w * 4;
-            size_t imageBytes = rowBytes * h;
+            size_t rowBytes = blockBytes ? (((size_t)w + 3) / 4) * blockBytes : (size_t)w * 4;
+            size_t rows = blockBytes ? ((size_t)h + 3) / 4 : h;
+            size_t imageBytes = rowBytes * rows;
             [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0
                          withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:imageBytes];
             levelPixels += imageBytes;

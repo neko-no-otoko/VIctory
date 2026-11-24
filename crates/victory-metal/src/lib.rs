@@ -35,6 +35,35 @@ impl ColorFormat {
         matches!(self, Self::Bgra8)
     }
 }
+/// Sampled texture encoding; BC formats contain native compressed blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureFormat {
+    Rgba8,
+    Bgra8,
+    Bc1,
+    Bc3,
+}
+
+impl From<ColorFormat> for TextureFormat {
+    fn from(format: ColorFormat) -> Self {
+        match format {
+            ColorFormat::Rgba8 => Self::Rgba8,
+            ColorFormat::Bgra8 => Self::Bgra8,
+        }
+    }
+}
+
+impl TextureFormat {
+    fn native_value(self) -> u32 {
+        match self {
+            Self::Rgba8 => 0,
+            Self::Bgra8 => 1,
+            Self::Bc1 => 2,
+            Self::Bc3 => 3,
+        }
+    }
+}
+
 
 
 unsafe extern "C" {
@@ -93,7 +122,7 @@ unsafe extern "C" {
         levels: u32,
         rgba: *const u8,
         linear_filter: bool,
-        bgra: bool,
+        format: u32,
         min_lod: f32,
         max_lod: f32,
         error: *mut c_char,
@@ -452,11 +481,12 @@ impl Renderer {
         filter: TextureFilter,
         format: ColorFormat,
     ) -> Result<(), RenderError> {
-        self.set_fragment_texture_mips(width, height, 1, pixels, filter, format, 0.0, 0.0)
+        self.set_fragment_texture_mips(width, height, 1, pixels, filter, format.into(), 0.0, 0.0)
     }
 
     /// Upload a tightly packed mip chain as a 2D-array texture with one slice.
-    /// Levels are consecutive, starting at `width` by `height`.
+    /// Levels are consecutive, starting at `width` by `height`. BC levels use
+    /// tightly packed 4x4 blocks, including partial blocks at the edges.
     pub fn set_fragment_texture_mips(
         &mut self,
         width: u32,
@@ -464,7 +494,7 @@ impl Renderer {
         levels: u32,
         pixels: &[u8],
         filter: TextureFilter,
-        format: ColorFormat,
+        format: TextureFormat,
         min_lod: f32,
         max_lod: f32,
     ) -> Result<(), RenderError> {
@@ -477,15 +507,20 @@ impl Renderer {
         }
         let (mut w, mut h, mut size) = (width, height, 0usize);
         for _ in 0..levels {
-            size = (w as usize).checked_mul(h as usize)
-                .and_then(|n| n.checked_mul(4))
+            let (columns, rows, bytes_per_block) = match format {
+                TextureFormat::Rgba8 | TextureFormat::Bgra8 => (w as usize, h as usize, 4),
+                TextureFormat::Bc1 => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 8),
+                TextureFormat::Bc3 => ((w as usize).div_ceil(4), (h as usize).div_ceil(4), 16),
+            };
+            size = columns.checked_mul(rows)
+                .and_then(|n| n.checked_mul(bytes_per_block))
                 .and_then(|n| size.checked_add(n))
                 .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
             w = (w / 2).max(1);
             h = (h / 2).max(1);
         }
         if pixels.len() != size {
-            return Err(RenderError("expected tightly packed 8-bit mip texels".into()));
+            return Err(RenderError("expected tightly packed mip data".into()));
         }
         let mut error = [0 as c_char; 1024];
         // SAFETY: the renderer and validated input buffer live through the
@@ -498,7 +533,7 @@ impl Renderer {
                 levels,
                 pixels.as_ptr(),
                 matches!(filter, TextureFilter::Linear),
-                format.is_bgra(),
+                format.native_value(),
                 min_lod,
                 max_lod,
                 error.as_mut_ptr(),
