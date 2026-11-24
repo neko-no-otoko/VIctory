@@ -17,6 +17,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
+    "d3d12-probe.c",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",

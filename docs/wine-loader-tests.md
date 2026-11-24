@@ -36,3 +36,26 @@ process, avoiding a nested Windows-side Cargo build. Without it the existing
 native Windows test builds the fixture as before. The test still verifies the
 fixture's imports and delay imports and exercises the loader's real mapping,
 binding, TLS and thread behavior.
+
+## Synthetic D3D12 capability probe
+
+The optional diagnostic creates D3D12 devices and queries capabilities; it
+does not submit rendering work or use game data. With the Wine and
+LLVM-MinGW setup above, run from the repository root:
+
+```sh
+x86_64-w64-mingw32-clang -O2 -Wall -Wextra tools/d3d12-probe.c \
+  -o /tmp/victory-wine/d3d12-probe.exe -ld3d12 -ldxgi -ldxguid -lole32
+wine /tmp/victory-wine/d3d12-probe.exe
+```
+
+Exit status zero means the default D3D12 device was created; individual
+capability-query failures are shown as HRESULTs. A successful device creation
+does not prove rendering, game execution, or Metal support. Adapter names and
+IDs may be supplied by Wine rather than describe the physical GPU.
+
+In one test on an Apple M3 Max with Wine 11.0 and MoltenVK 1.4.1, the
+default device was created, but the shader-model query returned `0x60`
+(6.0) and the mesh-shader tier was 0. These are observations of that Wine
+configuration, **not limits of macOS or the hardware**. VIctory's Windows
+requirements include shader model 6.6 and mesh shaders for the world.
