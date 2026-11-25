@@ -131,7 +131,12 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         || d.first_mip!=0 || d.mip_count!=0 || d.linear_filter)
     {return Err("mixed legacy and extended texture bindings".into())}
     let mut texture_bindings:Vec<_>=d.textures.iter().map(|t|(t.slot,t.offset,t.resource,t.first_mip,t.mip_count)).collect();
-    let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s|Ok((s.slot,s.offset,s.linear_filter,[sampler_address(s.address[0])?,sampler_address(s.address[1])?,sampler_address(s.address[2])?]))).collect::<Result<_,String>>()?;
+    let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s| {
+        if !s.min_lod.is_finite() || !s.max_lod.is_finite() || s.min_lod<0. || s.max_lod<s.min_lod {
+            return Err("unsupported sampler LOD".into());
+        }
+        Ok((s.slot,s.offset,s.linear_filter,s.mip_linear,s.min_lod,s.max_lod,[sampler_address(s.address[0])?,sampler_address(s.address[1])?,sampler_address(s.address[2])?]))
+    }).collect::<Result<_,String>>()?;
     if !extended {
         if d.texture.is_none() && d.texture_slot.is_none() && d.sampler_slot.is_none()
             && (!prepared.texture_entries.is_empty() || !prepared.sampler_entries.is_empty())
@@ -143,7 +148,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         if let (Some(slot),Some(resource))=(d.texture_slot,d.texture) {
             texture_bindings.push((slot,0,resource,d.first_mip,d.mip_count));
         } else if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())}
-        if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,0,d.linear_filter,[SamplerAddress::Clamp;3]));}
+        if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,0,d.linear_filter,d.linear_filter,0.,0.,[SamplerAddress::Clamp;3]));}
     }
     texture_bindings.sort_unstable_by_key(|t|(t.0,t.1));
     sampler_bindings.sort_unstable_by_key(|s|(s.0,s.1));
@@ -193,7 +198,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         sampled.push((Texture {width:view_width,height:view_height,levels:mip_count,pixels:&r.bytes[start..end_offset],filter:TextureFilter::Nearest,format:f,min_lod:0.,max_lod:0.},
             Some(SampledTextureIdentity {resource:id,generation:generations.get(&id).copied().unwrap_or(0),first_mip})));
     }
-    let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,_,linear,address)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},0.,0.,address)).collect();
+    let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,_,linear,mip_linear,min_lod,max_lod,address)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},mip_linear,min_lod,max_lod,address)).collect();
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
     let result=if generic {
         let legacy_view=crate::wine_transport::VertexView {slot:0,buffer:d.vertex_buffer,offset:d.vertex_offset,size:d.vertex_size,stride:d.vertex_stride};

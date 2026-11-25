@@ -180,7 +180,7 @@ struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
-struct Sampler { linear:bool, address:[u32;3] }
+struct Sampler { linear:bool, mip_linear:bool, address:[u32;3], min_lod:f32, max_lod:f32 }
 type SamplerHeap = Arc<Mutex<Vec<Option<Arc<Sampler>>>>>;
 struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend, topology_type:u32, cull:u32, front_ccw:bool }
 type RtvSlot = Arc<Mutex<(Option<Arc<Texture>>, u64)>>;
@@ -838,9 +838,11 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
 }
 extern "system" fn create_sampler(this: This, desc: *const [u32; 13], handle: u64) {
     let (Some((h,index)), Some(d)) = (sampler_handle(handle), unsafe { desc.as_ref() }) else { trap("invalid sampler"); };
-    if device(this).is_none() || !matches!(d[0], 0 | 0x15) || d[1..4].iter().any(|v|!(1..=3).contains(v))
-        || d[4..] != [0,1,8,0,0,0,0,0,0] { trap("unsupported sampler"); }
-    h.lock().unwrap()[index] = Some(Arc::new(Sampler {linear:d[0] == 0x15,address:[d[1],d[2],d[3]]}));
+    let (bias,min,max)=(f32::from_bits(d[4]),f32::from_bits(d[11]),f32::from_bits(d[12]));
+    if device(this).is_none() || !matches!(d[0], 0 | 1 | 0x14 | 0x15) || d[1..4].iter().any(|v|!(1..=3).contains(v))
+        || d[5..11] != [1,8,0,0,0,0] || !min.is_finite() || !max.is_finite() || min<0.0 || min>max
+        || bias!=0.0 { trap("unsupported sampler"); }
+    h.lock().unwrap()[index] = Some(Arc::new(Sampler {linear:d[0] & 0x14 == 0x14,mip_linear:d[0] & 1 != 0,address:[d[1],d[2],d[3]],min_lod:min,max_lod:max}));
 }
 #[repr(C)]
 struct ComputeDesc {
@@ -1761,7 +1763,8 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         }
     }
     if textures.len()>256 || samplers.len()>256 { l.invalid = true; return; }
-    let single = textures.len()==1 && samplers.len()==1 && textures[0].1==0 && samplers[0].1==0 && samplers[0].4.address==[3;3];
+    let single = textures.len()==1 && samplers.len()==1 && textures[0].1==0 && samplers[0].1==0 && samplers[0].4.address==[3;3]
+        && samplers[0].4.mip_linear==samplers[0].4.linear && samplers[0].4.min_lod==0.0 && samplers[0].4.max_lod==0.0;
     let texture = single.then(|| &textures[0]);
     let sampler = single.then(|| &samplers[0]);
     if pipeline.depth.as_ref().is_some_and(|d| d.stencil.is_some()) {
@@ -1782,7 +1785,7 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         textures: if single {Vec::new()} else {textures.iter().map(|v| wine_transport::SampledTextureBinding {
             slot:v.0,offset:v.1,resource:v.4.texture.id,first_mip:v.4.first_mip,mip_count:v.4.mip_count }).collect()},
         samplers: if single {Vec::new()} else {samplers.iter().map(|v| wine_transport::SamplerBinding {
-            slot:v.0,offset:v.1,linear_filter:v.4.linear,address:v.4.address }).collect()} });
+            slot:v.0,offset:v.1,linear_filter:v.4.linear,address:v.4.address,mip_linear:v.4.mip_linear,min_lod:v.4.min_lod,max_lod:v.4.max_lod }).collect()} });
     g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), extra_descriptors:g.targets.iter().skip(1).cloned().collect(), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
         textures: textures.into_iter().map(|v| (v.2,v.3,v.4)).collect(),
         samplers: samplers.into_iter().map(|v| (v.2,v.3,v.4)).collect() });
@@ -1911,7 +1914,8 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let mrt=batch.pipelines.iter().any(|p|!p.extra_targets.is_empty());
     let raster=batch.pipelines.iter().any(|p|p.cull!=1 || p.front_ccw);
     let addressed=batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.samplers.iter().any(|s|s.address!=[3;3])));
-    let version = match (payload.is_some(),mrt,raster,addressed) {(true,_,_,true)=>14,(false,_,_,true)=>15,(true,_,true,false)=>12,(false,_,true,false)=>13,(true,false,false,false)=>5,(false,false,false,false)=>9,(true,true,false,false)=>10,(false,true,false,false)=>11};
+    let lod=batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.samplers.iter().any(|s|s.mip_linear!=s.linear_filter || s.min_lod!=0.0 || s.max_lod!=0.0)));
+    let version = match (payload.is_some(),mrt,raster,addressed,lod) {(true,_,_,_,true)=>16,(false,_,_,_,true)=>17,(true,_,_,true,false)=>14,(false,_,_,true,false)=>15,(true,_,true,false,false)=>12,(false,_,true,false,false)=>13,(true,false,false,false,false)=>5,(false,false,false,false,false)=>9,(true,true,false,false,false)=>10,(false,true,false,false,false)=>11};
     let payload_len = payload.as_ref().map_or(0, |p| p.len() as u32);
     for v in [MAGIC,version,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
     s.write_all(&c.token).map_err(|e| e.to_string())?;
@@ -1921,13 +1925,13 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
     let (magic,status,len,msg) = (word(0),word(4),word(8) as usize,word(12) as usize);
     if magic != MAGIC || len > wine_transport::MAX_PAYLOAD || msg > 4096 || (status == 0 && msg != 0)
-        || (status != 0 && len != 0) || (matches!(version,9|11|13|15) && len != 0)
+        || (status != 0 && len != 0) || (matches!(version,9|11|13|15|17) && len != 0)
     { return Err("invalid proxy response".into()); }
     if status != 0 {
         let mut message = vec![0;msg]; s.read_exact(&mut message).map_err(|e| e.to_string())?;
         return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
     }
-    let results = if matches!(version,9|11|13|15) { wine_transport::read_stream_results(&mut s)? } else {
+    let results = if matches!(version,9|11|13|15|17) { wine_transport::read_stream_results(&mut s)? } else {
         let mut bytes = vec![0;len]; s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         wine_transport::decode_results(&bytes)?
     };

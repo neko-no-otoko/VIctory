@@ -674,7 +674,7 @@ static MTLSamplerAddressMode samplerAddressMode(uint32_t address) {
     }
 }
 
-bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
+bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear, bool mip_linear,
                                   float min_lod, float max_lod, uint32_t address_u,
                                   uint32_t address_v, uint32_t address_w, char *error, size_t error_len) {
     @autoreleasepool {
@@ -690,12 +690,14 @@ bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
         id<MTLSamplerState> sampler = r.samplers[key];
         MTLSamplerDescriptor *old = r.samplerDescriptors[key];
         MTLSamplerMinMagFilter filter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-        if (!sampler || old.minFilter != filter || old.lodMinClamp != min_lod || old.lodMaxClamp != max_lod ||
+        MTLSamplerMipFilter mip = mip_linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+        if (!sampler || old.minFilter != filter || old.mipFilter != mip ||
+            old.lodMinClamp != min_lod || old.lodMaxClamp != max_lod ||
             old.sAddressMode != u || old.tAddressMode != v || old.rAddressMode != w) {
             MTLSamplerDescriptor *desc = [MTLSamplerDescriptor new];
             desc.minFilter = filter;
             desc.magFilter = filter;
-            desc.mipFilter = linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+            desc.mipFilter = mip;
             desc.lodMinClamp = min_lod;
             desc.lodMaxClamp = max_lod;
             desc.sAddressMode = u;

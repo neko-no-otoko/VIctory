@@ -151,8 +151,8 @@ unsafe extern "C" {
         pixels: *const u8, format: u32, error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_set_sampler_at(
-        renderer: *mut c_void, index: u32, linear_filter: bool, min_lod: f32,
-        max_lod: f32, address_u: u32, address_v: u32, address_w: u32,
+        renderer: *mut c_void, index: u32, linear_filter: bool, mip_linear: bool,
+        min_lod: f32, max_lod: f32, address_u: u32, address_v: u32, address_w: u32,
         error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_clear(
@@ -801,6 +801,14 @@ impl Renderer {
         &mut self, index: u32, filter: TextureFilter, min_lod: f32, max_lod: f32,
         address: [SamplerAddress; 3],
     ) -> Result<(), RenderError> {
+        self.set_sampler_lod(index, filter, matches!(filter, TextureFilter::Linear), min_lod, max_lod, address)
+    }
+
+    /// Set independent minification/magnification and mip filters and LOD clamps.
+    pub fn set_sampler_lod(
+        &mut self, index: u32, filter: TextureFilter, mip_linear: bool,
+        min_lod: f32, max_lod: f32, address: [SamplerAddress; 3],
+    ) -> Result<(), RenderError> {
         if !self.fragment_texture || index >= 16 || !min_lod.is_finite()
             || !max_lod.is_finite() || min_lod < 0.0 || min_lod > max_lod
         {
@@ -810,7 +818,7 @@ impl Renderer {
         // SAFETY: the renderer remains alive throughout this synchronous call.
         let ok = unsafe {
             victory_metal_set_sampler_at(
-                self.handle.as_ptr(), index, matches!(filter, TextureFilter::Linear),
+                self.handle.as_ptr(), index, matches!(filter, TextureFilter::Linear), mip_linear,
                 min_lod, max_lod, address[0] as u32, address[1] as u32,
                 address[2] as u32, error.as_mut_ptr(), error.len(),
             )

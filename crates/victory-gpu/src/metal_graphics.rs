@@ -79,6 +79,9 @@ pub(crate) struct Prepared {
     pub(crate) sampler_slots: Vec<u8>,
     pub(crate) texture_entries: Vec<TableEntry>,
     pub(crate) sampler_entries: Vec<TableEntry>,
+    // Shader-wide flags conservatively pair every bound sampler and texture.
+    explicit_lod: bool,
+    explicit_lod_zero: bool,
     pub(crate) depth: Option<victory_metal::DepthState>,
     pub(crate) vertex_stride: u32,
     pub(crate) color_format: victory_metal::ColorFormat,
@@ -256,8 +259,8 @@ impl Prepared {
         let count = extra.len() + 1;
         validate_color_signature(pixel, count)?;
         let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
-        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
-        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries) =
+        let (vertex_host, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
+        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod) =
             validate(pixel, HwStage::Ps, &varying, false, None, count)?;
         let (vertex, reflected, legacy_attributes) = if extra.is_empty() {
             (convert(&vertex_host, HwStage::Vs, false)?, None, Vec::new())
@@ -282,6 +285,7 @@ impl Prepared {
             sampler_slot: sampler_slots.first().copied(),
             texture_slots, sampler_slots,
             texture_entries, sampler_entries,
+            explicit_lod: explicit_lod.0, explicit_lod_zero: explicit_lod.1,
             depth: graphics.depth,
             blend: graphics.blend,
             cull: 1,
@@ -315,8 +319,8 @@ impl Prepared {
         validate_color_signature(pixel, count)?;
         let signatures = vertex_signatures(vertex, inputs)?;
         let varying = varying_signatures_for_stages(vertex, pixel)?;
-        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures), count)?;
-        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries) =
+        let (vertex_host, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures), count)?;
+        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod) =
             validate(pixel, HwStage::Ps, &varying, false, None, count)?;
         let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
         let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(
@@ -344,6 +348,7 @@ impl Prepared {
             texture_slot: texture_slots.first().copied(), sampler_slot: sampler_slots.first().copied(),
             texture_slots, sampler_slots,
             texture_entries, sampler_entries,
+            explicit_lod: explicit_lod.0, explicit_lod_zero: explicit_lod.1,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
             cull: 1, front_ccw: false,
             color_format: graphics.color_format, renderer: None, input_renderer: None,
@@ -351,6 +356,20 @@ impl Prepared {
             legacy_attributes: Vec::new(),
             renderer_texture: [None; 16], input_renderer_texture: [None; 16],
         }, resolved))
+    }
+
+    fn validate_explicit_lod(&self, textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
+        samplers: &[(victory_metal::TextureFilter, bool, f32, f32, [victory_metal::SamplerAddress; 3])]) -> Result<(), String> {
+        let last_mip = textures.iter().map(|(texture, _)| texture.levels.saturating_sub(1)).max().unwrap_or(0);
+        if last_mip > 0 {
+            if self.explicit_lod && samplers.iter().any(|s| s.2 > 0. || s.3 < last_mip as f32) {
+                return Err("explicit LOD sampling with sampler LOD clamp on a multi-mip texture is unsupported".into());
+            }
+            if self.explicit_lod_zero && samplers.iter().any(|s| s.2 > 0.) {
+                return Err("explicit level-zero sampling with positive sampler minimum LOD on a multi-mip texture is unsupported".into());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_legacy_attributes(&mut self) -> Result<(), String> {
@@ -378,7 +397,7 @@ impl Prepared {
             return Err("native graphics supports only descriptor index zero".into());
         }
         let identity = None;
-        let sampler = texture.as_ref().map(|t| (t.filter, t.min_lod, t.max_lod, [victory_metal::SamplerAddress::Clamp; 3]));
+        let sampler = texture.as_ref().map(|t| (t.filter, matches!(t.filter, victory_metal::TextureFilter::Linear), t.min_lod, t.max_lod, [victory_metal::SamplerAddress::Clamp; 3]));
         let textures = texture.map(|t| (t, identity));
         self.draw_multi(width, height, vertices, indices, viewport, scissor, depth, stencil,
             stencil_reference, constants, textures.as_slice(), sampler.as_slice(), pixels)
@@ -397,12 +416,13 @@ impl Prepared {
         stencil_reference: u32,
         constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])],
+        samplers: &[(victory_metal::TextureFilter, bool, f32, f32, [victory_metal::SamplerAddress; 3])],
         pixels: &mut [u8],
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
         }
+        self.validate_explicit_lod(textures, samplers)?;
         if self.vertex_stride == 0 {
             return Err("generic input pipeline requires layout-aware rendering".into());
         }
@@ -437,8 +457,8 @@ impl Prepared {
             let index = entry.heap_index as usize;
             upload_sampled_texture(renderer, entry.heap_index, texture, *identity, &mut self.renderer_texture[index])?;
         }
-        for (&(filter, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
-            renderer.set_sampler_addressed(entry.heap_index, filter, min_lod, max_lod, address).map_err(|e| e.to_string())?;
+        for (&(filter, mip_linear, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
+            renderer.set_sampler_lod(entry.heap_index, filter, mip_linear, min_lod, max_lod, address).map_err(|e| e.to_string())?;
         }
         match (vertices, indices) {
             (Vertices::Position(v), Some((indices, base))) => renderer.draw_indexed_preserving(v, indices, base, constants, pixels),
@@ -473,7 +493,7 @@ impl Prepared {
         stencil_reference: u32,
         constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])],
+        samplers: &[(victory_metal::TextureFilter, bool, f32, f32, [victory_metal::SamplerAddress; 3])],
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
@@ -489,11 +509,12 @@ impl Prepared {
         viewport: [f64; 6], scissor: [u32; 4], mut depth: Option<&mut [f32]>,
         mut stencil: Option<&mut [u8]>, stencil_reference: u32, constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])], pixels: &mut [&mut [u8]], preserve: bool,
+        samplers: &[(victory_metal::TextureFilter, bool, f32, f32, [victory_metal::SamplerAddress; 3])], pixels: &mut [&mut [u8]], preserve: bool,
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
         }
+        self.validate_explicit_lod(textures, samplers)?;
         if pixels.len() != self.color_targets.len() {
             return Err("color attachment count does not match pipeline".into());
         }
@@ -547,8 +568,8 @@ impl Prepared {
             let index = entry.heap_index as usize;
             upload_sampled_texture(renderer, entry.heap_index, texture, *identity, &mut self.input_renderer_texture[index])?;
         }
-        for (&(filter, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
-            renderer.set_sampler_addressed(entry.heap_index, filter, min_lod, max_lod, address).map_err(|e| e.to_string())?;
+        for (&(filter, mip_linear, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
+            renderer.set_sampler_lod(entry.heap_index, filter, mip_linear, min_lod, max_lod, address).map_err(|e| e.to_string())?;
         }
         renderer.draw_buffers_mrt_topology(
             buffers, indices, first_vertex, vertex_count, instance_count, start_instance, topology,
@@ -868,7 +889,7 @@ fn validate(
     input_uv: bool,
     vertex_signatures: Option<&[VertexSignature]>,
     color_count: usize,
-) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>, Vec<TableEntry>, Vec<TableEntry>), String> {
+) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>, Vec<TableEntry>, Vec<TableEntry>, (bool, bool)), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
     let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
@@ -1007,6 +1028,7 @@ fn validate(
     let mut seen = Vec::new();
     let mut texture_accesses = Vec::new();
     let mut sampler_accesses = Vec::new();
+    let mut explicit_lod = (false, false);
     for descriptor in &traced.descriptors {
         let resource::Source::Loaded { load, first: 0 } = descriptor.source else {
             return Err("descriptor must be loaded directly from its table".into());
@@ -1017,6 +1039,8 @@ fn validate(
         {
             return Err("only non-comparison 2D texture sampling is supported".into());
         }
+        explicit_lod.0 |= inst.name() == "image_sample_l";
+        explicit_lod.1 |= inst.name() == "image_sample_lz";
         let expected_load = match descriptor.role {
             resource::Role::Resource => "s_load_dwordx8",
             resource::Role::Sampler => "s_load_dwordx4",
@@ -1173,7 +1197,7 @@ fn validate(
     let sampler_slots: Vec<_> = samplers.iter().map(|u| u.slot).collect();
     let texture_entries = table_entries(&texture_slots, &texture_accesses)?;
     let sampler_entries = table_entries(&sampler_slots, &sampler_accesses)?;
-    Ok((host, texture_slots, sampler_slots, texture_entries, sampler_entries))
+    Ok((host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod))
 }
 
 fn convert(host: &emit::HostShader, stage: HwStage, sampled: bool) -> Result<Vec<u8>, String> {

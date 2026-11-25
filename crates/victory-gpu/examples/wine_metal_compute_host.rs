@@ -264,7 +264,7 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17) {
             return Err("invalid protocol header".into());
         }
         if matches!(fields[1], 1 | 6 | 7) {
@@ -276,12 +276,12 @@ mod host {
                 return Err("invalid request lengths or dispatch dimensions".into());
             }
         }
-        if matches!(fields[1], 5 | 10 | 12 | 14) && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
+        if matches!(fields[1], 5 | 10 | 12 | 14 | 16) && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
             || fields[3..].iter().any(|&v| v != 0))
         {
             return Err("invalid batch request length or reserved fields".into());
         }
-        if matches!(fields[1], 9 | 11 | 13 | 15) && fields[2..].iter().any(|&v| v != 0) {
+        if matches!(fields[1], 9 | 11 | 13 | 15 | 17) && fields[2..].iter().any(|&v| v != 0) {
             return Err("invalid stream request reserved fields".into());
         }
         if fields[1] == 8 && (fields[2] < 32 || fields[2] as usize > 64 * 1024 * 1024
@@ -298,14 +298,14 @@ mod host {
             1 | 6 | 7 => compute_request(stream, fields, cache).map(Response::Bytes),
             8 => raw_heap_request(stream, fields[2] as usize, cache).map(Response::Bytes),
             2 => graphics_request(stream, fields).map(Response::Bytes),
-            5 | 10 | 12 | 14 => {
+            5 | 10 | 12 | 14 | 16 => {
                 let mut payload = vec![0; fields[2] as usize];
                 stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
                 let batch = victory_gpu::wine_transport::decode_batch(&payload)?;
                 let results = victory_gpu::execute_wine_batch(batch)?;
                 victory_gpu::wine_transport::encode_results(&results).map(Response::Bytes)
             }
-            9 | 11 | 13 | 15 => {
+            9 | 11 | 13 | 15 | 17 => {
                 let batch = victory_gpu::wine_transport::read_stream_batch(stream)?;
                 let results = victory_gpu::execute_wine_batch(batch)?;
                 victory_gpu::wine_transport::validate_stream_results(&results)?;
@@ -451,14 +451,14 @@ mod host {
 
         #[test]
         fn extended_batch_versions_validate_headers_and_authentication() {
-            for version in [12u32,13,14,15] {
+            for version in [12u32,13,14,15,16,17] {
                 for (reserved, token, expected) in [
                     (1, [0;16], "reserved"),
                     (0, [1;16], "authentication"),
                 ] {
                     let listener=TcpListener::bind("127.0.0.1:0").unwrap();
                     let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-                    let fields=if version==12 || version==14 {[MAGIC,version,0,reserved,0,0,0,0]}
+                    let fields=if matches!(version,12|14|16) {[MAGIC,version,0,reserved,0,0,0,0]}
                         else {[MAGIC,version,reserved,0,0,0,0,0]};
                     for value in fields {client.write_all(&value.to_le_bytes()).unwrap();}
                     client.write_all(&token).unwrap();
@@ -470,15 +470,15 @@ mod host {
 
         #[test]
         fn addressed_batch_versions_dispatch_framed_and_streamed_payloads() {
-            for version in [14u32,15] {
+            for version in [14u32,15,16,17] {
                 let listener=TcpListener::bind("127.0.0.1:0").unwrap();
                 let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-                let fields=if version==14 {[MAGIC,version,4,0,0,0,0,0]}
+                let fields=if version==14 || version==16 {[MAGIC,version,4,0,0,0,0,0]}
                     else {[MAGIC,version,0,0,0,0,0,0]};
                 for value in fields {client.write_all(&value.to_le_bytes()).unwrap();}
                 client.write_all(&[0;16]).unwrap();
                 client.write_all(&0u32.to_le_bytes()).unwrap();
-                if version==15 {client.write_all(&0u32.to_le_bytes()).unwrap();}
+                if version==15 || version==17 {client.write_all(&0u32.to_le_bytes()).unwrap();}
                 let (mut server,_)=listener.accept().unwrap();
                 let error=request(&mut server,&[0;16],&mut None,false).unwrap_err();
                 assert!(!error.contains("protocol header") && !error.contains("authentication"),"{error}");

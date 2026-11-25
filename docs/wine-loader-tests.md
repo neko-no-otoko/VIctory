@@ -428,6 +428,16 @@ and unsupported blend factors remain rejected. The native depth comparison/write
 subset and multiple sampled textures with point or linear samplers are supported.
 Sampler U, V and W addressing independently support wrap, mirror and clamp.
 Border addressing, comparison and anisotropic filtering remain unsupported.
+Mip filtering may be point or linear independently of the point/linear
+minification and magnification filter. Finite nonnegative minimum and maximum
+LOD values with minimum no greater than maximum are supported, relative to the
+SRV's first mip. Nonzero sampler LOD bias is rejected: Metal's sampler-bias
+feature is not available on the tested GPU and equivalence is not established.
+Metal's SDK specifies that sampler clamps do not apply to explicit-LOD samples,
+so multi-mip explicit-LOD draws are rejected when a clamp could affect them;
+level-zero samples with a positive minimum are likewise rejected. Single-mip
+views remain supported. This conservative check applies across all textures
+and samplers in the draw.
 Pixel shaders may access multiple texture and sampler entries at statically
 traced table-relative indices, including nonzero indices and table bases.
 Guest shader-visible resource and sampler heaps hold up to 256 entries; per
