@@ -45,7 +45,7 @@ ordered; it is not a persistent native texture implementation.
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
+| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack and audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
@@ -54,6 +54,22 @@ ordered; it is not a persistent native texture implementation.
 
 Everything except `victory-game` is platform-level and can be tested with
 any Xbox Series title.
+
+### Format implementations
+
+`victory-formats` incorporates the BCPack, texture-layout and XMA changes and
+the texture-layout benchmark from canonical VIctory at
+[`ccfb02996eac831853e8324156f123eeff083e9d`](https://github.com/Marvisak/VIctory/tree/ccfb02996eac831853e8324156f123eeff083e9d/crates/victory-formats).
+Their original authorship and GPL-3.0-or-later history remain in the upstream
+repository. BCPack uses indexed bucket lookup; XMA handles continuation
+packets and caches transform rotations.
+
+For texture consumers, `Layout::new` returns `Error::Invalid` for linear
+multisample layouts. Tiling and detiling a 3D mip require `depth_pitch` to
+cover the final row of each slice: `(height - 1) * row_pitch + row_bytes`.
+Overlapping depth slices, insufficient buffers and arithmetic overflow return
+`Error::TooSmall`. The copy path coalesces tiled runs; supported layouts and
+their addressing remain subject to the format API's existing checks.
 
 ## Import resolution
 
