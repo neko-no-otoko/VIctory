@@ -129,7 +129,7 @@ impl Stencil {
     }
 }
 #[derive(Clone, Debug)]
-pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend, pub inputs:Vec<VertexInput>, pub extra_targets:Vec<ColorTarget> }
+pub struct Pipeline { pub id:u64, pub vertex_shader:Vec<u8>, pub pixel_shader:Vec<u8>, pub vertex_stride:u32, pub format:u32, pub depth:Option<PipelineDepth>, pub blend:Blend, pub inputs:Vec<VertexInput>, pub extra_targets:Vec<ColorTarget>, pub cull:u32, pub front_ccw:bool }
 #[derive(Clone, Debug)]
 pub struct ColorTarget { pub format:u32, pub blend:Blend }
 #[derive(Clone, Debug)]
@@ -278,8 +278,10 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
         if p.id==0 || !ids.insert(p.id) {return Err("duplicate pipeline id".into())}
         w.u64(p.id);w.bytes(&p.vertex_shader,MAX_SHADER)?;w.bytes(&p.pixel_shader,MAX_SHADER)?;
         if p.vertex_stride & 0x8000_0000 != 0 {return Err("invalid vertex stride".into())}
-        if p.format & 0x8000_0000 != 0 || p.extra_targets.len()>7 {return Err("invalid render target formats".into())}
-        w.u32(p.vertex_stride | if p.inputs.is_empty(){0}else{0x8000_0000});w.u32(p.format | if p.extra_targets.is_empty(){0}else{0x8000_0000});
+        if p.format & 0xc000_0000 != 0 || p.extra_targets.len()>7 {return Err("invalid render target formats".into())}
+        if !(1..=3).contains(&p.cull) {return Err("invalid rasterizer cull mode".into())}
+        let rasterizer=p.cull!=1 || p.front_ccw;
+        w.u32(p.vertex_stride | if p.inputs.is_empty(){0}else{0x8000_0000});w.u32(p.format | if p.extra_targets.is_empty(){0}else{0x8000_0000} | if rasterizer {0x4000_0000}else{0});
         if let Some(z)=&p.depth {
             w.u32(if z.stencil.is_some(){2}else{1});w.u32(z.write as u32);w.u32(z.compare);
             if let Some(s)=&z.stencil {
@@ -305,6 +307,7 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
                 w.u32(t.format);w.u32(t.blend.enabled as u32);w.u32(t.blend.write_mask as u32);w.u32(t.blend.encode());
             }
         }
+        if rasterizer {w.u32(p.cull);w.u32(p.front_ccw as u32);}
     }
     count(w,batch.commands.len())?;
     for c in &batch.commands { match c {
@@ -350,7 +353,7 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
         let id=r.u64()?;if id==0 || !ids.insert(id) {return Err("duplicate pipeline id".into())}
         let vertex_shader=r.bytes(MAX_SHADER)?;let pixel_shader=r.bytes(MAX_SHADER)?;
         let raw_stride=r.u32()?;let extended=raw_stride & 0x8000_0000!=0;let vertex_stride=raw_stride & 0x7fff_ffff;
-        let raw_format=r.u32()?;let mrt=raw_format & 0x8000_0000!=0;let format=raw_format & 0x7fff_ffff;
+        let raw_format=r.u32()?;let mrt=raw_format & 0x8000_0000!=0;let rasterizer=raw_format & 0x4000_0000!=0;let format=raw_format & 0x3fff_ffff;
         let depth=match r.u32()? {
             0=>None,k @ (1|2)=>{
                 let write=r.boolean()?;let compare=r.u32()?;
@@ -385,7 +388,11 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
                 extra_targets.push(ColorTarget {format,blend});
             }
         }
-        pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend,inputs,extra_targets});
+        let (cull,front_ccw)=if rasterizer {
+            let cull=r.u32()?;if !(1..=3).contains(&cull) {return Err("invalid rasterizer cull mode".into())}
+            (cull,r.boolean()?)
+        } else {(1,false)};
+        pipelines.push(Pipeline {id,vertex_shader,pixel_shader,vertex_stride,format,depth,blend,inputs,extra_targets,cull,front_ccw});
     }
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
@@ -719,7 +726,7 @@ mod tests {
     fn pipeline_and_draw_round_trip() {
         let mut b=batch();
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
-            depth:Some(PipelineDepth {write:true,compare:4,stencil:None}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap(),inputs:vec![],extra_targets:vec![]});
+            depth:Some(PipelineDepth {write:true,compare:4,stencil:None}),blend:Blend::new(true,15,[3,7,2,5,8,3]).unwrap(),inputs:vec![],extra_targets:vec![],cull:1,front_ccw:false});
         b.commands.push(Command::Draw(Draw {target:2,extra_targets:vec![],pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![10,20],texture:Some(2),first_mip:0,mip_count:1,index:Some(Index {buffer:1,offset:0,size:4,format:57,first:0,base_vertex:-1}),
@@ -731,12 +738,59 @@ mod tests {
     }
 
     #[test]
+    fn rasterizer_wire_legacy_extended_and_invalid() {
+        let mut b=Batch {resources:vec![],pipelines:vec![Pipeline {
+            id:1,vertex_shader:vec![],pixel_shader:vec![],vertex_stride:16,format:28,
+            depth:None,blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![],extra_targets:vec![],
+            cull:1,front_ccw:false,
+        }],commands:vec![]};
+        let legacy=encode_batch(&b).unwrap();
+        assert_eq!(u32::from_le_bytes(legacy[28..32].try_into().unwrap()),28);
+        let p=&decode_batch(&legacy).unwrap().pipelines[0];
+        assert_eq!((p.cull,p.front_ccw),(1,false));
+        for cull in 1..=3 {
+            for front_ccw in [false,true] {
+                b.pipelines[0].cull=cull;b.pipelines[0].front_ccw=front_ccw;
+                let bytes=encode_batch(&b).unwrap();
+                let decoded=decode_batch(&bytes).unwrap();
+                assert_eq!((decoded.pipelines[0].cull,decoded.pipelines[0].front_ccw),(cull,front_ccw));
+                assert_eq!(encode_batch(&decoded).unwrap(),bytes);
+                let mut stream=Vec::new();write_stream_batch(&mut stream,&b).unwrap();
+                let decoded=read_stream_batch(&mut stream.as_slice()).unwrap();
+                assert_eq!((decoded.pipelines[0].cull,decoded.pipelines[0].front_ccw),(cull,front_ccw));
+            }
+        }
+        b.pipelines[0].extra_targets.push(ColorTarget {format:87,blend:Blend::new(false,15,[0;6]).unwrap()});
+        let bytes=encode_batch(&b).unwrap();
+        let decoded=decode_batch(&bytes).unwrap();
+        assert_eq!(decoded.pipelines[0].extra_targets[0].format,87);
+        assert_eq!((decoded.pipelines[0].cull,decoded.pipelines[0].front_ccw),(3,true));
+        for end in 0..bytes.len() {assert!(decode_batch(&bytes[..end]).is_err());}
+        let n=bytes.len();
+        for (offset,value) in [(n-12,0u32),(n-12,4),(n-8,2)] {
+            let mut invalid=bytes.clone();
+            invalid[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+            assert!(decode_batch(&invalid).is_err());
+        }
+        let mut missing_flag=bytes.clone();
+        missing_flag[28..32].copy_from_slice(&(28u32 | 0x8000_0000).to_le_bytes());
+        assert!(decode_batch(&missing_flag).is_err());
+        for cull in [0,4,u32::MAX] {
+            b.pipelines[0].cull=cull;
+            assert!(encode_batch(&b).is_err());
+            assert!(write_stream_batch(&mut Vec::new(),&b).is_err());
+        }
+        b.pipelines[0].cull=1;b.pipelines[0].format=0x4000_001c;
+        assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
     fn multiple_render_targets_round_trip() {
         let mut b=batch();
         b.resources.push(Resource {id:3,state:4,kind:ResourceKind::Texture {width:1,height:1,format:87,mips:1},bytes:vec![0;4]});
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
             depth:None,blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![],
-            extra_targets:vec![ColorTarget {format:87,blend:Blend::new(true,5,[2,1,1,2,1,1]).unwrap()}]});
+            extra_targets:vec![ColorTarget {format:87,blend:Blend::new(true,5,[2,1,1,2,1,1]).unwrap()}],cull:1,front_ccw:false});
         b.commands.push(Command::Draw(Draw {target:2,extra_targets:vec![3],pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
@@ -806,7 +860,7 @@ mod tests {
             depth:None,blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![
                 VertexInput {semantic:"TEXCOORD".into(),semantic_index:0,format:34,slot:1,offset:0,per_instance:true,step_rate:2},
                 VertexInput {semantic:"POSITION".into(),semantic_index:0,format:2,slot:0,offset:4,per_instance:false,step_rate:0},
-            ],extra_targets:vec![]});
+            ],extra_targets:vec![],cull:1,front_ccw:false});
         b.commands.push(Command::Draw(Draw {target:2,extra_targets:vec![],pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
             vertex_count:3,instance_count:3,first_vertex:0,first_instance:2,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
@@ -824,7 +878,7 @@ mod tests {
         b.resources.push(Resource {id:3,state:0x10,kind:ResourceKind::Texture {width:1,height:1,format:20,mips:1},bytes:vec![0;5]});
         b.pipelines.push(Pipeline {id:7,vertex_shader:vec![1],pixel_shader:vec![2],vertex_stride:16,format:28,
             depth:Some(PipelineDepth {write:true,compare:2,stencil:Some(Stencil {enabled:true,read_mask:0xf0,write_mask:0x0f,front:[1,2,3,4],back:[5,6,7,8]})}),
-            blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![],extra_targets:vec![]});
+            blend:Blend::new(false,15,[0;6]).unwrap(),inputs:vec![],extra_targets:vec![],cull:1,front_ccw:false});
         b.commands.extend([Command::SetStencilRef(0xa5),Command::ClearStencil {target:3,flags:3,depth:0.5,stencil:0xa0},
             Command::CopyDepthStencil {src:3,dst:1,offset:0,pitch:256,width:1,height:1,plane:1,upload:false}]);
         let encoded=encode_batch(&b).unwrap();

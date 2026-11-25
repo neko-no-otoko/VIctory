@@ -65,8 +65,9 @@ int main(int argc,char **argv) {
     if (hr!=S_OK) return 5;
     void *v=0,*o=0;
     if (SLOT(vb,0x40,Map)(vb,0,0,&v)!=S_OK || SLOT(out,0x40,Map)(out,0,0,&o)!=S_OK) return 6;
-    for (unsigned i=0;i<3;i++) { float z=(float[]){0.5f,0.25f,0.9f}[i];float tri[12]={-1,-1,z,1,3,-1,z,1,-1,3,z,1};memcpy((float *)v+i*12,tri,sizeof(tri)); }
-    const float reverse[12]={-1,-1,0.5f,1,-1,3,0.5f,1,3,-1,0.5f,1};
+    /* D3D's default front face is clockwise in render-target coordinates. */
+    for (unsigned i=0;i<3;i++) { float z=(float[]){0.5f,0.25f,0.9f}[i];float tri[12]={-1,-1,z,1,-1,3,z,1,3,-1,z,1};memcpy((float *)v+i*12,tri,sizeof(tri)); }
+    const float reverse[12]={-1,-1,0.5f,1,3,-1,0.5f,1,-1,3,0.5f,1};
     memcpy((float *)v+36,reverse,sizeof(reverse));
     memset(o,0x77,6144);
     HeapDesc hd={{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,0,0},{0,0}};

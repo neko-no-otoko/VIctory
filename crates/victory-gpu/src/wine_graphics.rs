@@ -117,8 +117,11 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             if target.blend.write_mask>15 {return Err("invalid blend mask".into())}
             extra.push((format(target.format)?,BlendState {enabled:target.blend.enabled,write_mask:target.blend.write_mask,factors:target.blend.factors}));
         }
-        let value=if generic { Prepared::new_inputs_mrt(&p.vertex_shader,&p.pixel_shader,state,&p.inputs,&extra)? }
+        let (mut pipeline,resolved)=if generic { Prepared::new_inputs_mrt(&p.vertex_shader,&p.pixel_shader,state,&p.inputs,&extra)? }
             else { (Prepared::new_mrt(&p.vertex_shader,&p.pixel_shader,state,&extra)?,Vec::new()) };
+        pipeline.cull=p.cull;
+        pipeline.front_ccw=p.front_ccw;
+        let value=(pipeline,resolved);
         prepared.insert(d.pipeline,value);
     }
     let (prepared,resolved)=prepared.get_mut(&d.pipeline).unwrap();
@@ -243,7 +246,10 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
         if let ResourceKind::Texture {format:fmt,..}=r.kind {if matches!(fmt,20|40) {depth_image(&r)?;} else {image(&r)?;}}
         if r.id==0 || rs.insert(r.id,r).is_some() {return Err("duplicate resource id".into())}
     }
-    let mut pipelines=HashMap::new();for p in batch.pipelines {if p.id==0 || pipelines.insert(p.id,p).is_some() {return Err("duplicate pipeline id".into())}}
+    let mut pipelines=HashMap::new();for p in batch.pipelines {
+        if !(1..=3).contains(&p.cull) {return Err("invalid rasterizer cull mode".into())}
+        if p.id==0 || pipelines.insert(p.id,p).is_some() {return Err("duplicate pipeline id".into())}
+    }
     let mut prepared=HashMap::new();let mut touched=HashMap::new();let mut generations=HashMap::new();let mut stencil_reference=0;
     for (index,c) in batch.commands.into_iter().enumerate() {
         mark_writes(&mut generations,&c,index+1);

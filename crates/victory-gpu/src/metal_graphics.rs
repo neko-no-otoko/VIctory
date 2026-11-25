@@ -83,6 +83,8 @@ pub(crate) struct Prepared {
     pub(crate) vertex_stride: u32,
     pub(crate) color_format: victory_metal::ColorFormat,
     pub(crate) blend: victory_metal::BlendState,
+    pub(crate) cull: u32,
+    pub(crate) front_ccw: bool,
     color_targets: Vec<victory_metal::RenderTarget>,
     pub(crate) legacy_attributes: Vec<victory_metal::VertexAttribute>,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
@@ -282,6 +284,8 @@ impl Prepared {
             texture_entries, sampler_entries,
             depth: graphics.depth,
             blend: graphics.blend,
+            cull: 1,
+            front_ccw: false,
             vertex_stride: if graphics.input_uv { 24 } else { 16 },
             color_format: graphics.color_format,
             color_targets: std::iter::once((graphics.color_format, graphics.blend)).chain(extra.iter().copied()).map(|(format, blend)| victory_metal::RenderTarget { format, blend }).collect(),
@@ -341,6 +345,7 @@ impl Prepared {
             texture_slots, sampler_slots,
             texture_entries, sampler_entries,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
+            cull: 1, front_ccw: false,
             color_format: graphics.color_format, renderer: None, input_renderer: None,
             color_targets: std::iter::once((graphics.color_format, graphics.blend)).chain(extra.iter().copied()).map(|(format, blend)| victory_metal::RenderTarget { format, blend }).collect(),
             legacy_attributes: Vec::new(),
@@ -419,6 +424,7 @@ impl Prepared {
             self.renderer = Some((width, height, renderer));
         }
         let renderer = &mut self.renderer.as_mut().unwrap().2;
+        renderer.set_rasterizer(self.cull, self.front_ccw).map_err(|e| e.to_string())?;
         renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
@@ -528,6 +534,7 @@ impl Prepared {
             self.input_renderer = Some((width, height, point, attributes.to_vec(), renderer));
         }
         let renderer = &mut self.input_renderer.as_mut().unwrap().4;
+        renderer.set_rasterizer(self.cull, self.front_ccw).map_err(|e| e.to_string())?;
         renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;

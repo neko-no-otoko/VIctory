@@ -176,6 +176,7 @@ unsafe extern "C" {
     fn victory_metal_stencil_pixels(renderer: *mut c_void, pixels: *mut u8, upload: bool,
                                     error: *mut c_char, error_len: usize) -> bool;
     fn victory_metal_stencil_reference(renderer: *mut c_void, reference: u32);
+    fn victory_metal_set_rasterizer(renderer: *mut c_void, cull: u32, front_ccw: bool);
     fn victory_metal_clear_depth(width: u32, height: u32, pitch: usize, pixels: *mut u8,
                                 value: f32, rects: *const [u32; 4], count: usize,
                                 error: *mut c_char, error_len: usize) -> bool;
@@ -640,6 +641,16 @@ impl Renderer {
         let ok = unsafe { victory_metal_depth_pixels(self.handle.as_ptr(), pixels.as_mut_ptr(), false,
                                                      error.as_mut_ptr(), error.len()) };
         if ok { Ok(()) } else { Err(native_error(&error)) }
+    }
+
+    /// Set D3D cull mode (1 = none, 2 = front, 3 = back) and front winding.
+    pub fn set_rasterizer(&mut self, cull: u32, front_ccw: bool) -> Result<(), RenderError> {
+        if !(1..=3).contains(&cull) {
+            return Err(RenderError("invalid D3D cull mode".into()));
+        }
+        // SAFETY: the renderer handle is valid and the cull mode was checked above.
+        unsafe { victory_metal_set_rasterizer(self.handle.as_ptr(), cull, front_ccw); }
+        Ok(())
     }
 
     pub fn set_stencil_reference(&mut self, value: u32) {

@@ -181,7 +181,7 @@ struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
 type SamplerHeap = Arc<Mutex<Vec<Option<Arc<bool>>>>>;
-struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend, topology_type:u32 }
+struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend, topology_type:u32, cull:u32, front_ccw:bool }
 type RtvSlot = Arc<Mutex<(Option<Arc<Texture>>, u64)>>;
 type Rtv = (RtvSlot, Arc<Texture>, u64);
 #[derive(Clone)]
@@ -1440,6 +1440,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let mut depth = None;
     let mut stencil_state = None;
     let mut front_counter_clockwise = false;
+    let mut cull=1;
     let mut depth_format = 0;
     let mut color_formats = Vec::new();
     let mut blend_offset = None;
@@ -1462,8 +1463,8 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
             9 => if word(4) != u32::MAX { return E_INVALIDARG; },
             12 => { ep = stream_ptr(b,at+8); input_count = word(16); if !(1..=16).contains(&input_count) { return E_INVALIDARG; } }
             10 => {
-                if word(4) != 3 || word(8) != 1 || (16..48).step_by(4).any(|i| word(i) != if i == 28 { 1 } else { 0 }) { return E_INVALIDARG; }
-                front_counter_clockwise = word(12) != 0;
+                if word(4) != 3 || !(1..=3).contains(&word(8)) || word(12)>1 || (16..48).step_by(4).any(|i| word(i) != if i == 28 { 1 } else { 0 }) { return E_INVALIDARG; }
+                cull=word(8); front_counter_clockwise = word(12) != 0;
             }
             11 => {
                 let (enabled, write, compare, stencil) = (word(4),word(8),word(12),word(16));
@@ -1516,7 +1517,6 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let blend=blends[0].clone();
     let extra_targets=color_formats.iter().copied().skip(1).zip(blends.iter().skip(1))
         .map(|(format,blend)|wine_transport::ColorTarget {format,blend:blend.clone()}).collect();
-    if front_counter_clockwise && stencil_state.as_ref().is_some_and(|s| s.enabled) { return E_INVALIDARG; }
     if depth_format == 20 {
         let Some(d) = depth.as_mut() else { return E_INVALIDARG; };
         d.stencil = stencil_state;
@@ -1545,7 +1545,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
         && (inputs.len()==1 || (inputs.len()==2 && inputs[1].semantic.eq_ignore_ascii_case("TEXCOORD")
             && inputs[1].semantic_index==0 && inputs[1].format==16 && inputs[1].slot==0
             && inputs[1].offset==16 && !inputs[1].per_instance));
-    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, extra_targets, inputs, legacy, depth, blend, topology_type };
+    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, extra_targets, inputs, legacy, depth, blend, topology_type, cull, front_ccw:front_counter_clockwise };
     new(Data::GraphicsPipeline(Arc::new(p)), &PIPELINE_TABLE, iid, PIPELINE, out)
 }
 extern "system" fn gpu_address(this: This) -> u64 {
@@ -1883,7 +1883,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         }
         if let Some(p) = &j.pipeline {
             let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
-                format: p.format, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new(), extra_targets:p.extra_targets.clone() });
+                format: p.format, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new(), extra_targets:p.extra_targets.clone(), cull:p.cull, front_ccw:p.front_ccw });
             if matches!(&j.command,Command::Draw(d) if !d.vertices.is_empty()) { entry.inputs=p.inputs.clone(); }
         }
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }
@@ -1907,7 +1907,8 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     let mrt=batch.pipelines.iter().any(|p|!p.extra_targets.is_empty());
-    let version = match (payload.is_some(),mrt) {(true,false)=>5,(false,false)=>9,(true,true)=>10,(false,true)=>11};
+    let raster=batch.pipelines.iter().any(|p|p.cull!=1 || p.front_ccw);
+    let version = match (payload.is_some(),mrt,raster) {(true,_,true)=>12,(false,_,true)=>13,(true,false,false)=>5,(false,false,false)=>9,(true,true,false)=>10,(false,true,false)=>11};
     let payload_len = payload.as_ref().map_or(0, |p| p.len() as u32);
     for v in [MAGIC,version,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
     s.write_all(&c.token).map_err(|e| e.to_string())?;
@@ -1917,13 +1918,13 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
     let (magic,status,len,msg) = (word(0),word(4),word(8) as usize,word(12) as usize);
     if magic != MAGIC || len > wine_transport::MAX_PAYLOAD || msg > 4096 || (status == 0 && msg != 0)
-        || (status != 0 && len != 0) || (matches!(version,9|11) && len != 0)
+        || (status != 0 && len != 0) || (matches!(version,9|11|13) && len != 0)
     { return Err("invalid proxy response".into()); }
     if status != 0 {
         let mut message = vec![0;msg]; s.read_exact(&mut message).map_err(|e| e.to_string())?;
         return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
     }
-    let results = if matches!(version,9|11) { wine_transport::read_stream_results(&mut s)? } else {
+    let results = if matches!(version,9|11|13) { wine_transport::read_stream_results(&mut s)? } else {
         let mut bytes = vec![0;len]; s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         wine_transport::decode_results(&bytes)?
     };

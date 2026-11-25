@@ -406,6 +406,10 @@ indexed strip restart values (0xffff or 0xffffffff) are rejected, not emulated.
 Point draws use a separately converted vertex shader with the converter's
 [point input topology](https://github.com/MethanePowered/MetalShaderConverterBinary/blob/main/include/metal_irconverter/metal_irconverter.h),
 which supplies Metal's required point-size behavior.
+Solid rasterization supports no culling, front-face culling, and back-face
+culling with either D3D front-face winding; the selected winding also controls
+front/back stencil operations. Wireframe, depth bias, depth clipping disabled,
+multisampling and conservative rasterization remain unsupported.
 Committed default-heap resources are limited to
 typed RGBA8 and BGRA8 UNORM or UNORM_SRGB, and typed BC1/BC3 linear or sRGB
 sampled textures (including multiple mips); single-mip RGBA8/BGRA8 UNORM or

@@ -180,6 +180,8 @@ bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, ui
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic) BOOL hasStencil;
 @property(nonatomic) uint32_t stencilReference;
+@property(nonatomic) MTLCullMode cullMode;
+@property(nonatomic) BOOL frontCCW;
 @property(nonatomic, strong) id<MTLBuffer> readback;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *vertexBuffers;
 @property(nonatomic, strong) id<MTLBuffer> indices;
@@ -506,6 +508,12 @@ void victory_metal_stencil_reference(void *handle, uint32_t reference) {
     r.stencilReference = reference & 255;
 }
 
+void victory_metal_set_rasterizer(void *handle, uint32_t cull, bool front_ccw) {
+    VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+    r.cullMode = cull == 2 ? MTLCullModeFront : cull == 3 ? MTLCullModeBack : MTLCullModeNone;
+    r.frontCCW = front_ccw;
+}
+
 bool victory_metal_stencil_pixels(void *handle, uint8_t *pixels, bool upload, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
@@ -778,12 +786,10 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
         for (size_t i = 0; i < buffer_count; ++i)
             [render setVertexBuffer:r.vertexBuffers[@(buffers[i].slot)] offset:buffers[i].offset atIndex:6 + buffers[i].slot];
         if (r.depthState) [render setDepthStencilState:r.depthState];
-        if (r.hasStencil) {
-            // D3D's default clockwise front face is measured after its
-            // viewport Y flip; Metal's winding uses the opposite convention.
-            [render setFrontFacingWinding:MTLWindingCounterClockwise];
-            [render setStencilReferenceValue:r.stencilReference];
-        }
+        // Both APIs specify the winding as seen on the render target.
+        [render setFrontFacingWinding:r.frontCCW ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        [render setCullMode:r.cullMode];
+        if (r.hasStencil) [render setStencilReferenceValue:r.stencilReference];
         if (r.fragmentConstants) {
             [render setFragmentBuffer:r.fragmentArguments offset:0 atIndex:2];
             [render useResource:r.fragmentConstants usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
