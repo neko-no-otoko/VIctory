@@ -98,7 +98,7 @@ impl Drop for Handle {
 /// Loading the supplied dynamic library executes its initializers; callers must
 /// supply a trusted Apple Metal Shader Converter library.
 pub fn convert(library: &Path, dxil: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, stage, None, false, None, false).map(|(data, _, _)| data)
+    convert_impl(library, dxil, stage, None, false, None, false, false).map(|(data, _, _)| data)
 }
 
 /// Convert a vertex shader and obtain its authoritative Metal attribute indices.
@@ -107,7 +107,16 @@ pub fn convert_vertex_with_reflection(
     library: &Path,
     dxil: &[u8],
 ) -> Result<(Vec<u8>, Vec<VertexAttribute>), String> {
-    let (data, _, attributes) = convert_impl(library, dxil, Stage::Vertex, None, false, None, true)?;
+    let (data, _, attributes) = convert_impl(library, dxil, Stage::Vertex, None, false, None, true, false)?;
+    Ok((data, attributes.ok_or("missing vertex reflection")?))
+}
+
+/// Convert a vertex shader for point primitives and reflect its input layout.
+pub fn convert_point_vertex_with_reflection(
+    library: &Path,
+    dxil: &[u8],
+) -> Result<(Vec<u8>, Vec<VertexAttribute>), String> {
+    let (data, _, attributes) = convert_impl(library, dxil, Stage::Vertex, None, false, None, true, true)?;
     Ok((data, attributes.ok_or("missing vertex reflection")?))
 }
 
@@ -123,7 +132,7 @@ pub fn convert_fragment_with_b0(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false, None, false)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), false, None, false, false)
         .map(|(data, _, _)| data)
 }
 
@@ -137,7 +146,7 @@ pub fn convert_sampled_fragment(
     dxil: &[u8],
     expected_b0: bool,
 ) -> Result<Vec<u8>, String> {
-    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true, None, false)
+    convert_impl(library, dxil, Stage::Fragment, Some(expected_b0), true, None, false, false)
         .map(|(data, _, _)| data)
 }
 
@@ -154,7 +163,7 @@ pub fn convert_compute_with_root_cbv(
     if root_slot > 63 {
         return Err("root CBV slot must be in 0..64".into());
     }
-    let (data, offset, _) = convert_impl(library, dxil, Stage::Compute, None, false, Some(root_slot), false)?;
+    let (data, offset, _) = convert_impl(library, dxil, Stage::Compute, None, false, Some(root_slot), false, false)?;
     Ok((data, offset.ok_or("missing reflected root CBV")?))
 }
 
@@ -166,6 +175,7 @@ fn convert_impl(
     force_texture_array: bool,
     root_cbv: Option<u8>,
     reflect_vertex: bool,
+    point_topology: bool,
 ) -> Result<(Vec<u8>, Option<usize>, Option<Vec<VertexAttribute>>), String> {
     // SAFETY: the caller supplies the path to a trusted converter library.
     let lib = unsafe { libloading::Library::new(library) }
@@ -209,6 +219,12 @@ fn convert_impl(
         );
 
         let compiler = Handle::new(compiler_create(), compiler_destroy, "compiler")?;
+        if point_topology {
+            // IRInputTopologyPoint = 1. The converter requires this setting
+            // to generate a vertex shader suitable for point primitives.
+            let set_topology = api!("IRCompilerSetInputTopology", unsafe extern "C" fn(Pointer, c_int));
+            set_topology(compiler.ptr, 1);
+        }
         if force_texture_array {
             // IRCompatibilityFlagForceTextureArray (metal_irconverter.h): keep the
             // descriptor ABI stable across converter 2.x and 3.x.

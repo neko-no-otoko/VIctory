@@ -211,6 +211,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
     } else if !d.extra_targets.is_empty() || d.topology!=4 {
         let bytes=&rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?.bytes[view.start+first..view.start+end];
         let buffers=[victory_metal::VertexBuffer {slot:0,bytes}];
+        prepared.ensure_legacy_attributes()?;
         let attributes=prepared.legacy_attributes.clone();
         let mut outputs:Vec<&mut [u8]>=targets.iter_mut().map(Vec::as_mut_slice).collect();
         prepared.draw_inputs_mrt(width,height,&attributes,&buffers,index,d.topology,0,d.vertex_count,1,0,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut outputs,true)

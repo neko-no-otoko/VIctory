@@ -67,6 +67,9 @@ mod descriptor_address_tests {
 
 pub(crate) struct Prepared {
     pub(crate) vertex: Vec<u8>,
+    vertex_dxil: Vec<u8>,
+    point_vertex: Option<Vec<u8>>,
+    vertex_reflection: Option<Vec<victory_metal::converter::VertexAttribute>>,
     pub(crate) pixel: Vec<u8>,
     pub(crate) user_data: Vec<emit::UserData>,
     pub(crate) dwords: usize,
@@ -83,7 +86,7 @@ pub(crate) struct Prepared {
     color_targets: Vec<victory_metal::RenderTarget>,
     pub(crate) legacy_attributes: Vec<victory_metal::VertexAttribute>,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
-    input_renderer: Option<(u32, u32, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
+    input_renderer: Option<(u32, u32, bool, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
     renderer_texture: [Option<SampledTextureKey>; 16],
     input_renderer_texture: [Option<SampledTextureKey>; 16],
 }
@@ -229,6 +232,18 @@ mod sampled_texture_cache_tests {
 }
 
 
+fn legacy_vertex_attributes(reflected: &[victory_metal::converter::VertexAttribute], input_uv: bool) -> Result<Vec<victory_metal::VertexAttribute>, String> {
+    let names: &[(&str, u32, u32)] = if input_uv { &[("POSITION0", 2, 0), ("TEXCOORD0", 16, 16)] } else { &[("POSITION0", 2, 0)] };
+    if reflected.len() != names.len() { return Err("converter vertex reflection does not match input signature".into()); }
+    let mut attributes = Vec::with_capacity(names.len());
+    for &(name, format, offset) in names {
+        let a = reflected.iter().find(|a| a.name.eq_ignore_ascii_case(name)).ok_or("missing reflected vertex attribute")?;
+        let index = a.index.checked_add(11).filter(|&i| i < 31).ok_or("reflected vertex attribute exceeds Metal limits")?;
+        attributes.push(victory_metal::VertexAttribute { index: u32::from(index), format, slot: 0, offset, stride: if input_uv { 24 } else { 16 }, per_instance: false, step_rate: 0 });
+    }
+    Ok(attributes)
+}
+
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
         Self::new_mrt(vertex, pixel, graphics, &[])
@@ -242,26 +257,22 @@ impl Prepared {
         let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
         let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries) =
             validate(pixel, HwStage::Ps, &varying, false, None, count)?;
-        let (vertex, legacy_attributes) = if extra.is_empty() {
-            (convert(&vertex_host, HwStage::Vs, false)?, Vec::new())
+        let (vertex, reflected, legacy_attributes) = if extra.is_empty() {
+            (convert(&vertex_host, HwStage::Vs, false)?, None, Vec::new())
         } else {
             let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
             let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(std::path::Path::new(&path), &vertex_host.dxil)?;
-            let names: &[(&str, u32, u32)] = if graphics.input_uv { &[("POSITION0", 2, 0), ("TEXCOORD0", 16, 16)] } else { &[("POSITION0", 2, 0)] };
-            if reflected.len() != names.len() { return Err("converter vertex reflection does not match input signature".into()); }
-            let mut attributes = Vec::with_capacity(names.len());
-            for &(name, format, offset) in names {
-                let a = reflected.iter().find(|a| a.name.eq_ignore_ascii_case(name)).ok_or("missing reflected vertex attribute")?;
-                let index = a.index.checked_add(11).filter(|&i| i < 31).ok_or("reflected vertex attribute exceeds Metal limits")?;
-                attributes.push(victory_metal::VertexAttribute { index: u32::from(index), format, slot: 0, offset, stride: if graphics.input_uv { 24 } else { 16 }, per_instance: false, step_rate: 0 });
-            }
-            (vertex, attributes)
+            let attributes = legacy_vertex_attributes(&reflected, graphics.input_uv)?;
+            (vertex, Some(reflected), attributes)
         };
         let pixel = convert(&pixel_host, HwStage::Ps, !texture_slots.is_empty())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         let user_data = pixel_host.user_data;
         Ok(Self {
             vertex,
+            vertex_dxil: vertex_host.dxil,
+            point_vertex: None,
+            vertex_reflection: reflected,
             pixel,
             user_data,
             dwords,
@@ -324,7 +335,8 @@ impl Prepared {
         let pixel = convert(&pixel_host, HwStage::Ps, !texture_slots.is_empty())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         Ok((Self {
-            vertex, pixel, user_data: pixel_host.user_data, dwords,
+            vertex, vertex_dxil: vertex_host.dxil, point_vertex: None, vertex_reflection: Some(reflected),
+            pixel, user_data: pixel_host.user_data, dwords,
             texture_slot: texture_slots.first().copied(), sampler_slot: sampler_slots.first().copied(),
             texture_slots, sampler_slots,
             texture_entries, sampler_entries,
@@ -334,6 +346,18 @@ impl Prepared {
             legacy_attributes: Vec::new(),
             renderer_texture: [None; 16], input_renderer_texture: [None; 16],
         }, resolved))
+    }
+
+    pub(crate) fn ensure_legacy_attributes(&mut self) -> Result<(), String> {
+        if self.vertex_reflection.is_none() {
+            let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
+            let (_, reflected) = victory_metal::converter::convert_vertex_with_reflection(
+                std::path::Path::new(&path), &self.vertex_dxil,
+            )?;
+            self.legacy_attributes = legacy_vertex_attributes(&reflected, self.vertex_stride == 24)?;
+            self.vertex_reflection = Some(reflected);
+        }
+        Ok(())
     }
 
     pub(crate) fn draw(
@@ -478,17 +502,32 @@ impl Prepared {
                     && a.per_instance == b.per_instance && a.step_rate == b.step_rate
             })
         };
-        if !matches!(&self.input_renderer, Some((w, h, layout, _))
-            if *w == width && *h == height && matches_layout(layout))
+        let point = topology == 1;
+        if point && self.point_vertex.is_none() {
+            let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
+            let (vertex, reflected) = victory_metal::converter::convert_point_vertex_with_reflection(
+                std::path::Path::new(&path), &self.vertex_dxil,
+            )?;
+            let normal = self.vertex_reflection.as_ref().ok_or("missing vertex reflection")?;
+            if reflected.len() != normal.len() || reflected.iter().any(|a|
+                !normal.iter().any(|b| a.index == b.index && a.name.eq_ignore_ascii_case(&b.name)))
+            {
+                return Err("point vertex reflection does not match input layout".into());
+            }
+            self.point_vertex = Some(vertex);
+        }
+        if !matches!(&self.input_renderer, Some((w, h, cached_point, layout, _))
+            if *w == width && *h == height && *cached_point == point && matches_layout(layout))
         {
+            let vertex = if point { self.point_vertex.as_ref().unwrap() } else { &self.vertex };
             let renderer = victory_metal::Renderer::new_configured_mrt(
-                &self.vertex, "main", &self.pixel, "main", width, height,
+                vertex, "main", &self.pixel, "main", width, height,
                 self.dwords as u32, self.texture_slot.is_some(), self.depth, &self.color_targets, attributes,
             ).map_err(|e| e.to_string())?;
             self.input_renderer_texture = [None; 16];
-            self.input_renderer = Some((width, height, attributes.to_vec(), renderer));
+            self.input_renderer = Some((width, height, point, attributes.to_vec(), renderer));
         }
-        let renderer = &mut self.input_renderer.as_mut().unwrap().3;
+        let renderer = &mut self.input_renderer.as_mut().unwrap().4;
         renderer.set_viewport_scissor(viewport, scissor).map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref() {
             renderer.set_depth_pixels(pixels).map_err(|e| e.to_string())?;
