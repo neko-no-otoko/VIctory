@@ -2,11 +2,12 @@
 use std::collections::HashMap;
 use crate::metal_graphics::{GraphicsState, Prepared, ResolvedVertexInput, SampledTextureIdentity, Texture, Vertices};
 use crate::wine_transport::{block_geometry, mip_layout, texture_size, Batch, Command, CopyTexture, Draw, Pipeline, Resource, ResourceKind};
-use victory_metal::{BlendState, ColorFormat, DepthState, IndexData, TextureFilter, TextureFormat};
+use victory_metal::{BlendState, ColorFormat, DepthState, IndexData, SamplerAddress, TextureFilter, TextureFormat};
 use victory_shader::native::RootType;
 
 fn format(n:u32)->Result<ColorFormat,String> { match n {28=>Ok(ColorFormat::Rgba8),29=>Ok(ColorFormat::Rgba8Srgb),87=>Ok(ColorFormat::Bgra8),91=>Ok(ColorFormat::Bgra8Srgb),_=>Err("unsupported texture format".into())} }
 fn sampled_format(n:u32)->Result<TextureFormat,String> { match n {71=>Ok(TextureFormat::Bc1),72=>Ok(TextureFormat::Bc1Srgb),77=>Ok(TextureFormat::Bc3),78=>Ok(TextureFormat::Bc3Srgb),_=>Ok(TextureFormat::from(format(n)?))} }
+fn sampler_address(n:u32)->Result<SamplerAddress,String> {match n {1=>Ok(SamplerAddress::Wrap),2=>Ok(SamplerAddress::Mirror),3=>Ok(SamplerAddress::Clamp),_=>Err("unsupported sampler address mode".into())}}
 fn image(r:&Resource)->Result<(u32,u32,u32,TextureFormat),String> {
     let ResourceKind::Texture {width,height,format:fmt,mips}=r.kind else {return Err("expected texture".into())};
     let size=texture_size(fmt,width,height,mips).ok_or("invalid texture dimensions or mip count")?;
@@ -130,7 +131,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         || d.first_mip!=0 || d.mip_count!=0 || d.linear_filter)
     {return Err("mixed legacy and extended texture bindings".into())}
     let mut texture_bindings:Vec<_>=d.textures.iter().map(|t|(t.slot,t.offset,t.resource,t.first_mip,t.mip_count)).collect();
-    let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s|(s.slot,s.offset,s.linear_filter)).collect();
+    let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s|Ok((s.slot,s.offset,s.linear_filter,[sampler_address(s.address[0])?,sampler_address(s.address[1])?,sampler_address(s.address[2])?]))).collect::<Result<_,String>>()?;
     if !extended {
         if d.texture.is_none() && d.texture_slot.is_none() && d.sampler_slot.is_none()
             && (!prepared.texture_entries.is_empty() || !prepared.sampler_entries.is_empty())
@@ -142,7 +143,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         if let (Some(slot),Some(resource))=(d.texture_slot,d.texture) {
             texture_bindings.push((slot,0,resource,d.first_mip,d.mip_count));
         } else if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())}
-        if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,0,d.linear_filter));}
+        if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,0,d.linear_filter,[SamplerAddress::Clamp;3]));}
     }
     texture_bindings.sort_unstable_by_key(|t|(t.0,t.1));
     sampler_bindings.sort_unstable_by_key(|s|(s.0,s.1));
@@ -192,7 +193,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         sampled.push((Texture {width:view_width,height:view_height,levels:mip_count,pixels:&r.bytes[start..end_offset],filter:TextureFilter::Nearest,format:f,min_lod:0.,max_lod:0.},
             Some(SampledTextureIdentity {resource:id,generation:generations.get(&id).copied().unwrap_or(0),first_mip})));
     }
-    let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,_,linear)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},0.,0.)).collect();
+    let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,_,linear,address)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},0.,0.,address)).collect();
     let index=indices.as_ref().map(|v| (match v {Indices::U16(v)=>IndexData::U16(v),Indices::U32(v)=>IndexData::U32(v)},d.index.as_ref().unwrap().base_vertex));
     let result=if generic {
         let legacy_view=crate::wine_transport::VertexView {slot:0,buffer:d.vertex_buffer,offset:d.vertex_offset,size:d.vertex_size,stride:d.vertex_stride};
@@ -306,6 +307,15 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_address_modes_are_validated() {
+        assert!(matches!(sampler_address(1), Ok(SamplerAddress::Wrap)));
+        assert!(matches!(sampler_address(2), Ok(SamplerAddress::Mirror)));
+        assert!(matches!(sampler_address(3), Ok(SamplerAddress::Clamp)));
+        assert!(sampler_address(0).is_err());
+        assert!(sampler_address(4).is_err());
+    }
 
     #[test]
     fn writer_generations_follow_command_order_and_resource_identity() {

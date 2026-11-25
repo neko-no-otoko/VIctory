@@ -425,8 +425,9 @@ explicit RTV handle arrays are supported, and recorded descriptors are checked
 for mutation before execution. Independent blending and write masks apply per
 target when enabled; otherwise target zero's state is shared. Logic operations
 and unsupported blend factors remain rejected. The native depth comparison/write
-subset and multiple sampled textures with point or linear clamp samplers are
-also supported.
+subset and multiple sampled textures with point or linear samplers are supported.
+Sampler U, V and W addressing independently support wrap, mirror and clamp.
+Border addressing, comparison and anisotropic filtering remain unsupported.
 Pixel shaders may access multiple texture and sampler entries at statically
 traced table-relative indices, including nonzero indices and table bases.
 Guest shader-visible resource and sampler heaps hold up to 256 entries; per
@@ -435,9 +436,9 @@ Each Metal direct heap is limited to 16 entries including gaps reserved by stati
 indices. Draws retain the snapshotted resources and reject descriptors changed
 before execution, including unused populated entries in the snapshot.
 Dynamic indexing, unaligned accesses, nonzero metadata table offsets, base
-registers, lower bounds or strides, and comparison or non-clamp samplers
-remain unsupported. The decoded console metadata does not expose register
-spaces, so no additional register-space mapping is claimed.
+registers, lower bounds or strides remain unsupported. The decoded console
+metadata does not expose register spaces, so no additional register-space
+mapping is claimed.
 The converter's directly indexed heaps use its
 [documented descriptor-table encoding](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
 Color SRV and RTV views must match the resource's typed format exactly;

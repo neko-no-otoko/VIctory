@@ -152,7 +152,8 @@ unsafe extern "C" {
     ) -> bool;
     fn victory_metal_set_sampler_at(
         renderer: *mut c_void, index: u32, linear_filter: bool, min_lod: f32,
-        max_lod: f32, error: *mut c_char, error_len: usize,
+        max_lod: f32, address_u: u32, address_v: u32, address_w: u32,
+        error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_clear(
         width: u32,
@@ -380,11 +381,20 @@ pub struct Renderer {
     scissor: [u32; 4],
 }
 
-/// Texture filtering; address mode is clamp-to-edge.
+/// Texture filtering.
 #[derive(Clone, Copy)]
 pub enum TextureFilter {
     Nearest,
     Linear,
+}
+
+/// Texture addressing for the U, V and W axes.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplerAddress {
+    Wrap = 1,
+    Mirror = 2,
+    Clamp = 3,
 }
 
 /// Indices for a draw.
@@ -783,6 +793,14 @@ impl Renderer {
     pub fn set_fragment_sampler_at(
         &mut self, index: u32, filter: TextureFilter, min_lod: f32, max_lod: f32,
     ) -> Result<(), RenderError> {
+        self.set_sampler_addressed(index, filter, min_lod, max_lod, [SamplerAddress::Clamp; 3])
+    }
+
+    /// Set a direct sampler heap index with independent U, V and W addressing.
+    pub fn set_sampler_addressed(
+        &mut self, index: u32, filter: TextureFilter, min_lod: f32, max_lod: f32,
+        address: [SamplerAddress; 3],
+    ) -> Result<(), RenderError> {
         if !self.fragment_texture || index >= 16 || !min_lod.is_finite()
             || !max_lod.is_finite() || min_lod < 0.0 || min_lod > max_lod
         {
@@ -793,7 +811,8 @@ impl Renderer {
         let ok = unsafe {
             victory_metal_set_sampler_at(
                 self.handle.as_ptr(), index, matches!(filter, TextureFilter::Linear),
-                min_lod, max_lod, error.as_mut_ptr(), error.len(),
+                min_lod, max_lod, address[0] as u32, address[1] as u32,
+                address[2] as u32, error.as_mut_ptr(), error.len(),
             )
         };
         if ok {

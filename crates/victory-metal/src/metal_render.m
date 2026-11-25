@@ -666,25 +666,41 @@ bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, 
     }
 }
 
+static MTLSamplerAddressMode samplerAddressMode(uint32_t address) {
+    switch (address) {
+        case 1: return MTLSamplerAddressModeRepeat;
+        case 2: return MTLSamplerAddressModeMirrorRepeat;
+        default: return MTLSamplerAddressModeClampToEdge;
+    }
+}
+
 bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
-                                  float min_lod, float max_lod, char *error, size_t error_len) {
+                                  float min_lod, float max_lod, uint32_t address_u,
+                                  uint32_t address_v, uint32_t address_w, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         if (!r.textureEnabled || index >= 16) return fail(error, error_len, @"invalid sampler binding");
+        if (address_u < 1 || address_u > 3 || address_v < 1 || address_v > 3 ||
+            address_w < 1 || address_w > 3) return fail(error, error_len, @"invalid sampler address mode");
+        MTLSamplerAddressMode u = samplerAddressMode(address_u);
+        MTLSamplerAddressMode v = samplerAddressMode(address_v);
+        MTLSamplerAddressMode w = samplerAddressMode(address_w);
         NSNumber *key = @(index);
         id<MTLSamplerState> sampler = r.samplers[key];
         MTLSamplerDescriptor *old = r.samplerDescriptors[key];
         MTLSamplerMinMagFilter filter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-        if (!sampler || old.minFilter != filter || old.lodMinClamp != min_lod || old.lodMaxClamp != max_lod) {
+        if (!sampler || old.minFilter != filter || old.lodMinClamp != min_lod || old.lodMaxClamp != max_lod ||
+            old.sAddressMode != u || old.tAddressMode != v || old.rAddressMode != w) {
             MTLSamplerDescriptor *desc = [MTLSamplerDescriptor new];
             desc.minFilter = filter;
             desc.magFilter = filter;
             desc.mipFilter = linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
             desc.lodMinClamp = min_lod;
             desc.lodMaxClamp = max_lod;
-            desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-            desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            desc.sAddressMode = u;
+            desc.tAddressMode = v;
+            desc.rAddressMode = w;
             desc.supportArgumentBuffers = YES;
             sampler = [r.device newSamplerStateWithDescriptor:desc];
             if (!sampler) return fail(error, error_len, @"sampler allocation failed");

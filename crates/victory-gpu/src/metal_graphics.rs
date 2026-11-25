@@ -378,7 +378,7 @@ impl Prepared {
             return Err("native graphics supports only descriptor index zero".into());
         }
         let identity = None;
-        let sampler = texture.as_ref().map(|t| (t.filter, t.min_lod, t.max_lod));
+        let sampler = texture.as_ref().map(|t| (t.filter, t.min_lod, t.max_lod, [victory_metal::SamplerAddress::Clamp; 3]));
         let textures = texture.map(|t| (t, identity));
         self.draw_multi(width, height, vertices, indices, viewport, scissor, depth, stencil,
             stencil_reference, constants, textures.as_slice(), sampler.as_slice(), pixels)
@@ -397,7 +397,7 @@ impl Prepared {
         stencil_reference: u32,
         constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32)],
+        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])],
         pixels: &mut [u8],
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
@@ -437,8 +437,8 @@ impl Prepared {
             let index = entry.heap_index as usize;
             upload_sampled_texture(renderer, entry.heap_index, texture, *identity, &mut self.renderer_texture[index])?;
         }
-        for (&(filter, min_lod, max_lod), entry) in samplers.iter().zip(&self.sampler_entries) {
-            renderer.set_fragment_sampler_at(entry.heap_index, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
+        for (&(filter, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
+            renderer.set_sampler_addressed(entry.heap_index, filter, min_lod, max_lod, address).map_err(|e| e.to_string())?;
         }
         match (vertices, indices) {
             (Vertices::Position(v), Some((indices, base))) => renderer.draw_indexed_preserving(v, indices, base, constants, pixels),
@@ -473,7 +473,7 @@ impl Prepared {
         stencil_reference: u32,
         constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32)],
+        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])],
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
@@ -489,7 +489,7 @@ impl Prepared {
         viewport: [f64; 6], scissor: [u32; 4], mut depth: Option<&mut [f32]>,
         mut stencil: Option<&mut [u8]>, stencil_reference: u32, constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
-        samplers: &[(victory_metal::TextureFilter, f32, f32)], pixels: &mut [&mut [u8]], preserve: bool,
+        samplers: &[(victory_metal::TextureFilter, f32, f32, [victory_metal::SamplerAddress; 3])], pixels: &mut [&mut [u8]], preserve: bool,
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
@@ -547,8 +547,8 @@ impl Prepared {
             let index = entry.heap_index as usize;
             upload_sampled_texture(renderer, entry.heap_index, texture, *identity, &mut self.input_renderer_texture[index])?;
         }
-        for (&(filter, min_lod, max_lod), entry) in samplers.iter().zip(&self.sampler_entries) {
-            renderer.set_fragment_sampler_at(entry.heap_index, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
+        for (&(filter, min_lod, max_lod, address), entry) in samplers.iter().zip(&self.sampler_entries) {
+            renderer.set_sampler_addressed(entry.heap_index, filter, min_lod, max_lod, address).map_err(|e| e.to_string())?;
         }
         renderer.draw_buffers_mrt_topology(
             buffers, indices, first_vertex, vertex_count, instance_count, start_instance, topology,
