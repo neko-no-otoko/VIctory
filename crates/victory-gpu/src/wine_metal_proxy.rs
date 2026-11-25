@@ -181,7 +181,7 @@ struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
 type SamplerHeap = Arc<Mutex<Vec<Option<Arc<bool>>>>>;
-struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
+struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend, topology_type:u32 }
 type RtvSlot = Arc<Mutex<(Option<Arc<Texture>>, u64)>>;
 type Rtv = (RtvSlot, Arc<Texture>, u64);
 #[derive(Clone)]
@@ -231,7 +231,7 @@ struct GraphicsState {
     targets: Vec<Rtv>,
     depth: Option<Rtv>,
     stencil_ref: u32,
-    viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: bool,
+    viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: Option<u32>,
     vertices: [Option<(Arc<Buffer>, usize, u32, u32)>; 16], constants: Vec<Option<u32>>,
     index: Option<(Arc<Buffer>, usize, u32, u32)>,
     heaps: Vec<usize>, textures: Vec<(u32, TextureHeap, usize)>,
@@ -1443,6 +1443,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let mut depth_format = 0;
     let mut color_formats = Vec::new();
     let mut blend_offset = None;
+    let mut topology_type=0;
     while at < b.len() {
         if b.len() - at < 8 { return E_INVALIDARG; }
         let kind = u32::from_ne_bytes(b[at..at+4].try_into().unwrap());
@@ -1477,7 +1478,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
                 stencil_state = Some(s);
             }
             13 => if word(4) != 0 { return E_INVALIDARG; },
-            14 => if word(4) != 3 { return E_INVALIDARG; },
+            14 => {topology_type=word(4); if !(1..=3).contains(&topology_type) {return E_INVALIDARG;}},
             15 => {
                 let count=word(36) as usize;
                 if !(1..=8).contains(&count) {return E_INVALIDARG;}
@@ -1544,7 +1545,7 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
         && (inputs.len()==1 || (inputs.len()==2 && inputs[1].semantic.eq_ignore_ascii_case("TEXCOORD")
             && inputs[1].semantic_index==0 && inputs[1].format==16 && inputs[1].slot==0
             && inputs[1].offset==16 && !inputs[1].per_instance));
-    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, extra_targets, inputs, legacy, depth, blend };
+    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, extra_targets, inputs, legacy, depth, blend, topology_type };
     new(Data::GraphicsPipeline(Arc::new(p)), &PIPELINE_TABLE, iid, PIPELINE, out)
 }
 extern "system" fn gpu_address(this: This) -> u64 {
@@ -1635,7 +1636,7 @@ extern "system" fn set_stencil_ref(this: This, value: u32) {
 }
 extern "system" fn topology(this: This, value: u32) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
-    if value != 4 { l.invalid = true; } else { l.graphics.topology = true; }
+    if !(1..=5).contains(&value) { l.invalid = true; } else { l.graphics.topology = Some(value); }
 }
 extern "system" fn viewport(this: This, n: u32, p: *const [f32; 6]) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1701,8 +1702,8 @@ extern "system" fn draw_indexed(this: This, count: u32, instances: u32, first: u
 }
 fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32, base: Option<i32>) {
     let l = graphics_list(this); let mut l = l.lock().unwrap(); let g = &mut l.graphics;
-    let (Some(desc), Some(pipeline), Some(viewport), Some(scissor), Some(constants)) =
-        (g.targets.first().cloned(), g.pipeline.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>())
+    let (Some(desc), Some(pipeline), Some(viewport), Some(scissor), Some(constants), Some(topology)) =
+        (g.targets.first().cloned(), g.pipeline.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>(),g.topology)
         else { l.invalid = true; return; };
     let index = if let Some(base_vertex) = base {
         let Some((b, offset, size, format)) = g.index.clone() else { l.invalid = true; return; };
@@ -1712,7 +1713,8 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
     } else { None };
     if g.targets.len()!=pipeline.extra_targets.len()+1 || desc.1.format != pipeline.format
         || g.targets.iter().skip(1).zip(&pipeline.extra_targets).any(|(d,p)|d.1.format!=p.format || d.1.width!=desc.1.width || d.1.height!=desc.1.height)
-        || !g.topology || count == 0 || instances == 0
+        || pipeline.topology_type != match topology {1=>1,2|3=>2,4|5=>3,_=>0}
+        || match topology {1=>count==0,2=>count==0 || count%2!=0,3=>count<2,4=>count==0 || count%3!=0,5=>count<3,_=>true} || instances == 0
         || !viewport.iter().all(|v| v.is_finite()) || viewport[2] <= 0.0 || viewport[3] <= 0.0
         || scissor[0] < 0 || scissor[1] < 0 || scissor[2] <= scissor[0] || scissor[3] <= scissor[1] {
         l.invalid = true; return;
@@ -1769,7 +1771,7 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
     let command = Command::Draw(Draw { target: target.id, extra_targets:g.targets.iter().skip(1).map(|v|v.1.id).collect(), pipeline: pipeline.id,
         vertex_buffer: first_view.buffer, vertex_offset: first_view.offset, vertex_size: first_view.size, vertex_stride: first_view.stride,
         vertex_count: count, instance_count: instances, first_vertex: if index.is_some() { 0 } else { first }, first_instance: instance,
-        viewport, scissor, topology: 4, constants, texture: texture.map(|v| v.4.texture.id),
+        viewport, scissor, topology, constants, texture: texture.map(|v| v.4.texture.id),
         first_mip: texture.map_or(0, |v| v.4.first_mip),
         mip_count: texture.map_or(0, |v| v.4.mip_count),
         index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: sampler.is_some_and(|v| *v.4),

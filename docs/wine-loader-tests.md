@@ -397,9 +397,16 @@ work remains serialized and synchronous; an unsatisfied queue fence wait can
 defer subsequent operations without blocking the calling thread.
 
 The supported subset includes multiple full color/depth clears, buffer copies,
-full texture uploads and readbacks, resource transitions, and multiple
-nonindexed or 16-/32-bit indexed triangle-list draws with viewport/scissor
-and pipeline changes. Committed default-heap resources are limited to
+full texture uploads and readbacks, resource transitions, and nonindexed or
+16-/32-bit indexed point lists, line lists and strips, triangle lists and
+strips with viewport/scissor and pipeline changes. Pipeline primitive type must
+match the draw topology. Lists require complete primitives, and strips require
+at least two line or three triangle vertices. Strip-cut pipeline state and
+indexed strip restart values (0xffff or 0xffffffff) are rejected, not emulated.
+Point draws use a separately converted vertex shader with the converter's
+[point input topology](https://github.com/MethanePowered/MetalShaderConverterBinary/blob/main/include/metal_irconverter/metal_irconverter.h),
+which supplies Metal's required point-size behavior.
+Committed default-heap resources are limited to
 typed RGBA8 and BGRA8 UNORM or UNORM_SRGB, and typed BC1/BC3 linear or sRGB
 sampled textures (including multiple mips); single-mip RGBA8/BGRA8 UNORM or
 UNORM_SRGB color targets; single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT
