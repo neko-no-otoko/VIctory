@@ -113,7 +113,7 @@ unsafe extern "C" {
     fn victory_metal_draw_buffers_mrt(
         renderer: *mut c_void, buffers: *const NativeVertexBuffer, buffer_count: usize,
         indices: *const c_void, index_count: u32, index_size: u32, base_vertex: i32,
-        first_vertex: u32, vertex_count: u32, instance_count: u32,
+        first_vertex: u32, vertex_count: u32, instance_count: u32, topology: u32,
         constants: *const u32, pixels: *const *mut u8, pixel_count: usize, preserve: bool,
         viewport: *const f64, scissor: *const u32,
         error: *mut c_char,
@@ -386,7 +386,7 @@ pub enum TextureFilter {
     Linear,
 }
 
-/// Indices for a triangle-list draw.
+/// Indices for a draw.
 pub enum IndexData<'a> {
     U16(&'a [u16]),
     U32(&'a [u32]),
@@ -971,6 +971,20 @@ impl Renderer {
         first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
         constants: &[u32], pixels: &mut [&mut [u8]], preserve: bool,
     ) -> Result<(), RenderError> {
+        self.draw_buffers_mrt_topology(buffers, indices, first_vertex, vertex_count, instance_count,
+                                       start_instance, 4, constants, pixels, preserve)
+    }
+
+    /// Draw with a D3D primitive topology (1 through 5) to all color attachments.
+    /// Indexed line and triangle strips reject primitive restart indices.
+    pub fn draw_buffers_mrt_topology(
+        &mut self, buffers: &[VertexBuffer<'_>], indices: Option<(IndexData<'_>, i32)>,
+        first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
+        topology: u32, constants: &[u32], pixels: &mut [&mut [u8]], preserve: bool,
+    ) -> Result<(), RenderError> {
+        if !(1..=5).contains(&topology) {
+            return Err(RenderError("unsupported primitive topology".into()));
+        }
         let layout = self.attributes.as_ref()
             .ok_or_else(|| RenderError("draw_buffers requires a custom vertex layout".into()))?;
         if pixels.len() != self.target_count || pixels.iter().any(|p| p.len() != self.pixel_len)
@@ -1008,12 +1022,22 @@ impl Renderer {
             let (ptr, size) = match data {
                 IndexData::U16(data) => {
                     let data = data.get(..count).ok_or_else(|| RenderError("index buffer too short".into()))?;
-                    for &index in data { check(u32::from(index))?; }
+                    for &index in data {
+                        if (topology == 3 || topology == 5) && index == u16::MAX {
+                            return Err(RenderError("indexed strip restart is unsupported".into()));
+                        }
+                        check(u32::from(index))?;
+                    }
                     (data.as_ptr().cast::<c_void>(), 2)
                 }
                 IndexData::U32(data) => {
                     let data = data.get(..count).ok_or_else(|| RenderError("index buffer too short".into()))?;
-                    for &index in data { check(index)?; }
+                    for &index in data {
+                        if (topology == 3 || topology == 5) && index == u32::MAX {
+                            return Err(RenderError("indexed strip restart is unsupported".into()));
+                        }
+                        check(index)?;
+                    }
                     (data.as_ptr().cast::<c_void>(), 4)
                 }
             };
@@ -1069,7 +1093,7 @@ impl Renderer {
         let ok = unsafe {
             victory_metal_draw_buffers_mrt(self.handle.as_ptr(), native.as_ptr(), count,
                 index_ptr, if index_size == 0 { 0 } else { vertex_count }, index_size,
-                base_vertex, first_vertex, vertex_count, instance_count, constants.as_ptr(),
+                base_vertex, first_vertex, vertex_count, instance_count, topology, constants.as_ptr(),
                 pixel_ptrs.as_ptr(), pixels.len(), preserve, self.viewport.as_ptr(), self.scissor.as_ptr(),
                 error.as_mut_ptr(), error.len())
         };

@@ -691,11 +691,20 @@ bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
 
 static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
                  const void *indices, uint32_t index_count, uint32_t index_size,
-                 int32_t base_vertex, uint32_t first_vertex, uint32_t count, uint32_t instance_count,
+                 int32_t base_vertex, uint32_t first_vertex, uint32_t count, uint32_t instance_count, uint32_t topology,
                  const uint32_t *constants, uint8_t *const *pixels, size_t pixel_count, bool preserve,
                  const double *viewport, const uint32_t *scissor, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
+        MTLPrimitiveType primitive;
+        switch (topology) {
+            case 1: primitive = MTLPrimitiveTypePoint; break;
+            case 2: primitive = MTLPrimitiveTypeLine; break;
+            case 3: primitive = MTLPrimitiveTypeLineStrip; break;
+            case 4: primitive = MTLPrimitiveTypeTriangle; break;
+            case 5: primitive = MTLPrimitiveTypeTriangleStrip; break;
+            default: return fail(error, error_len, @"unsupported primitive topology");
+        }
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
         if (!pixels || pixel_count != r.colorTextures.count)
             return fail(error, error_len, @"color target count mismatch");
@@ -788,7 +797,7 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
                 [render useResource:texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
         if (rasterize && indices) {
-            [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+            [render drawIndexedPrimitives:primitive
                                indexCount:index_count
                                 indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                               indexBuffer:r.indices
@@ -797,7 +806,7 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
                                baseVertex:(NSInteger)base_vertex
                              baseInstance:0];
         } else if (rasterize) {
-            [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:first_vertex vertexCount:count
+            [render drawPrimitives:primitive vertexStart:first_vertex vertexCount:count
                     instanceCount:instance_count baseInstance:0];
         }
         [render endEncoding];
@@ -828,7 +837,7 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
     if (r.vertexStride && count > SIZE_MAX / r.vertexStride)
         return fail(error, error_len, @"vertex buffer size overflow");
     VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)count * r.vertexStride, 0 };
-    return draw(handle, &buffer, 1, NULL, 0, 0, 0, 0, count, 1, constants, &pixels, 1,
+    return draw(handle, &buffer, 1, NULL, 0, 0, 0, 0, count, 1, 4, constants, &pixels, 1,
                 preserve, viewport, scissor, error, error_len);
 }
 
@@ -841,7 +850,7 @@ bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t ve
     if (r.vertexStride && vertex_count > SIZE_MAX / r.vertexStride)
         return fail(error, error_len, @"vertex buffer size overflow");
     VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)vertex_count * r.vertexStride, 0 };
-    return draw(handle, &buffer, 1, indices, index_count, index_size, base_vertex, 0, vertex_count, 1,
+    return draw(handle, &buffer, 1, indices, index_count, index_size, base_vertex, 0, vertex_count, 1, 4,
                 constants, &pixels, 1, true, viewport, scissor, error, error_len);
 }
 
@@ -849,12 +858,12 @@ bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t ve
 bool victory_metal_draw_buffers_mrt(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
                                     const void *indices, uint32_t index_count, uint32_t index_size,
                                     int32_t base_vertex, uint32_t first_vertex, uint32_t vertex_count,
-                                    uint32_t instance_count, const uint32_t *constants,
+                                    uint32_t instance_count, uint32_t topology, const uint32_t *constants,
                                     uint8_t *const *pixels, size_t pixel_count, bool preserve,
                                     const double *viewport, const uint32_t *scissor,
                                     char *error, size_t error_len) {
     return draw(handle, buffers, buffer_count, indices, index_count, index_size, base_vertex,
-                first_vertex, vertex_count, instance_count, constants, pixels, pixel_count, preserve,
+                first_vertex, vertex_count, instance_count, topology, constants, pixels, pixel_count, preserve,
                 viewport, scissor, error, error_len);
 }
 
