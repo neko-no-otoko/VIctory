@@ -322,9 +322,10 @@ fn lock_save_root(path: &Path) -> Result<(PathBuf, File)> {
     }
     Ok((path, lock))
 }
-fn wine_overrides(gameinput: bool) -> Result<OsString> {
+fn wine_overrides(gameinput: bool, chad: bool) -> Result<OsString> {
     let owned = [b"d3d12_xs".as_slice(), b"xg_xs", b"xgameruntime", b"xmem", b"acphal", b"xapu"];
     let mut result = OsString::from("d3d12_xs,xg_xs,xgameruntime,xmem,acphal,xapu=n");
+    if chad { result.push(";chad=n"); }
     if gameinput {
         result.push(";gameinput=n");
     }
@@ -340,7 +341,8 @@ fn wine_overrides(gameinput: bool) -> Result<OsString> {
                     &basename[..basename.len()-4]
                 } else { basename };
                 if owned.iter().any(|item| base.eq_ignore_ascii_case(item))
-                    || (gameinput && base.eq_ignore_ascii_case(b"gameinput")) {
+                    || (gameinput && base.eq_ignore_ascii_case(b"gameinput"))
+                    || (chad && base.eq_ignore_ascii_case(b"chad")) {
                     let mode = entry[eq+1..].trim_ascii();
                     if !mode.eq_ignore_ascii_case(b"n") && !mode.eq_ignore_ascii_case(b"native") {
                         bail!("conflicting WINEDLLOVERRIDES setting for {}", String::from_utf8_lossy(name));
@@ -358,15 +360,15 @@ fn wine_overrides(gameinput: bool) -> Result<OsString> {
 
 // These are snapshot checks only: Wine performs its own later opens and also
 // supports activation contexts, registry overrides and guest-directed loads.
-fn reject_shadow_dlls(dir: &Path, selected: &[PathBuf]) -> Result<()> {
+fn reject_shadow_dlls(dir: &Path, selected: &[(&str, PathBuf)]) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("reading DLL search directory {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("reading DLL search directory {}", dir.display()))?;
-        if let Some(index) = PROVIDERS.iter().copied().chain(std::iter::once(XMEM_BACKEND))
-            .position(|name| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
+        if let Some((_, expected)) = selected.iter()
+            .find(|(name, _)| entry.file_name().as_bytes().eq_ignore_ascii_case(name.as_bytes())) {
             let resolved = fs::canonicalize(entry.path())
                 .with_context(|| format!("resolving possible provider DLL conflict {}", entry.path().display()))?;
-            if resolved != selected[index] {
+            if resolved != *expected {
                 bail!("provider DLL conflict in Wine search directory: {}", entry.path().display());
             }
         }
@@ -399,9 +401,14 @@ fn windows_child_directory(parent: &Path, name: &str) -> Result<Option<PathBuf>>
     Ok(found)
 }
 
-fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path) -> Result<()> {
-    let selected: Vec<_> = PROVIDERS.iter().copied().chain(std::iter::once(XMEM_BACKEND))
-        .map(|name| regular_file(&dll_dir.join(name), name)).collect::<Result<_>>()?;
+fn reject_known_shadows(exe: &Path, dll_dir: &Path, prefix: &Path, chad: bool) -> Result<()> {
+    if crate::wine_imports::chad_present(dll_dir)? != chad {
+        bail!("optional chad.dll provider changed during launch");
+    }
+    let mut names: Vec<_> = PROVIDERS.iter().copied().chain(std::iter::once(XMEM_BACKEND)).collect();
+    if chad { names.push(crate::wine_imports::CHAD); }
+    let selected: Vec<_> = names.into_iter()
+        .map(|name| regular_file(&dll_dir.join(name), name).map(|path| (name, path))).collect::<Result<_>>()?;
     reject_shadow_dlls(dll_dir, &selected)?;
     reject_shadow_dlls(exe.parent().context("guest executable has no parent directory")?, &selected)?;
     reject_shadow_dlls(&std::env::current_dir().context("reading current directory")?, &selected)?;
@@ -607,9 +614,10 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
         let (save, _) = save_root.as_ref().context("storage drive requires a save root")?;
         Some(checked_storage_drive(&wine_prefix, save, letter)?)
     } else { None };
-    reject_known_shadows(&exe, &dll_dir, &wine_prefix)?;
+    let chad = crate::wine_imports::chad_present(&dll_dir)?;
+    reject_known_shadows(&exe, &dll_dir, &wine_prefix, chad)?;
     crate::wine_imports::run(&exe, &dll_dir, provision_gameinput, guest_dll)?;
-    let overrides = wine_overrides(provision_gameinput)?;
+    let overrides = wine_overrides(provision_gameinput, chad)?;
     if !allow_unverified_dll_search {
         bail!("Wine cannot guarantee exact provider DLL identity; use --allow-unverified-dll-search only with a trusted, stable guest, prefix and search paths");
     }
@@ -728,7 +736,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
                 // requested Windows path so GetModuleFileName preserves it.
                 launch_path = OsString::from(&request.exe);
             }
-            reject_known_shadows(&current_exe, &dll_dir, &wine_prefix)?;
+            reject_known_shadows(&current_exe, &dll_dir, &wine_prefix, chad)?;
             crate::wine_imports::run(&current_exe, &dll_dir, provision_gameinput, guest_dll)?;
             if let Some(root) = &title_root { checked_title_root(&wine_prefix, root)?; }
             if let (Some(letter), Some((save, _))) = (storage_drive, &save_root) {

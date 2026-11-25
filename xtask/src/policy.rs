@@ -72,6 +72,8 @@ const ALLOWED_SOURCE_PATHS: &[&str] = &[
     "tests/fixtures/windows_d3d12x_uv_shaders.h",
     "tests/fixtures/wine_acphal.c",
     "tests/fixtures/wine_acphal_pin.c",
+    "tests/fixtures/wine_chad.c",
+    "tests/fixtures/wine_chad_pin.c",
     "tests/fixtures/wine_gameinput.c",
     "tests/fixtures/wine_gameinput_pin.c",
     "tests/fixtures/wine_launcher_bc.c",

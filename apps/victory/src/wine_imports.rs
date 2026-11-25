@@ -19,10 +19,22 @@ const BACKEND_EXPORTS: [&str; 14] = [
     "XMemVirtualQuery", "XMemGetWorkingSetStatistics", "XMemTransferMemory",
     "VIctoryXMemMapAlias",
 ];
-// These console-only providers appear in victory-hle's module registry but
-// have no corresponding Wine HLE DLL in this build (modules/dsp.rs and
-// modules/dstorage.rs respectively). Do not infer providers from a prefix.
-const UNSUPPORTED: [&str; 2] = ["chad.dll", "xcrdapi.dll"];
+pub(crate) const CHAD: &str = "chad.dll";
+const CHAD_EXPORTS: [&str; 5] = [
+    "XDspConnectWithMaximumStreamLimit", "XDspDisconnect", "XDspActivate",
+    "XDspDeactivate", "XDspSubmitCommand",
+];
+// DirectStorage has no corresponding Wine HLE DLL.
+const UNSUPPORTED: [&str; 1] = ["xcrdapi.dll"];
+
+/// CHAD is optional until installed or explicitly imported.
+pub(crate) fn chad_present(dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(dir.join(CHAD)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context("examining optional chad.dll provider"),
+    }
+}
 
 fn image(path: &Path, dll: bool) -> Result<(ImageInfo, usize)> {
     if !fs::metadata(path).with_context(|| format!("examining PE {}", path.display()))?.is_file() {
@@ -113,6 +125,17 @@ pub(crate) fn run(exe: &Path, dll_dir: &Path, gameinput: bool, required_guest: &
             providers.insert(name, provider);
         }
     }
+    let chad = chad_present(dll_dir)?;
+    if chad {
+        if let Some((provider, len)) = load_provider(dll_dir, CHAD, &mut errors) {
+            for name in CHAD_EXPORTS {
+                if let Some(error) = export_error(&provider, len, name) {
+                    errors.push(format!("provider {CHAD}: {error}"));
+                }
+            }
+            providers.insert(CHAD, (provider, len));
+        }
+    }
     if let Some((backend, len)) = load_provider(dll_dir, BACKEND, &mut errors) {
         for name in BACKEND_EXPORTS {
             if let Some(error) = export_error(&backend, len, name) {
@@ -176,7 +199,7 @@ pub(crate) fn run(exe: &Path, dll_dir: &Path, gameinput: bool, required_guest: &
         for (kind, modules) in [("ordinary", &info.imports), ("delay", &info.delay_imports)] {
             for module in modules {
                 let key = module.dll.to_ascii_lowercase();
-                let provider = PROVIDERS.contains(&key.as_str()) || key == "gameinput.dll";
+                let provider = PROVIDERS.contains(&key.as_str()) || key == "gameinput.dll" || key == CHAD;
                 let unsupported = UNSUPPORTED.contains(&key.as_str());
                 let safe = safe_basename(&module.dll);
                 if safe && ambiguous.contains(&key) && reported_ambiguities.insert(key.clone()) {
@@ -207,7 +230,9 @@ pub(crate) fn run(exe: &Path, dll_dir: &Path, gameinput: bool, required_guest: &
                     } else if unsupported {
                         report.push(format!("{context}: no VIctory Wine provider; guest candidate selection and ABI are unverified"));
                     } else if provider {
-                        if key == "gameinput.dll" && !gameinput {
+                        if key == CHAD && !chad {
+                            errors.push(format!("{context}: optional chad.dll provider is not installed in {}", dll_dir.display()));
+                        } else if key == "gameinput.dll" && !gameinput {
                             errors.push(format!("{context}: GameInput requires --provision-gameinput"));
                         } else if let Some(entry) = module.entries.get(index) {
                             match &entry.symbol {

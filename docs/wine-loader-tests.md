@@ -1005,7 +1005,8 @@ launches a trusted PE as a normal Wine process and starts a separate native
 Metal host. Supply the Wine executable, `winepath`, Metal host, Apple
 converter, Wine prefix and HLE DLL directory explicitly. The directory must
 contain `d3d12_xs.dll`, `xg_xs.dll`, `xgameruntime.dll`, `xmem.dll`,
-`acphal.dll`, `xapu.dll` and the private `victory_xmem_backend.dll`. For example:
+`acphal.dll`, `xapu.dll` and the private `victory_xmem_backend.dll`. An
+optional `chad.dll` enables the upstream DSP provider. For example:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/victory-launcher-target
@@ -1058,8 +1059,11 @@ It parses the executable and reachable guest DLL candidates beside it,
 following ordinary and delay imports with ASCII case-insensitive DLL names and
 handling cycles. It checks imports of the six selected providers against their
 named exports; unsupported symbols and ordinals fail before launch.
-`chad.dll` and `xcrdapi.dll` are reported as having no VIctory Wine provider,
-without assuming Wine cannot resolve them. Use `--provision-gameinput` when
+If `chad.dll` is installed in the provider directory, its five named exports
+are checked and it is selected as a native Wine override. An explicit ordinary
+or delay import of `chad.dll` fails preflight when the provider is absent.
+Other launches do not require it. `xcrdapi.dll` has no VIctory Wine provider,
+without assuming Wine cannot resolve it. Use `--provision-gameinput` when
 the separate GameInput provider will be used. The optional repeatable
 `--guest-dll` declares a DLL that must exist beside the executable; a declared
 DLL that is missing or case-ambiguous is an error. The same options are
@@ -1486,3 +1490,32 @@ command and result queues, and decoded a 20 ms Opus silence packet into 960
 float PCM frames. Another guest verified module pinning after `FreeLibrary`;
 unsupported names and ordinals, provider collisions and override conflicts
 were rejected. The upstream Windows XApu decoding regression also passed.
+
+## Optional Wine CHAD DSP provider
+
+Build `victory-chad-dll` for `x86_64-pc-windows-gnullvm` and place its
+`chad.dll` beside the other VIctory providers to enable it. The launcher
+checks its named exports, rejects known search-path collisions and conflicting
+overrides, and repeats checks for relaunches. Dynamic guest loads cannot be
+discovered by static import preflight; install the provider explicitly for
+those. Wine's DLL selection remains unpinned and the checks are snapshots.
+
+The five named exports forward to the upstream DSP connection, stream,
+command-ticket and status implementation. The provider pins itself so live
+handles cannot outlive the module. Disconnect only after deactivating all
+streams, and deactivate each stream once: the upstream HLE trusts handle
+lifetime. Linker-assigned ordinals are not console ordinal mappings.
+Upstream does **not** perform convolution or other block transforms: submitted
+output is silence, so this does not implement reverb or complete title audio.
+
+With the launcher test environment above:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_chad -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, four synthetic tests passed: named imports exercised
+validation, stream limits, tickets, status and silent output; a dynamically
+loaded provider remained pinned after `FreeLibrary`; unsupported names,
+ordinals, collisions and conflicting overrides failed preflight; and an
+unrelated guest ran without `chad.dll` while a CHAD-importing guest failed.
