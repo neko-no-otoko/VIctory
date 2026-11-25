@@ -408,14 +408,17 @@ Graphics supports one color target and optional depth target per draw; the
 native depth comparison/write subset; restricted single-target D3D blending
 and color write masks; and multiple sampled textures with point or linear
 clamp samplers.
-The pixel-shader subset accepts up to 16 textures and 16 samplers, each in
-its own distinct root-parameter slot and single-descriptor table at index
-zero. Descriptor heaps hold up to 16 entries; tables can point at different
-entries, and recorded draws retain the referenced resources. Changing a
-referenced descriptor before execution is rejected. Array or dynamically
-indexed tables, nonzero table offsets/base registers, and comparison or
-non-clamp samplers remain unsupported. The decoded console metadata does not
-expose register spaces, so no additional register-space mapping is claimed.
+Pixel shaders may access multiple texture and sampler entries at statically
+traced table-relative indices, including nonzero indices and table bases.
+Guest shader-visible resource and sampler heaps hold up to 256 entries; per
+draw, at most 256 populated texture and 256 sampler entries are snapshotted.
+Each Metal direct heap is limited to 16 entries including gaps reserved by static
+indices. Draws retain the snapshotted resources and reject descriptors changed
+before execution, including unused populated entries in the snapshot.
+Dynamic indexing, unaligned accesses, nonzero metadata table offsets, base
+registers, lower bounds or strides, and comparison or non-clamp samplers
+remain unsupported. The decoded console metadata does not expose register
+spaces, so no additional register-space mapping is claimed.
 The converter's directly indexed heaps use its
 [documented descriptor-table encoding](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/binding-model.md).
 Color SRV and RTV views must match the resource's typed format exactly;

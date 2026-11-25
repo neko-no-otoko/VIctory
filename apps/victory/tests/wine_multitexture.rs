@@ -264,8 +264,8 @@ fn launcher_runs_independent_texture_and_sampler_tables() {
     assert_eq!(out.status.code(), Some(42), "{}\n{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("D3D12X multitexture passed"), "{}\n{}", out.stdout, out.stderr);
     for (variant, diagnostic) in [
-        ("--missing-texture", "shader texture or sampler slot mismatch"),
-        ("--missing-sampler", "shader texture or sampler slot mismatch"),
+        ("--missing-texture", "missing static descriptor binding"),
+        ("--missing-sampler", "missing static descriptor binding"),
         ("--changed-texture", "SRV descriptor changed"),
         ("--changed-sampler", "sampler descriptor changed"),
     ] {

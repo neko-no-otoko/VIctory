@@ -179,8 +179,8 @@ unsafe impl Sync for Buffer {}
 struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
 #[derive(Clone)]
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
-type TextureHeap = Arc<Mutex<Vec<Option<Srv>>>>;
-type SamplerHeap = Arc<Mutex<Vec<Option<bool>>>>;
+type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
+type SamplerHeap = Arc<Mutex<Vec<Option<Arc<bool>>>>>;
 struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
 type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
 #[derive(Clone)]
@@ -221,8 +221,8 @@ struct GraphicsJob {
     command: Command, resources: Vec<GraphicsResource>, descriptor: Option<Rtv>,
     depth_descriptor: Option<Rtv>,
     pipeline: Option<Arc<GraphicsPipeline>>,
-    textures: Vec<(TextureHeap, usize, Srv)>,
-    samplers: Vec<(SamplerHeap, usize, bool)>,
+    textures: Vec<(TextureHeap, usize, Arc<Srv>)>,
+    samplers: Vec<(SamplerHeap, usize, Arc<bool>)>,
 }
 #[derive(Default)]
 struct GraphicsState {
@@ -233,8 +233,8 @@ struct GraphicsState {
     viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: bool,
     vertices: [Option<(Arc<Buffer>, usize, u32, u32)>; 16], constants: Vec<Option<u32>>,
     index: Option<(Arc<Buffer>, usize, u32, u32)>,
-    heaps: Vec<usize>, textures: Vec<(u32, TextureHeap, usize, Srv)>,
-    samplers: Vec<(u32, SamplerHeap, usize, bool)>, constant_slot: Option<u32>,
+    heaps: Vec<usize>, textures: Vec<(u32, TextureHeap, usize)>,
+    samplers: Vec<(u32, SamplerHeap, usize)>, constant_slot: Option<u32>,
     jobs: Vec<GraphicsJob>,
 }
 #[derive(Clone)]
@@ -591,7 +591,7 @@ extern "system" fn create_heap(this: This, d: *const HeapDesc, iid: *const Iid, 
     let Some(d) = (unsafe { d.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if device(this).is_none() || d.count == 0 || d.count > 16 || d.nodes != 0 {
+    if device(this).is_none() || d.count == 0 || d.count > 256 || d.nodes != 0 {
         return E_INVALIDARG;
     }
     if d.kind == 2 && d.flags == 0 && d.count == 1 {
@@ -831,12 +831,12 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
         (first, count)
     };
     clear_buffer_descriptor(handle);
-    h.lock().unwrap()[index] = Some(Srv { texture: t, first_mip, mip_count });
+    h.lock().unwrap()[index] = Some(Arc::new(Srv { texture: t, first_mip, mip_count }));
 }
 extern "system" fn create_sampler(this: This, desc: *const [u32; 13], handle: u64) {
     let (Some((h,index)), Some(d)) = (sampler_handle(handle), unsafe { desc.as_ref() }) else { trap("invalid sampler"); };
     if device(this).is_none() || !matches!(d[0], 0 | 0x15) || d[1..] != [3,3,3,0,1,8,0,0,0,0,0,0] { trap("unsupported sampler"); }
-    h.lock().unwrap()[index] = Some(d[0] == 0x15);
+    h.lock().unwrap()[index] = Some(Arc::new(d[0] == 0x15));
 }
 #[repr(C)]
 struct ComputeDesc {
@@ -1083,12 +1083,10 @@ extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
         let index = usize::try_from(handle.checked_sub(base as u64)?).ok()?;
         match data(base as This) {
             Some(Data::Heap(_, h)) => {
-                let value = h.lock().unwrap().get(index)?.clone()?;
-                Some((Some((h,index,value)),None))
+                (index < h.lock().unwrap().len()).then_some((Some((h.clone(),index)),None))
             }
             Some(Data::Sampler(h)) => {
-                let value = *h.lock().unwrap().get(index)?;
-                Some((None,Some((h,index,value?))))
+                (index < h.lock().unwrap().len()).then_some((None,Some((h.clone(),index))))
             }
             _ => None,
         }
@@ -1096,8 +1094,8 @@ extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
     let Some((texture,sampler)) = binding else { l.invalid = true; return; };
     l.graphics.textures.retain(|t| t.0 != slot);
     l.graphics.samplers.retain(|s| s.0 != slot);
-    if let Some((h,index,value)) = texture { l.graphics.textures.push((slot,h,index,value)); }
-    if let Some((h,index,value)) = sampler { l.graphics.samplers.push((slot,h,index,value)); }
+    if let Some((h,index)) = texture { l.graphics.textures.push((slot,h,index)); }
+    if let Some((h,index)) = sampler { l.graphics.samplers.push((slot,h,index)); }
 }
 extern "system" fn set_constants(this: This, slot: u32, n: u32, values: *const u32, offset: u32) {
     let l = list(this);
@@ -1706,13 +1704,25 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         && views[0].slot==0 && views[0].stride==pipeline.stride;
     let first_view=views.first().unwrap().clone();
     if let Some((b,_)) = &index { resources.push(GraphicsResource::Buffer(b.clone())); }
-    for (_,_,_,view) in &g.textures { resources.push(GraphicsResource::Texture(view.texture.clone())); }
-    if g.textures.is_empty() != g.samplers.is_empty() || g.textures.len()>16 || g.samplers.len()>16 {
-        l.invalid = true; return;
+    let mut textures = Vec::new();
+    let mut samplers = Vec::new();
+    for (slot,heap,base) in &g.textures {
+        for (offset,entry) in heap.lock().unwrap()[*base..].iter().enumerate() {
+            if let Some(view)=entry {
+                resources.push(GraphicsResource::Texture(view.texture.clone()));
+                textures.push((*slot,offset as u32,heap.clone(),*base+offset,view.clone()));
+            }
+        }
     }
-    let single = g.textures.len()==1 && g.samplers.len()==1;
-    let texture = single.then(|| &g.textures[0]);
-    let sampler = single.then(|| &g.samplers[0]);
+    for (slot,heap,base) in &g.samplers {
+        for (offset,entry) in heap.lock().unwrap()[*base..].iter().enumerate() {
+            if let Some(value)=entry { samplers.push((*slot,offset as u32,heap.clone(),*base+offset,value.clone())); }
+        }
+    }
+    if textures.len()>256 || samplers.len()>256 { l.invalid = true; return; }
+    let single = textures.len()==1 && samplers.len()==1 && textures[0].1==0 && samplers[0].1==0;
+    let texture = single.then(|| &textures[0]);
+    let sampler = single.then(|| &samplers[0]);
     if pipeline.depth.as_ref().is_some_and(|d| d.stencil.is_some()) {
         g.jobs.push(GraphicsJob { command: Command::SetStencilRef(g.stencil_ref), resources: vec![],
             descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
@@ -1722,19 +1732,19 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
     let command = Command::Draw(Draw { target: target.id, pipeline: pipeline.id,
         vertex_buffer: first_view.buffer, vertex_offset: first_view.offset, vertex_size: first_view.size, vertex_stride: first_view.stride,
         vertex_count: count, instance_count: instances, first_vertex: if index.is_some() { 0 } else { first }, first_instance: instance,
-        viewport, scissor, topology: 4, constants, texture: texture.map(|v| v.3.texture.id),
-        first_mip: texture.map_or(0, |v| v.3.first_mip),
-        mip_count: texture.map_or(0, |v| v.3.mip_count),
-        index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: sampler.is_some_and(|v| v.3),
+        viewport, scissor, topology: 4, constants, texture: texture.map(|v| v.4.texture.id),
+        first_mip: texture.map_or(0, |v| v.4.first_mip),
+        mip_count: texture.map_or(0, |v| v.4.mip_count),
+        index: index.map(|v| v.1), depth: g.depth.as_ref().map(|v| v.1.id), linear_filter: sampler.is_some_and(|v| *v.4),
         constant_slot: g.constant_slot, texture_slot: texture.map(|v| v.0),
         sampler_slot: sampler.map(|v| v.0), vertices: if legacy {Vec::new()} else {views},
-        textures: if single {Vec::new()} else {g.textures.iter().map(|v| wine_transport::SampledTextureBinding {
-            slot:v.0,resource:v.3.texture.id,first_mip:v.3.first_mip,mip_count:v.3.mip_count }).collect()},
-        samplers: if single {Vec::new()} else {g.samplers.iter().map(|v| wine_transport::SamplerBinding {
-            slot:v.0,linear_filter:v.3 }).collect()} });
+        textures: if single {Vec::new()} else {textures.iter().map(|v| wine_transport::SampledTextureBinding {
+            slot:v.0,offset:v.1,resource:v.4.texture.id,first_mip:v.4.first_mip,mip_count:v.4.mip_count }).collect()},
+        samplers: if single {Vec::new()} else {samplers.iter().map(|v| wine_transport::SamplerBinding {
+            slot:v.0,offset:v.1,linear_filter:*v.4 }).collect()} });
     g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
-        textures: g.textures.iter().map(|v| (v.1.clone(),v.2,v.3.clone())).collect(),
-        samplers: g.samplers.iter().map(|v| (v.1.clone(),v.2,v.3)).collect() });
+        textures: textures.into_iter().map(|v| (v.2,v.3,v.4)).collect(),
+        samplers: samplers.into_iter().map(|v| (v.2,v.3,v.4)).collect() });
 }
 extern "system" fn copy_buffer(this: This, dst: This, dst_offset: u64, src: This, src_offset: u64, size: u64) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1823,11 +1833,10 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
             if d.1 != *revision || !d.0.as_ref().is_some_and(|v| Arc::ptr_eq(v,t)) { return Err("DSV descriptor changed".into()); }
         }
         for (h,index,t) in &j.textures {
-            if !h.lock().unwrap().get(*index).and_then(Option::as_ref).is_some_and(|v| Arc::ptr_eq(&v.texture, &t.texture)
-                && v.first_mip == t.first_mip && v.mip_count == t.mip_count) { return Err("SRV descriptor changed".into()); }
+            if !h.lock().unwrap().get(*index).and_then(Option::as_ref).is_some_and(|v| Arc::ptr_eq(v,t)) { return Err("SRV descriptor changed".into()); }
         }
         for (h,index,v) in &j.samplers {
-            if h.lock().unwrap().get(*index).copied().flatten() != Some(*v) { return Err("sampler descriptor changed".into()); }
+            if !h.lock().unwrap().get(*index).and_then(Option::as_ref).is_some_and(|value| Arc::ptr_eq(value,v)) { return Err("sampler descriptor changed".into()); }
         }
         if let Some(p) = &j.pipeline {
             let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
