@@ -29,7 +29,10 @@ static DWORD WINAPI tls_worker(void *arg) {
     return tls_value == value ? 0 : 3;
 }
 
-unsigned mainCRTStartup(void *unused) {
+#ifndef VICTORY_TLS_ENTRY
+#define VICTORY_TLS_ENTRY mainCRTStartup
+#endif
+unsigned VICTORY_TLS_ENTRY(void *unused) {
     HANDLE threads[2]; DWORD codes[2];
     if (tls_value != 17 || tls_bad) { SAY("TLS initial state failed\r\n"); return 20; }
     tls_value = 99;

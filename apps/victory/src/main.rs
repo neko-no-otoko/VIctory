@@ -232,6 +232,43 @@ enum Command {
         #[arg(last = true)]
         guest_args: Vec<std::ffi::OsString>,
     },
+    /// Run a trusted title using the Windows VIctory mapper under Wine and an arm64 Metal host.
+    #[cfg(target_os = "macos")]
+    #[command(long_about = "Run a trusted title using an explicitly selected Windows VIctory executable under Wine and a supervised arm64 Metal host. The guest, launcher, prefix and file paths are not sandboxed. This route has known TLS and compatibility limitations and does not establish title support.")]
+    WineMappedRun {
+        /// Trusted title executable to map.
+        exe: PathBuf,
+        /// Fork-built Windows x86-64 VIctory executable with mapped result protocol.
+        #[arg(long)]
+        victory_exe: PathBuf,
+        /// Wine executable.
+        #[arg(long)]
+        wine: PathBuf,
+        /// Wine's winepath executable.
+        #[arg(long)]
+        winepath: PathBuf,
+        /// Native arm64 wine_metal_compute_host executable.
+        #[arg(long)]
+        metal_host: PathBuf,
+        /// Apple Metal Shader Converter dylib usable by the arm64 host.
+        #[arg(long)]
+        converter: PathBuf,
+        /// Existing Wine prefix directory.
+        #[arg(long)]
+        wine_prefix: PathBuf,
+        /// Optional trusted Wine runtime DLL directory (for example LLVM-MinGW's bin).
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
+        /// Existing cache directory outside the source tree.
+        #[arg(long)]
+        cache_dir: PathBuf,
+        /// Existing persistent data directory outside the source tree.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Console model seen by the mapped title.
+        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        console: Console,
+    },
     #[cfg(windows)]
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -270,6 +307,34 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+#[cfg(windows)]
+fn report_mapped_result(code: u32) -> Result<bool> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    use anyhow::{Context, bail};
+
+    let Some(address) = std::env::var_os("VICTORY_MAPPED_RESULT_ADDR") else { return Ok(false); };
+    let address: SocketAddr = address.to_str().context("invalid mapped result address encoding")?
+        .parse().context("invalid mapped result address")?;
+    if !address.ip().is_loopback() || address.port() == 0 { bail!("mapped result address must be loopback"); }
+    let token = std::env::var("VICTORY_WINE_METAL_TOKEN").context("missing mapped result token")?;
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid mapped result token");
+    }
+    let timeout = Some(Duration::from_secs(2));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).context("connecting mapped result channel")?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    stream.write_all(b"VIMSTAT1")?;
+    stream.write_all(token.as_bytes())?;
+    stream.write_all(&code.to_le_bytes())?;
+    let mut ack = [0];
+    stream.read_exact(&mut ack).context("reading mapped result acknowledgement")?;
+    if ack != [1] { bail!("invalid mapped result acknowledgement"); }
+    Ok(true)
 }
 
 fn main() -> Result<()> {
@@ -335,6 +400,12 @@ fn main() -> Result<()> {
             if code != 0 { std::process::exit(code); }
             Ok(())
         }
+        #[cfg(target_os = "macos")]
+        Command::WineMappedRun { exe, victory_exe, wine, winepath, metal_host, converter, wine_prefix, runtime_dir, cache_dir, data_dir, console } => {
+            let code = wine_launcher::run_mapped(&exe, &victory_exe, &wine, &winepath, &metal_host, &converter, &wine_prefix, runtime_dir.as_deref(), &cache_dir, &data_dir, console)?;
+            if code != 0 { std::process::exit(code); }
+            Ok(())
+        }
         #[cfg(windows)]
         Command::Run {
             exe,
@@ -345,6 +416,9 @@ fn main() -> Result<()> {
             title_args: _,
         } => {
             let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            // In supervised mapped mode the channel carries the title's full
+            // status; the process status then describes delivery, not the title.
+            if report_mapped_result(code)? { return Ok(()); }
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

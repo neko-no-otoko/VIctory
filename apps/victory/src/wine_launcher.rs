@@ -20,6 +20,8 @@ use anyhow::{Context, Result, bail};
 const PROVIDERS: [&str; 6] = ["d3d12_xs.dll", "xg_xs.dll", "xgameruntime.dll", "xmem.dll", "acphal.dll", "xapu.dll"];
 const XMEM_BACKEND: &str = "victory_xmem_backend.dll";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+// A first winepath invocation can initialize a fresh Wine prefix.
+const MAPPED_WINEPATH_TIMEOUT: Duration = Duration::from_secs(120);
 const GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -196,7 +198,8 @@ fn clean_bridge_env(command: &mut Command) {
         .env_remove("VICTORY_WINE_TITLE_DATA")
         .env_remove("VICTORY_WINE_RELAUNCH_ADDR")
         .env_remove("VICTORY_WINE_PLS_DRIVE")
-        .env_remove("VICTORY_WINE_CONSOLE");
+        .env_remove("VICTORY_WINE_CONSOLE")
+        .env_remove("VICTORY_MAPPED_RESULT_ADDR");
 }
 
 struct Relaunch {
@@ -255,10 +258,10 @@ fn nonblocking(reader: &impl AsRawFd) -> Result<()> {
 
 // Read bounded output without a reader thread that could remain blocked after
 // a descendant inherits the pipe. Observe signals and child exits throughout.
-fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Result<Vec<u8>> {
+fn read_output(child: &mut ManagedChild, line: bool, description: &str, timeout: Duration) -> Result<Vec<u8>> {
     let mut stdout = child.child.stdout.take().context("missing child stdout")?;
     nonblocking(&stdout)?;
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
     let mut exited = None;
     loop {
@@ -295,11 +298,17 @@ fn read_output(child: &mut ManagedChild, line: bool, description: &str) -> Resul
 }
 
 fn winepath_output(winepath: &Path, prefix: &Path, flag: &str, path: &OsStr) -> Result<Vec<u8>> {
+    winepath_output_with_env(winepath, prefix, flag, path, false)
+}
+
+fn winepath_output_with_env(winepath: &Path, prefix: &Path, flag: &str, path: &OsStr, clean_wine: bool) -> Result<Vec<u8>> {
     let mut command = Command::new(winepath);
     command.arg(flag).arg(path).env("WINEPREFIX", prefix).stdout(Stdio::piped());
     clean_bridge_env(&mut command);
+    if clean_wine { command.env_remove("WINEPATH").env_remove("WINEDLLOVERRIDES"); }
     let mut child = ManagedChild::spawn(&mut command, "winepath")?;
-    let mut output = read_output(&mut child, false, "winepath")?;
+    let timeout = if clean_wine { MAPPED_WINEPATH_TIMEOUT } else { STARTUP_TIMEOUT };
+    let mut output = read_output(&mut child, false, "winepath", timeout)?;
     while matches!(output.last(), Some(b'\r' | b'\n')) { output.pop(); }
     if output.is_empty() || output.iter().any(|b| matches!(b, b'\0' | b'\r' | b'\n'))
         || std::str::from_utf8(&output).is_err() {
@@ -593,6 +602,176 @@ fn install_gameinput(prefix: &Path, provider: &Path) -> Result<()> {
 }
 
 
+fn start_metal_host(metal_host: &Path, converter: &Path, arm64: bool) -> Result<(ManagedChild, SocketAddrV4, String)> {
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random)).context("generating Metal bridge token")?;
+    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut host_command = if arm64 {
+        let mut command = Command::new("/usr/bin/arch");
+        command.arg("-arm64").arg(metal_host);
+        command
+    } else {
+        Command::new(metal_host)
+    };
+    host_command.arg("127.0.0.1:0").arg("--announce").stdout(Stdio::piped());
+    clean_bridge_env(&mut host_command);
+    host_command.env("VICTORY_WINE_METAL_TOKEN", &token)
+        .env("VICTORY_METAL_CONVERTER", converter);
+    let mut host = ManagedChild::spawn(&mut host_command, "Metal host")?;
+    let ready = read_output(&mut host, true, "Metal host", STARTUP_TIMEOUT)?;
+    let line = ready.split(|b| *b == b'\n').next().context("missing Metal host readiness line")?;
+    let address = line.strip_prefix(b"VICTORY_WINE_METAL_READY=").context("invalid Metal host readiness line")?;
+    let address: SocketAddrV4 = std::str::from_utf8(address).context("invalid Metal host address")?.parse().context("invalid Metal host address")?;
+    if *address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 { bail!("Metal host announced a non-loopback or zero address"); }
+    if let Some(status) = host.try_wait()? { bail!("Metal host exited after readiness: {status}"); }
+    Ok((host, address, token))
+}
+
+fn drain_host(host: &mut ManagedChild) -> Result<()> {
+    if let Some(stdout) = host.child.stdout.as_mut() {
+        let mut buffer = [0; 4096];
+        for _ in 0..16 {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => break,
+                Err(e) => return Err(e).context("reading Metal host output"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mapped_windows_path(winepath: &Path, prefix: &Path, path: &Path, is_dir: bool) -> Result<OsString> {
+    let windows = winepath_output_with_env(winepath, prefix, "-w", path.as_os_str(), true)
+        .with_context(|| format!("converting {} to a Wine path", path.display()))?;
+    if !(windows.len() >= 3 && windows[0].is_ascii_alphabetic() && windows[1] == b':' && matches!(windows[2], b'\\' | b'/')) {
+        bail!("winepath did not return an absolute Windows drive path for {}", path.display());
+    }
+    let host = winepath_output_with_env(winepath, prefix, "-u", OsStr::from_bytes(&windows), true)
+        .with_context(|| format!("round-tripping {} through Wine", path.display()))?;
+    let host = PathBuf::from(OsString::from_vec(host));
+    let roundtrip = if is_dir { directory(&host, "mapped directory")? } else { regular_file(&host, "mapped file")? };
+    if roundtrip != path { bail!("winepath mapping does not round-trip to {}", path.display()); }
+    Ok(OsString::from_vec(windows))
+}
+
+struct MappedWorkingDir(PathBuf);
+
+impl MappedWorkingDir {
+    fn create() -> Result<Self> {
+        let mut random = [0u8; 16];
+        File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random))
+            .context("generating private working directory name")?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("victory-mapped-{name}"));
+        fs::create_dir(&path).context("creating mapped working directory")?;
+        Ok(Self(directory(&path, "mapped working directory")?))
+    }
+}
+
+impl Drop for MappedWorkingDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+// A cooperative result channel for a trusted guest, not a security boundary.
+fn receive_mapped_result(listener: &TcpListener, token: &str) -> Result<Option<u32>> {
+    let (mut stream, peer) = match listener.accept() {
+        Ok(connection) => connection,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e).context("accepting mapped result"),
+    };
+    if !peer.ip().is_loopback() { bail!("non-loopback mapped result"); }
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(GRACE))?;
+    stream.set_write_timeout(Some(GRACE))?;
+    let mut frame = [0u8; 44];
+    stream.read_exact(&mut frame).context("reading mapped result")?;
+    if &frame[..8] != b"VIMSTAT1" || &frame[8..40] != token.as_bytes() {
+        bail!("invalid mapped result authentication or protocol");
+    }
+    let code = u32::from_le_bytes(frame[40..44].try_into().expect("fixed frame"));
+    stream.write_all(&[1]).context("acknowledging mapped result")?;
+    Ok(Some(code))
+}
+
+fn run_mapped_inner(exe: &Path, victory_exe: &Path, wine: &Path, winepath: &Path,
+    metal_host: &Path, converter: &Path, wine_prefix: &Path, runtime_dir: Option<&Path>,
+    cache_dir: &Path, data_dir: &Path, console: crate::Console) -> Result<i32> {
+    let exe = regular_file(exe, "title executable")?;
+    let victory_exe = regular_file(victory_exe, "Windows VIctory executable")?;
+    let wine = executable_file(wine, "Wine executable")?;
+    let winepath = executable_file(winepath, "winepath executable")?;
+    let metal_host = executable_file(metal_host, "Metal host executable")?;
+    let converter = regular_file(converter, "Metal converter")?;
+    let prefix = directory(wine_prefix, "Wine prefix")?;
+    let cache = directory(cache_dir, "cache directory")?;
+    let data = directory(data_dir, "data directory")?;
+    let working_dir = MappedWorkingDir::create()?;
+    let _signals = SignalGuard::install()?;
+    let title = mapped_windows_path(&winepath, &prefix, &exe, false)?;
+    let cache = mapped_windows_path(&winepath, &prefix, &cache, true)?;
+    let data = mapped_windows_path(&winepath, &prefix, &data, true)?;
+    let runtime = runtime_dir.map(|path| {
+        let dir = directory(path, "Wine runtime DLL directory")?;
+        let windows = mapped_windows_path(&winepath, &prefix, &dir, true)?;
+        if windows.as_bytes().contains(&b';') { bail!("runtime DLL directory contains a Wine path separator"); }
+        Ok::<_, anyhow::Error>(windows)
+    }).transpose()?;
+    mapped_windows_path(&winepath, &prefix, &working_dir.0, true)?;
+    let (mut host, address, token) = start_metal_host(&metal_host, &converter, true)?;
+    let result_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("binding mapped result channel")?;
+    result_listener.set_nonblocking(true).context("setting mapped result channel nonblocking")?;
+    let result_address = result_listener.local_addr().context("reading mapped result address")?;
+    let mut command = Command::new(&wine);
+    clean_bridge_env(&mut command);
+    command.current_dir(&working_dir.0).arg(&victory_exe).arg("run").arg(title)
+        .arg("--execute").arg("--console").arg(match console {
+            crate::Console::SeriesX => "series-x",
+            crate::Console::SeriesS => "series-s",
+        })
+        .env("WINEPREFIX", &prefix)
+        .env_remove("WINEPATH").env_remove("WINEDLLOVERRIDES")
+        .env_remove("VICTORY_CONFIG").env_remove("VICTORY_FIDELITYFX_DIR")
+        .env_remove("VICTORY_RELAUNCHED_FROM")
+        .env("VICTORY_CACHE_DIR", cache).env("VICTORY_DATA_DIR", data)
+        .env("VICTORY_WINE_METAL_ADDR", address.to_string())
+        .env("VICTORY_WINE_METAL_TOKEN", &token)
+        .env("VICTORY_MAPPED_RESULT_ADDR", result_address.to_string());
+    if let Some(runtime) = &runtime { command.env("WINEPATH", runtime); }
+    let mut guest = ManagedChild::spawn(&mut command, "mapped VIctory under Wine")?;
+    let mut result = None;
+    loop {
+        check_signal()?;
+        drain_host(&mut host)?;
+        if result.is_none() { result = receive_mapped_result(&result_listener, &token)?; }
+        let status = guest.try_wait()?;
+        if let Some(host_status) = host.try_wait()? { bail!("Metal host exited while Wine was running: {host_status}"); }
+        if let Some(status) = status {
+            let code = result.context(format!("mapped VIctory exited with {status} without reporting a title result (launcher or protocol failure)"))?;
+            if !status.success() {
+                bail!("mapped VIctory exited with {status} after reporting title result {code} (launcher or protocol failure)");
+            }
+            println!("mapped title result: {code}");
+            let low = (code & 0xff) as i32;
+            return Ok(if code != 0 && low == 0 { 1 } else { low });
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+pub fn run_mapped(exe: &Path, victory_exe: &Path, wine: &Path, winepath: &Path,
+    metal_host: &Path, converter: &Path, wine_prefix: &Path, runtime_dir: Option<&Path>,
+    cache_dir: &Path, data_dir: &Path, console: crate::Console) -> Result<i32> {
+    match run_mapped_inner(exe, victory_exe, wine, winepath, metal_host, converter, wine_prefix, runtime_dir, cache_dir, data_dir, console) {
+        Err(error) if error.downcast_ref::<Interrupted>().is_some() =>
+            Ok(128 + error.downcast_ref::<Interrupted>().expect("checked above").0),
+        result => result,
+    }
+}
+
 fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, converter: &Path,
     dll_dir: &Path, wine_prefix: &Path, allow_unverified_dll_search: bool, provision_gameinput: bool, guest_dll: &[String], title_root: Option<&Path>, save_root: Option<&Path>, storage_drive: Option<char>, console: crate::Console, args: &[OsString]) -> Result<i32> {
     let exe = regular_file(exe, "guest executable")?;
@@ -659,21 +838,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     if let Some(old) = std::env::var_os("WINEPATH").filter(|value| !value.is_empty()) {
         wine_path.push(OsStr::new(";")); wine_path.push(old);
     }
-    let mut random = [0u8; 16];
-    File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random)).context("generating Metal bridge token")?;
-    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let mut host_command = Command::new(&metal_host);
-    host_command.arg("127.0.0.1:0").arg("--announce").stdout(Stdio::piped());
-    clean_bridge_env(&mut host_command);
-    host_command.env("VICTORY_WINE_METAL_TOKEN", &token)
-        .env("VICTORY_METAL_CONVERTER", &converter);
-    let mut host = ManagedChild::spawn(&mut host_command, "Metal host")?;
-    let ready = read_output(&mut host, true, "Metal host")?;
-    let line = ready.split(|b| *b == b'\n').next().context("missing Metal host readiness line")?;
-    let address = line.strip_prefix(b"VICTORY_WINE_METAL_READY=").context("invalid Metal host readiness line")?;
-    let address: SocketAddrV4 = std::str::from_utf8(address).context("invalid Metal host address")?.parse().context("invalid Metal host address")?;
-    if *address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 { bail!("Metal host announced a non-loopback or zero address"); }
-    if let Some(status) = host.try_wait()? { bail!("Metal host exited after readiness: {status}"); }
+    let (mut host, address, token) = start_metal_host(&metal_host, &converter, false)?;
     if let Some(root) = &title_root {
         checked_title_root(&wine_prefix, root)?;
         eprintln!("Wine G: currently maps to {}; the mapping and guest file access are not sandboxed.", root.display());
@@ -706,18 +871,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     let mut pending = None;
     loop {
         check_signal()?;
-        // Bound each drain so a noisy host cannot starve status and signal checks.
-        if let Some(stdout) = host.child.stdout.as_mut() {
-            let mut buffer = [0; 4096];
-            for _ in 0..16 {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => break,
-                    Err(e) => return Err(e).context("reading Metal host output"),
-                }
-            }
-        }
+        drain_host(&mut host)?;
         if pending.is_none() { pending = receive_relaunch(&relaunch, &token)?; }
         let status = guest.try_wait()?;
         if let Some(host_status) = host.try_wait()? { bail!("Metal host exited while Wine was running: {host_status}"); }

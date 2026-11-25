@@ -396,6 +396,91 @@ CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
 Stop the service after the test. No compatible game files were used or
 configured; these results are not evidence of game compatibility.
 
+### Supervised Windows mapper under Wine with an arm64 Metal host
+
+On Apple Silicon, `wine-mapped-run` starts a fork-built Windows `victory.exe`
+under Wine. That executable maps the trusted title and binds its existing
+in-process HLE registry, rather than using the normal-Wine provider DLLs.
+The macOS launcher starts the selected Metal host as arm64, supplies a fresh
+loopback endpoint and token, supervises both process groups, and stops them
+when the run ends. It removes inherited `WINEPATH` and `WINEDLLOVERRIDES`
+for this route; it does not provision normal-Wine provider overrides. An
+explicit trusted `--runtime-dir` supplies Wine's DLL search path if needed.
+
+Build all three executables from the same checkout. The Windows executable
+must include the mapped-result protocol; an older or different executable
+that does not report a result is rejected. With Wine, LLVM-MinGW and an
+arm64-compatible Apple Metal Shader Converter already installed:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/victory-mapped-target
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang
+cargo build --locked -p victory --target x86_64-pc-windows-gnullvm
+cargo build --locked -p victory-gpu --example wine_metal_compute_host --target aarch64-apple-darwin
+cargo build --locked -p victory --target aarch64-apple-darwin
+mkdir -p "/tmp/victory mapped prefix" "/tmp/victory mapped cache" "/tmp/victory mapped data"
+"$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/victory" wine-mapped-run "/path/to/trusted title.exe" \
+  --victory-exe "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug/victory.exe" \
+  --wine /opt/homebrew/bin/wine --winepath /opt/homebrew/bin/winepath \
+  --metal-host "$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host" \
+  --converter /path/to/arm64/libmetalirconverter.dylib \
+  --wine-prefix "/tmp/victory mapped prefix" --runtime-dir "$LLVM_MINGW/x86_64-w64-mingw32/bin" \
+  --cache-dir "/tmp/victory mapped cache" \
+  --data-dir "/tmp/victory mapped data" --console series-x
+```
+
+Paths must already exist; Wine path conversions are checked by round trip.
+The first conversion can initialize a fresh prefix and has a 120-second
+deadline; this does not guarantee Wine initialization will succeed.
+The LLVM-MinGW build above requires `libunwind.dll` from its runtime `bin`
+directory; use `--runtime-dir` as shown or provide the matching DLL beside
+the Windows executable. This directory and Wine's remaining search paths
+are trusted, not pinned or sandboxed.
+The cache and data directories are passed explicitly to the Windows
+executable; inherited `VICTORY_CONFIG` and FidelityFX configuration are
+removed. The Windows launcher's AVX2 preflight remains in force. It is
+**not** automatically bypassed: `VICTORY_SKIP_CPU_CHECK=1` is a deliberate
+user opt-in, not evidence that an executable's instructions are supported.
+
+The Windows launcher reports a normal title return over an authenticated
+loopback result channel, then exits zero only after successful delivery. The
+macOS launcher checks that process exit separately, prints the full 32-bit
+title result and returns its low byte; a nonzero result with a zero low byte
+returns 1. An exit without a valid result is reported as a launcher
+or protocol failure, not as a successful title return. A title that directly
+terminates the process or requests a mapped relaunch cannot currently report
+a normal result; mapped relaunch is unsupported. The token and result channel
+coordinate trusted processes, not a security boundary.
+
+This is still an unsandboxed Wine process. It inherits the upstream mapper's
+limitations, including the documented alternate TLS-access counterexample in
+`native-macos-loader.md`; a single successful TLS fixture does not fix it.
+Metal proxy API coverage is restricted. Binding the DirectStorage factory does
+not by itself prove file transfer, decompression, title startup or game
+compatibility.
+
+The synthetic integration test requires the same tools and the built host and
+Windows executable. It sets the CPU-check opt-in for its own known fixture:
+
+```sh
+export LLVM_MINGW=/path/to/llvm-mingw
+export VICTORY_TEST_WINE=/opt/homebrew/bin/wine
+export VICTORY_TEST_WINEPATH=/opt/homebrew/bin/winepath
+export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
+export VICTORY_TEST_WINDOWS_VICTORY="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug/victory.exe"
+export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host"
+export VICTORY_TEST_METAL_CONVERTER=/path/to/arm64/libmetalirconverter.dylib
+cargo test --locked -p victory --target aarch64-apple-darwin --test wine_mapped_run -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta with an arm64 Metal host, the synthetic test passed:
+it acquired and released the existing HLE DirectStorage factory, exercised
+one compiler-TLS pattern and two threads, dispatched Metal compute and read
+back 42. It also checked separate title results 13 and 256, startup failures,
+paths with spaces and explicit CPU-check opt-in. It did **not** test
+DirectStorage file transfer or any game data. The normal-Wine real Metal
+launcher regression passed separately after the shared-supervisor refactor.
+
 ### Restricted offscreen graphics
 
 Graphics submissions carry ID-keyed resources and pipelines and an ordered
