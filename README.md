@@ -70,8 +70,78 @@ It reads the file without executing it; it does not establish whether the
 title can run. Input files must be supplied by the user; see
 [the asset policy](docs/asset-policy.md).
 
+The CLI also inspects import libraries and shader containers, disassembles
+GFX10 instructions, and translates shaders to DXIL:
+
+```sh
+cargo run -p victory -- lib-exports /path/to/import.lib --list
+cargo run -p victory -- shader-info /path/to/shaders --disasm
+cargo run -p victory -- translate /path/to/shaders --list
+```
+
+Translation reports DXIL emission, not validated behavior. `--validate`,
+`--pipelines` and `VICTORY_PAIRS` require Windows. Inputs may contain raw
+DXBC containers or SGD5 records; compressed or encrypted archives are not
+generally unpacked.
+
+### Offline DXIL to Metal
+
+With the pinned Rust toolchain and a separately supplied Apple Metal Shader
+Converter dynamic library, emitted DXIL can be converted to a `.metallib`.
+The library is proprietary and not bundled; use it under
+[Apple's terms](https://developer.apple.com/metal/shader-converter/).
+Output paths must be outside the repository.
+
+```sh
+cargo build -p victory
+VICTORY_EMIT_DUMP=/path/outside/repo target/debug/victory translate /path/to/shader --list
+target/debug/victory convert-metal /path/outside/repo/emitted.dxil \
+  --library /path/to/libmetalirconverter.dylib --stage compute \
+  --output /path/outside/repo/shader.metallib
+```
+
+Use the emitted DXIL file's actual path and stage (`vertex`, `fragment`,
+`mesh` or `compute`). Conversion alone does not validate shader behavior or
+resource bindings. The converter integration test and an opt-in synthetic
+Metal compute test can be run without title assets:
+
+```sh
+VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory --test shader_offline
+VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory --test metal_compute -- --ignored
+```
+
+The GPU test additionally requires Xcode command-line tools and a Metal
+device with argument buffers tier 2. It verifies a synthetic compute dispatch
+and readback; it is not a game or renderer compatibility test.
+
+### Experimental execution paths
+
 The fork also has restricted Metal compute, graphics and presentation paths
 verified with synthetic fixtures, not a complete Xbox GPU implementation.
+For the native `victory-gpu` path, these opt-in synthetic tests exercise
+ordered compute and an offscreen draw with GPU readback:
+
+```sh
+VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-gpu console_compute_records_and_submits_on_metal -- --ignored
+VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-gpu console_triangle_draw_preserves_target_and_copies_to_padded_buffer -- --ignored
+```
+
+The standalone `victory-metal::Renderer` also has a synthetic translated
+vertex/fragment test:
+
+```sh
+cargo build -p victory
+VICTORY_TEST_CLI="$(pwd)/target/debug/victory" \
+VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
+  cargo test -p victory-metal --test render -- --ignored
+```
+
+These are separate, restricted synthetic paths; their supported commands,
+formats and bindings are not a claim about arbitrary title workloads.
 The [native loader notes](docs/native-macos-loader.md) describe the x86-64
 macOS PE mapper and its limitations; the
 [Wine loader notes](docs/wine-loader-tests.md) describe normal Wine loading,
