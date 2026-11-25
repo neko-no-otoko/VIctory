@@ -210,7 +210,7 @@ struct Relaunch {
 // This channel is for a trusted guest, not a same-user security boundary.
 // A bounded read prevents a partial frame from indefinitely stalling the
 // supervising loop; authentication uses the same private token as the bridge.
-fn receive_relaunch(listener: &TcpListener, token: &str) -> Result<Option<Relaunch>> {
+fn receive_relaunch(listener: &TcpListener, token: &str, validate: impl FnOnce(&Relaunch) -> Result<()>) -> Result<Option<Relaunch>> {
     let (mut stream, peer) = match listener.accept() {
         Ok(connection) => connection,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
@@ -240,8 +240,10 @@ fn receive_relaunch(listener: &TcpListener, token: &str) -> Result<Option<Relaun
         path[1] == b':' && matches!(path[2], b'\\' | b'/')) {
         bail!("Wine relaunch executable must be an absolute drive path");
     }
+    let request = Relaunch { exe, args };
+    validate(&request)?;
     stream.write_all(&[1]).context("acknowledging Wine relaunch request")?;
-    Ok(Some(Relaunch { exe, args }))
+    Ok(Some(request))
 }
 
 fn nonblocking(reader: &impl AsRawFd) -> Result<()> {
@@ -725,31 +727,59 @@ fn run_mapped_inner(exe: &Path, victory_exe: &Path, wine: &Path, winepath: &Path
     let result_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("binding mapped result channel")?;
     result_listener.set_nonblocking(true).context("setting mapped result channel nonblocking")?;
     let result_address = result_listener.local_addr().context("reading mapped result address")?;
-    let mut command = Command::new(&wine);
-    clean_bridge_env(&mut command);
-    command.current_dir(&working_dir.0).arg(&victory_exe).arg("run").arg(title)
-        .arg("--execute").arg("--console").arg(match console {
-            crate::Console::SeriesX => "series-x",
-            crate::Console::SeriesS => "series-s",
-        })
-        .env("WINEPREFIX", &prefix)
-        .env_remove("WINEPATH").env_remove("WINEDLLOVERRIDES")
-        .env_remove("VICTORY_CONFIG").env_remove("VICTORY_FIDELITYFX_DIR")
-        .env_remove("VICTORY_RELAUNCHED_FROM")
-        .env("VICTORY_CACHE_DIR", cache).env("VICTORY_DATA_DIR", data)
-        .env("VICTORY_WINE_METAL_ADDR", address.to_string())
-        .env("VICTORY_WINE_METAL_TOKEN", &token)
-        .env("VICTORY_MAPPED_RESULT_ADDR", result_address.to_string());
-    if let Some(runtime) = &runtime { command.env("WINEPATH", runtime); }
-    let mut guest = ManagedChild::spawn(&mut command, "mapped VIctory under Wine")?;
+    let relaunch = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("binding mapped relaunch channel")?;
+    relaunch.set_nonblocking(true).context("setting mapped relaunch channel nonblocking")?;
+    let relaunch_address = relaunch.local_addr().context("reading mapped relaunch address")?;
+    let wine_command = |args: &[String]| {
+        let mut command = Command::new(&wine);
+        clean_bridge_env(&mut command);
+        command.current_dir(&working_dir.0).arg(&victory_exe).arg("run").arg(&title)
+            .arg("--execute").arg("--console").arg(match console {
+                crate::Console::SeriesX => "series-x",
+                crate::Console::SeriesS => "series-s",
+            })
+            .env("WINEPREFIX", &prefix)
+            .env_remove("WINEPATH").env_remove("WINEDLLOVERRIDES")
+            .env_remove("VICTORY_CONFIG").env_remove("VICTORY_FIDELITYFX_DIR")
+            .env_remove("VICTORY_RELAUNCHED_FROM")
+            .env("VICTORY_CACHE_DIR", &cache).env("VICTORY_DATA_DIR", &data)
+            .env("VICTORY_WINE_METAL_ADDR", address.to_string())
+            .env("VICTORY_WINE_METAL_TOKEN", &token)
+            .env("VICTORY_WINE_RELAUNCH_ADDR", relaunch_address.to_string())
+            .env("VICTORY_MAPPED_RESULT_ADDR", result_address.to_string());
+        if let Some(runtime) = &runtime { command.env("WINEPATH", runtime); }
+        if !args.is_empty() { command.arg("--").args(args); }
+        command
+    };
+    let mut guest = ManagedChild::spawn(&mut wine_command(&[]), "mapped VIctory under Wine")?;
     let mut result = None;
+    let mut pending = None;
     loop {
         check_signal()?;
         drain_host(&mut host)?;
+        if pending.is_none() {
+            pending = receive_relaunch(&relaunch, &token, |request| {
+                if !request.exe.is_empty() && !title.to_str().is_some_and(|current| request.exe.eq_ignore_ascii_case(current)) {
+                    bail!("mapped relaunch supports only the original title executable or an empty target");
+                }
+                Ok(())
+            })?;
+        }
         if result.is_none() { result = receive_mapped_result(&result_listener, &token)?; }
         let status = guest.try_wait()?;
         if let Some(host_status) = host.try_wait()? { bail!("Metal host exited while Wine was running: {host_status}"); }
         if let Some(status) = status {
+            if let Some(request) = pending.take() {
+                if !status.success() || result.is_some() {
+                    bail!("mapped VIctory exited with {status} or reported a title result after requesting relaunch");
+                }
+                // Terminate/reap the entire previous process group before the
+                // replacement opens title files. The Metal host stays alive.
+                drop(guest);
+                let args = victory_core::split_title_args(&request.args);
+                guest = ManagedChild::spawn(&mut wine_command(&args), "relaunched mapped VIctory under Wine")?;
+                continue;
+            }
             let code = result.context(format!("mapped VIctory exited with {status} without reporting a title result (launcher or protocol failure)"))?;
             if !status.success() {
                 bail!("mapped VIctory exited with {status} after reporting title result {code} (launcher or protocol failure)");
@@ -872,7 +902,7 @@ fn run_inner(exe: &Path, wine: &Path, winepath: &Path, metal_host: &Path, conver
     loop {
         check_signal()?;
         drain_host(&mut host)?;
-        if pending.is_none() { pending = receive_relaunch(&relaunch, &token)?; }
+        if pending.is_none() { pending = receive_relaunch(&relaunch, &token, |_| Ok(()))?; }
         let status = guest.try_wait()?;
         if let Some(host_status) = host.try_wait()? { bail!("Metal host exited while Wine was running: {host_status}"); }
         if let Some(status) = status {
@@ -942,7 +972,7 @@ mod tests {
             assert_eq!(ack, [1]);
         });
         connected.recv().unwrap();
-        let request = receive_relaunch(&listener, token).unwrap().unwrap();
+        let request = receive_relaunch(&listener, token, |_| Ok(())).unwrap().unwrap();
         assert_eq!(request.exe, "C:\\");
         assert_eq!(request.args, "one");
         client.join().unwrap();

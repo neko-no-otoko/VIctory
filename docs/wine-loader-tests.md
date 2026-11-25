@@ -469,10 +469,22 @@ loopback result channel, then exits zero only after successful delivery. The
 macOS launcher checks that process exit separately, prints the full 32-bit
 title result and returns its low byte; a nonzero result with a zero low byte
 returns 1. An exit without a valid result is reported as a launcher
-or protocol failure, not as a successful title return. A title that directly
-terminates the process or requests a mapped relaunch cannot currently report
-a normal result; mapped relaunch is unsupported. The token and result channel
-coordinate trusted processes, not a security boundary.
+or protocol failure, not as a successful title return; direct title process
+termination cannot report a normal result.
+
+The canonical HLE `XLaunchNewGame` lifecycle can request a supervised mapped
+relaunch. After the title's existing suspend sequence, the supervisor waits
+for and tears down the old Wine process group before starting the same Windows
+VIctory executable again. It preserves the Wine prefix, cache and data
+directories, console selection and arm64 Metal helper. It accepts an empty
+target (the current title) or the original absolute Windows title path
+(ASCII-case-insensitive); other targets, including relative paths and
+different title executables, are rejected before acknowledgment. It passes
+arguments using the canonical HLE splitter: double quotes group text and
+preserve empty arguments, while apostrophes are literal. This is not a full
+Windows backslash-escape parser. Only the final normally returned title
+result is reported. The loopback token and channels coordinate trusted
+processes, not a security boundary.
 
 This is still an unsandboxed Wine process. It inherits the upstream mapper's
 limitations, including the documented alternate TLS-access counterexample in
@@ -504,6 +516,13 @@ buffer guards, a short read at offset 14, EOF and a missing-file error; it
 then supplied the first byte read to Metal compute and read back 42. It also
 checked separate title results 13 and 256, startup failures, paths with spaces
 and explicit CPU-check opt-in. No game data was used.
+
+The `mapped_relaunch_preserves_state_and_supervision` synthetic test passed
+under Wine 11/Rosetta. It checked matching `T:` and cache markers across two
+mapped processes, the old process having exited, Series S analytics in both,
+quoted command-line text, Metal compute in both through one helper, helper
+cleanup, rejection of a different target and a final full-width result of 256.
+It does not establish game compatibility.
 
 Separately, the Windows-target upstream DirectStorage HLE tests
 `raw_and_zlib_reads_from_a_file` and

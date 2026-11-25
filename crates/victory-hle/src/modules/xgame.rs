@@ -75,7 +75,9 @@ extern "system" fn launch_new_game(
 ) {
     #[cfg(windows)]
     {
-        if runtime::title_storage().1 != runtime::StorageMode::Virtual {
+        if runtime::title_storage().1 != runtime::StorageMode::Virtual
+            || std::env::var_os("VICTORY_MAPPED_RESULT_ADDR").is_some()
+        {
             // Copy the title's input before suspension can invalidate it.
             let request = wine_launch_text(exe).and_then(|exe| {
                 wine_launch_text(args).map(|args| (exe, args))
@@ -192,42 +194,11 @@ fn relaunch_args(
     }
     if !args.trim().is_empty() {
         out.push("--".into());
-        out.extend(split_args(args).into_iter().map(Into::into));
+        out.extend(victory_core::split_title_args(args).into_iter().map(Into::into));
     }
     out
 }
 
-/// Splits the title's command-line tail into arguments, keeping double-quoted
-/// strings together (including empty ones). Windows command lines quote only
-/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
-fn split_args(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut started = false;
-    for c in args.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                started = true;
-            }
-            c if !quoted && c.is_whitespace() => {
-                if started {
-                    out.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            c => {
-                current.push(c);
-                started = true;
-            }
-        }
-    }
-    if started {
-        out.push(current);
-    }
-    out
-}
 
 /// Runtime areas by number, in the public feature list's order, that we
 /// serve: accessibility (0), app capture (1), async calls and providers

@@ -81,9 +81,10 @@ impl Fixture {
 
     fn build_imports(&self) {
         for (name, exports) in [
-            ("kernel32", "GetStdHandle\nWriteFile\nCreateFileW\nReadFile\nSetFilePointerEx\nGetLastError\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle"),
+            ("kernel32", "GetStdHandle\nWriteFile\nCreateFileW\nReadFile\nSetFilePointerEx\nGetLastError\nGetCommandLineA\nGetEnvironmentVariableW\nGetCurrentProcessId\nOpenProcess\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle"),
             ("d3d12_xs", "D3D12XboxCreateDevice"),
             ("xcrdapi", "DStorageGetFactory"),
+            ("xgameruntime", "QueryApiImpl"),
         ] {
             let def = self.dir.join(format!("{name}.def"));
             fs::write(&def, format!("LIBRARY {name}.dll\nEXPORTS\n{exports}\n")).unwrap();
@@ -173,6 +174,10 @@ unsigned mainCRTStartup(void *arg) {
     }
 
     fn command_with_host(&self, guest: &Path, wine: &Path, host: &Path) -> Command {
+        self.command_for_console(guest, wine, host, "series-x")
+    }
+
+    fn command_for_console(&self, guest: &Path, wine: &Path, host: &Path, console: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_victory"));
         command.arg("wine-mapped-run").arg(guest)
             .arg("--victory-exe").arg(&self.victory)
@@ -182,7 +187,7 @@ unsigned mainCRTStartup(void *arg) {
             .arg("--runtime-dir").arg(self.llvm.join("x86_64-w64-mingw32/bin"))
             .arg("--cache-dir").arg(self.dir.join("cache directory"))
             .arg("--data-dir").arg(self.dir.join("data directory"))
-            .arg("--console").arg("series-x")
+            .arg("--console").arg(console)
             .current_dir(&self.dir)
             .env_remove("VICTORY_CONFIG").env("WINEDLLOVERRIDES", "xcrdapi=n")
             .env("WINEPATH", "untrusted-provider-path")
@@ -342,4 +347,128 @@ fn mapped_graphics_present_drawable_contains_guest_pixels() {
         assert!(text.contains("refusing to use") && text.contains("inside the VIctory source tree"), "{text}");
         assert!(!text.contains("title exited with") && !text.contains("mapped title result:"), "{text}");
     }
+}
+
+#[test]
+#[ignore = "requires Windows victory.exe, Wine, LLVM-MinGW and native Metal host and converter"]
+fn mapped_relaunch_preserves_state_and_supervision() {
+    let f = Fixture::new();
+    f.build_imports();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/windows_d3d12x_compute.c");
+    let compute = f.dir.join("relaunch compute.obj");
+    checked(Command::new(f.llvm.join("bin/x86_64-w64-mingw32-clang"))
+        .args(["-O2", "-DmainCRTStartup=compute_entry", "-c"]).arg(fixture).arg("-o").arg(&compute), &f.dir);
+    let source = f.dir.join("mapped relaunch.c");
+    fs::write(&source, r#"
+#include <windows.h>
+__declspec(dllimport) HRESULT WINAPI QueryApiImpl(const GUID *, const GUID *, void **);
+unsigned compute_entry(void *);
+typedef void (WINAPI *Launch)(void *, const char *, const char *, const void *);
+typedef struct { unsigned short major, minor, build, revision; } Version;
+typedef struct { Version os, hosting_os; char family[64], form[64]; } Analytics;
+static int contains(const char *s, const char *needle) {
+    for (; *s; ++s) { const char *a=s, *b=needle; while (*b && *a==*b) { ++a; ++b; } if (!*b) return 1; }
+    return 0;
+}
+unsigned mainCRTStartup(void *unused) {
+    const GUID title = {0x973a344e,0x24bf,0x4d0f,{0x84,0x57,0x56,0xc5,0x34,0x89,0x2b,0x29}};
+    const GUID iid = {0x2549f142,0x6419,0x4a06,{0x97,0xb5,0x93,0x1a,0xab,0x7c,0x2f,0x34}};
+    const GUID analytics = {0xb884675d,0xb738,0x4a9c,{0x81,0x5d,0x9a,0x9a,0x1e,0x0c,0x6c,0x9b}};
+    void *object = 0; Analytics info;
+    typedef Analytics *(WINAPI *GetInfo)(void *, Analytics *);
+    if (QueryApiImpl(&analytics,&analytics,&object) || !object ||
+        ((GetInfo)(*(void ***)object)[3])(object,&info)!=&info ||
+        !contains(info.form,"Xbox Series S")) return 51;
+    if (compute_entry(unused)!=42) return 52;
+#ifdef INVALID_TARGET
+    const WCHAR *path=L"T:\\invalid-relaunch.bin";
+#else
+    const WCHAR *path=L"T:\\relaunch.bin";
+#endif
+    WCHAR cache_path[1024];
+    DWORD length=GetEnvironmentVariableW(L"VICTORY_CACHE_DIR",cache_path,1024);
+    if (!length || length > 980) return 63;
+#ifdef INVALID_TARGET
+    const WCHAR suffix[]=L"\\invalid-relaunch-cache.bin";
+#else
+    const WCHAR suffix[]=L"\\relaunch-cache.bin";
+#endif
+    for (unsigned i=0;i<sizeof(suffix)/sizeof(suffix[0]);++i) cache_path[length+i]=suffix[i];
+    HANDLE file=CreateFileW(path,GENERIC_READ|GENERIC_WRITE,0,0,OPEN_EXISTING,0,0);
+    DWORD count=0, pid=0;
+    if (file==INVALID_HANDLE_VALUE) {
+        file=CreateFileW(path,GENERIC_WRITE,0,0,CREATE_NEW,0,0);
+        if (file==INVALID_HANDLE_VALUE) return 53;
+        pid=GetCurrentProcessId();
+        if (!WriteFile(file,&pid,sizeof(pid),&count,0) || count!=sizeof(pid) || !CloseHandle(file)) return 54;
+        HANDLE cache=CreateFileW(cache_path,GENERIC_WRITE,0,0,CREATE_NEW,0,0);
+        if (cache==INVALID_HANDLE_VALUE ||
+            !WriteFile(cache,&pid,sizeof(pid),&count,0) || count!=sizeof(pid) || !CloseHandle(cache)) return 64;
+        object=0;
+        if (QueryApiImpl(&title,&iid,&object) || !object) return 55;
+#ifdef INVALID_TARGET
+        ((Launch)(*(void ***)object)[4])(object,"Z:\\definitely-missing-title.exe","",0);
+#else
+        ((Launch)(*(void ***)object)[4])(object,"","--phase \"two words\" \"\" -x",0);
+#endif
+        return 56;
+    }
+    if (!ReadFile(file,&pid,sizeof(pid),&count,0) || count!=sizeof(pid) || !pid || !CloseHandle(file)) return 57;
+    DWORD cache_pid=0;
+    HANDLE cache=CreateFileW(cache_path,GENERIC_READ,0,0,OPEN_EXISTING,0,0);
+    if (cache==INVALID_HANDLE_VALUE ||
+        !ReadFile(cache,&cache_pid,sizeof(cache_pid),&count,0) || count!=sizeof(cache_pid) ||
+        cache_pid!=pid || !CloseHandle(cache)) return 65;
+    if (pid==GetCurrentProcessId()) return 58;
+    HANDLE old=OpenProcess(SYNCHRONIZE,FALSE,pid);
+    if (old) { DWORD state=WaitForSingleObject(old,0); CloseHandle(old); if (state!=WAIT_OBJECT_0) return 59; }
+    else if (GetLastError()!=ERROR_INVALID_PARAMETER) return 60;
+    if (!contains(GetCommandLineA(),"--phase \"two words\" \"\" -x")) return 61;
+    static const char message[]="mapped relaunch persistence, arguments, console and prior exit passed\r\n";
+    if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),message,sizeof(message)-1,&count,0)) return 62;
+    return 256;
+}
+"#).unwrap();
+    let mut guests = Vec::new();
+    for invalid in [false, true] {
+        let obj = f.dir.join(format!("relaunch-{invalid}.obj"));
+        let mut compiler = Command::new(f.llvm.join("bin/x86_64-w64-mingw32-clang"));
+        compiler.args(["-O2", "-c"]);
+        if invalid { compiler.arg("-DINVALID_TARGET"); }
+        checked(compiler.arg(&source).arg("-o").arg(&obj), &f.dir);
+        let exe = f.dir.join(format!("relaunch-{invalid}.exe"));
+        checked(Command::new(f.llvm.join("bin/lld-link"))
+            .args(["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib"])
+            .arg(format!("/out:{}", exe.display())).arg(obj).arg(&compute)
+            .arg(f.dir.join("kernel32.lib")).arg(f.dir.join("xgameruntime.lib"))
+            .arg(f.dir.join("d3d12_xs.lib")), &f.dir);
+        guests.push(exe);
+    }
+    let host_wrapper = f.dir.join("observed metal host");
+    let host_pids = f.dir.join("metal host pids");
+    let quote = |p: &Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
+    fs::write(&host_wrapper, format!("#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nexec {} \"$@\"\n", quote(&host_pids), quote(&f.host))).unwrap();
+    fs::set_permissions(&host_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = run(f.command_for_console(&guests[0], &f.wine, &host_wrapper, "series-s")
+        .env("VICTORY_SKIP_CPU_CHECK", "1"), &f.dir);
+    let text = logs(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("mapped relaunch persistence, arguments, console and prior exit passed"), "{text}");
+    assert_eq!(text.matches("D3D12X synthetic compute readback 42").count(), 2, "{text}");
+    assert_eq!(text.matches("mapped title result:").count(), 1, "{text}");
+    assert!(text.contains("mapped title result: 256"), "{text}");
+    assert_eq!(fs::read(f.dir.join("data directory/00000000/temp/relaunch.bin")).unwrap().len(), 4);
+    assert_eq!(fs::read(f.dir.join("cache directory/relaunch-cache.bin")).unwrap().len(), 4);
+    let pids = fs::read_to_string(&host_pids).unwrap();
+    let pids: Vec<i32> = pids.lines().map(|s| s.parse().unwrap()).collect();
+    assert_eq!(pids.len(), 1, "{text}");
+    assert_eq!(unsafe { libc::kill(pids[0], 0) }, -1, "Metal helper survived launcher exit");
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+
+    let output = run(f.command_for_console(&guests[1], &f.wine, &f.host, "series-s")
+        .env("VICTORY_SKIP_CPU_CHECK", "1"), &f.dir);
+    let text = logs(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("mapped relaunch supports only the original title executable"), "{text}");
+    assert!(!text.contains("mapped title result:"), "{text}");
 }
