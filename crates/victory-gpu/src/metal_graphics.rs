@@ -78,6 +78,7 @@ pub(crate) struct Prepared {
     pub(crate) texture_slots: Vec<u8>,
     pub(crate) sampler_slots: Vec<u8>,
     pub(crate) texture_entries: Vec<TableEntry>,
+    pub(crate) texture_arrays: Vec<bool>,
     pub(crate) sampler_entries: Vec<TableEntry>,
     // Shader-wide flags conservatively pair every bound sampler and texture.
     explicit_lod: bool,
@@ -129,6 +130,7 @@ pub(crate) struct Texture<'a> {
     pub width: u32,
     pub height: u32,
     pub levels: u32,
+    pub array_layers: Option<u32>,
     pub pixels: &'a [u8],
     pub filter: victory_metal::TextureFilter,
     pub format: victory_metal::TextureFormat,
@@ -143,6 +145,7 @@ pub(crate) struct SampledTextureIdentity {
     pub resource: u64,
     pub generation: usize,
     pub first_mip: u32,
+    pub first_slice: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +154,7 @@ struct SampledTextureKey {
     width: u32,
     height: u32,
     levels: u32,
+    array_layers: Option<u32>,
     format: victory_metal::TextureFormat,
     linear: bool,
     min_lod: u32,
@@ -161,7 +165,7 @@ impl SampledTextureKey {
     fn new(identity: SampledTextureIdentity, texture: &Texture<'_>) -> Self {
         Self {
             identity, width: texture.width, height: texture.height, levels: texture.levels,
-            format: texture.format, linear: matches!(texture.filter, victory_metal::TextureFilter::Linear),
+            array_layers: texture.array_layers, format: texture.format, linear: matches!(texture.filter, victory_metal::TextureFilter::Linear),
             min_lod: texture.min_lod.to_bits(), max_lod: texture.max_lod.to_bits(),
         }
     }
@@ -181,9 +185,15 @@ fn upload_sampled_texture(
     }
     // A failed upload must never leave a stale identity attached to a renderer.
     *cached = None;
-    renderer.set_fragment_texture_mips_at(
-        index, texture.width, texture.height, texture.levels, texture.pixels, texture.format,
-    ).map_err(|e| e.to_string())?;
+    if let Some(layers) = texture.array_layers {
+        renderer.set_fragment_texture_array_mips_at(
+            index, texture.width, texture.height, texture.levels, layers, texture.pixels, texture.format,
+        ).map_err(|e| e.to_string())?;
+    } else {
+        renderer.set_fragment_texture_mips_at(
+            index, texture.width, texture.height, texture.levels, texture.pixels, texture.format,
+        ).map_err(|e| e.to_string())?;
+    }
     *cached = key;
     Ok(())
 }
@@ -195,9 +205,9 @@ mod sampled_texture_cache_tests {
 
     #[test]
     fn only_matching_explicit_identity_and_view_can_reuse_upload() {
-        let identity = SampledTextureIdentity { resource: 1, generation: 0, first_mip: 0 };
+        let identity = SampledTextureIdentity { resource: 1, generation: 0, first_mip: 0, first_slice: 0 };
         let mut texture = Texture {
-            width: 8, height: 8, levels: 2, pixels: &[], filter: TextureFilter::Nearest,
+            width: 8, height: 8, levels: 2, array_layers: None, pixels: &[], filter: TextureFilter::Nearest,
             format: TextureFormat::Rgba8, min_lod: 0.0, max_lod: 0.0,
         };
         let original = SampledTextureKey::new(identity, &texture);
@@ -210,6 +220,7 @@ mod sampled_texture_cache_tests {
             SampledTextureIdentity { resource: 2, ..identity },
             SampledTextureIdentity { generation: 1, ..identity },
             SampledTextureIdentity { first_mip: 1, ..identity },
+            SampledTextureIdentity { first_slice: 1, ..identity },
         ] {
             assert!(!sampled_texture_cached(cached, Some(SampledTextureKey::new(changed, &texture))));
         }
@@ -222,6 +233,9 @@ mod sampled_texture_cache_tests {
         texture.levels = 1;
         assert_ne!(original, SampledTextureKey::new(identity, &texture));
         texture.levels = 2;
+        texture.array_layers = Some(1);
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.array_layers = None;
         texture.filter = TextureFilter::Linear;
         assert_ne!(original, SampledTextureKey::new(identity, &texture));
         texture.filter = TextureFilter::Nearest;
@@ -259,8 +273,8 @@ impl Prepared {
         let count = extra.len() + 1;
         validate_color_signature(pixel, count)?;
         let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
-        let (vertex_host, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
-        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod) =
+        let (vertex_host, _, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
+        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, texture_arrays, explicit_lod) =
             validate(pixel, HwStage::Ps, &varying, false, None, count)?;
         let (vertex, reflected, legacy_attributes) = if extra.is_empty() {
             (convert(&vertex_host, HwStage::Vs, false)?, None, Vec::new())
@@ -284,7 +298,7 @@ impl Prepared {
             texture_slot: texture_slots.first().copied(),
             sampler_slot: sampler_slots.first().copied(),
             texture_slots, sampler_slots,
-            texture_entries, sampler_entries,
+            texture_entries, sampler_entries, texture_arrays,
             explicit_lod: explicit_lod.0, explicit_lod_zero: explicit_lod.1,
             depth: graphics.depth,
             blend: graphics.blend,
@@ -319,8 +333,8 @@ impl Prepared {
         validate_color_signature(pixel, count)?;
         let signatures = vertex_signatures(vertex, inputs)?;
         let varying = varying_signatures_for_stages(vertex, pixel)?;
-        let (vertex_host, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures), count)?;
-        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod) =
+        let (vertex_host, _, _, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures), count)?;
+        let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries, texture_arrays, explicit_lod) =
             validate(pixel, HwStage::Ps, &varying, false, None, count)?;
         let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
         let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(
@@ -347,7 +361,7 @@ impl Prepared {
             pixel, user_data: pixel_host.user_data, dwords,
             texture_slot: texture_slots.first().copied(), sampler_slot: sampler_slots.first().copied(),
             texture_slots, sampler_slots,
-            texture_entries, sampler_entries,
+            texture_entries, sampler_entries, texture_arrays,
             explicit_lod: explicit_lod.0, explicit_lod_zero: explicit_lod.1,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
             cull: 1, front_ccw: false,
@@ -421,6 +435,9 @@ impl Prepared {
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
+        }
+        if textures.iter().zip(&self.texture_arrays).any(|((texture, _), &array)| texture.array_layers.is_some() != array) {
+            return Err("shader texture dimension does not match binding".into());
         }
         self.validate_explicit_lod(textures, samplers)?;
         if self.vertex_stride == 0 {
@@ -513,6 +530,9 @@ impl Prepared {
     ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
+        }
+        if textures.iter().zip(&self.texture_arrays).any(|((texture, _), &array)| texture.array_layers.is_some() != array) {
+            return Err("shader texture dimension does not match binding".into());
         }
         self.validate_explicit_lod(textures, samplers)?;
         if pixels.len() != self.color_targets.len() {
@@ -889,7 +909,7 @@ fn validate(
     input_uv: bool,
     vertex_signatures: Option<&[VertexSignature]>,
     color_count: usize,
-) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>, Vec<TableEntry>, Vec<TableEntry>, (bool, bool)), String> {
+) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>, Vec<TableEntry>, Vec<TableEntry>, Vec<bool>, (bool, bool)), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
     let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
@@ -1027,6 +1047,7 @@ fn validate(
     let mut loads = Vec::new();
     let mut seen = Vec::new();
     let mut texture_accesses = Vec::new();
+    let mut texture_dimensions = Vec::new();
     let mut sampler_accesses = Vec::new();
     let mut explicit_lod = (false, false);
     for descriptor in &traced.descriptors {
@@ -1034,10 +1055,13 @@ fn validate(
             return Err("descriptor must be loaded directly from its table".into());
         };
         let inst = &program.blocks[descriptor.site.0].insts[descriptor.site.1];
-        if !matches!(&inst.fields, victory_shader::gfx10::Fields::Image { dim: 1, .. })
-            || !matches!(inst.name(), "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d")
-        {
-            return Err("only non-comparison 2D texture sampling is supported".into());
+        let array = match &inst.fields {
+            victory_shader::gfx10::Fields::Image { dim: 1, .. } => false,
+            victory_shader::gfx10::Fields::Image { dim: 5, .. } => true,
+            _ => return Err("only 2D and 2D array texture sampling is supported".into()),
+        };
+        if !matches!(inst.name(), "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d") {
+            return Err("only non-comparison texture sampling is supported".into());
         }
         explicit_lod.0 |= inst.name() == "image_sample_l";
         explicit_lod.1 |= inst.name() == "image_sample_lz";
@@ -1068,6 +1092,13 @@ fn validate(
             _ => unreachable!(),
         };
         let index = static_descriptor_index(addr, size)?;
+        if descriptor.role == resource::Role::Resource {
+            if let Some((_, _, previous)) = texture_dimensions.iter().find(|&&(slot, offset, _)| slot == root.slot && offset == index) {
+                if *previous != array { return Err("conflicting texture dimensions for descriptor".into()); }
+            } else {
+                texture_dimensions.push((root.slot, index, array));
+            }
+        }
         if !accesses.contains(&(root.slot, index)) { accesses.push((root.slot, index)); }
         if !loads.contains(&load) { loads.push(load); }
         if !seen.contains(&root.slot) { seen.push(root.slot); }
@@ -1197,7 +1228,11 @@ fn validate(
     let sampler_slots: Vec<_> = samplers.iter().map(|u| u.slot).collect();
     let texture_entries = table_entries(&texture_slots, &texture_accesses)?;
     let sampler_entries = table_entries(&sampler_slots, &sampler_accesses)?;
-    Ok((host, texture_slots, sampler_slots, texture_entries, sampler_entries, explicit_lod))
+    let texture_arrays = texture_entries.iter().map(|entry| {
+        texture_dimensions.iter().find(|&&(slot, offset, _)| slot == entry.slot && offset == entry.offset)
+            .map(|&(_, _, array)| array).ok_or("missing texture dimension")
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok((host, texture_slots, sampler_slots, texture_entries, sampler_entries, texture_arrays, explicit_lod))
 }
 
 fn convert(host: &emit::HostShader, stage: HwStage, sampled: bool) -> Result<Vec<u8>, String> {

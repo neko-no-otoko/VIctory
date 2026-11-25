@@ -147,7 +147,7 @@ unsafe extern "C" {
         error_len: usize,
     ) -> bool;
     fn victory_metal_set_texture_at(
-        renderer: *mut c_void, index: u32, width: u32, height: u32, levels: u32,
+        renderer: *mut c_void, index: u32, width: u32, height: u32, levels: u32, layers: u32,
         pixels: *const u8, format: u32, error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_set_sampler_at(
@@ -750,7 +750,16 @@ impl Renderer {
         &mut self, index: u32, width: u32, height: u32, levels: u32,
         pixels: &[u8], format: TextureFormat,
     ) -> Result<(), RenderError> {
-        if !self.fragment_texture || index >= 16 || width == 0 || height == 0 || levels == 0
+        self.set_fragment_texture_array_mips_at(index, width, height, levels, 1, pixels, format)
+    }
+
+    /// Upload a 2D-array texture at a direct resource heap index.
+    /// Data is slice-major, then mip-major, with tightly packed texels or BC blocks.
+    pub fn set_fragment_texture_array_mips_at(
+        &mut self, index: u32, width: u32, height: u32, levels: u32, layers: u32,
+        pixels: &[u8], format: TextureFormat,
+    ) -> Result<(), RenderError> {
+        if !self.fragment_texture || index >= 16 || width == 0 || height == 0 || levels == 0 || layers == 0
             || levels > u32::BITS - width.max(height).leading_zeros()
         {
             return Err(RenderError("invalid texture dimensions, mip count or binding".into()));
@@ -769,6 +778,8 @@ impl Renderer {
             w = (w / 2).max(1);
             h = (h / 2).max(1);
         }
+        let size = size.checked_mul(layers as usize)
+            .ok_or_else(|| RenderError("texture dimensions overflow".into()))?;
         if pixels.len() != size {
             return Err(RenderError("expected tightly packed mip data".into()));
         }
@@ -777,7 +788,7 @@ impl Renderer {
         // synchronous upload, which retains its own Metal texture.
         let ok = unsafe {
             victory_metal_set_texture_at(
-                self.handle.as_ptr(), index, width, height, levels, pixels.as_ptr(),
+                self.handle.as_ptr(), index, width, height, levels, layers, pixels.as_ptr(),
                 format.native_value(), error.as_mut_ptr(), error.len(),
             )
         };

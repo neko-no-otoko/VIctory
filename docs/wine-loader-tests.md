@@ -412,9 +412,9 @@ front/back stencil operations. Wireframe, depth bias, depth clipping disabled,
 multisampling and conservative rasterization remain unsupported.
 Committed default-heap resources are limited to
 typed RGBA8 and BGRA8 UNORM or UNORM_SRGB, and typed BC1/BC3 linear or sRGB
-sampled textures (including multiple mips); single-mip RGBA8/BGRA8 UNORM or
-UNORM_SRGB color targets; single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT
-depth/stencil textures; and buffers.
+sampled textures (including multiple mips and non-tiled Texture2D arrays of
+up to 256 slices); single-mip RGBA8/BGRA8 UNORM or UNORM_SRGB color targets;
+single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT depth/stencil textures; and buffers.
 Graphics supports one to eight color targets and an optional depth target per
 draw. Each target must have matching dimensions and an exactly matching typed
 pipeline format; targets must be distinct and cannot alias sampled textures or
@@ -438,6 +438,11 @@ so multi-mip explicit-LOD draws are rejected when a clamp could affect them;
 level-zero samples with a positive minimum are likewise rejected. Single-mip
 views remain supported. This conservative check applies across all textures
 and samplers in the draw.
+Texture2D array SRVs select bounded slice and mip ranges. Subresources use D3D
+slice-major ordering, with each slice's mip chain in order; full subresource
+buffer copies preserve 256-byte row-pitch and 512-byte offset alignment.
+Array shader dimensions must match the view. Array render/depth targets, tiled
+arrays, cube and 3D textures, and per-subresource barriers remain unsupported.
 Pixel shaders may access multiple texture and sampler entries at statically
 traced table-relative indices, including nonzero indices and table bases.
 Guest shader-visible resource and sampler heaps hold up to 256 entries; per
@@ -504,9 +509,10 @@ the tested M3 Max reports that its Metal device does not support D24S8.
 The path supports full depth/stencil clears, 8-bit stencil reference and
 read/write masks, and separate front/back D3D stencil comparisons and
 operations. Plane readback uses D3D12's R32_FLOAT depth and R8_UINT stencil
-footprints. Only whole-resource transitions, single-mip 2D textures, null DSV
-descriptors, and clockwise front faces are supported; partial clears,
-per-plane barriers, stencil SRVs and copyable-footprint queries for this
+footprints. Only whole-resource transitions, single-mip 2D textures and null DSV
+descriptors are supported; either clockwise or counterclockwise front winding
+can select the stencil face. Partial clears, per-plane barriers, stencil SRVs
+and copyable-footprint queries for this
 format remain unsupported. The launcher fixture tests both faces, stencil
 and depth pass/fail, masks, plane readback, and invalid formats and states.
 

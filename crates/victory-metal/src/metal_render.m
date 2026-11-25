@@ -612,7 +612,7 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
 }
 
 bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, uint32_t height,
-                                  uint32_t levels, const uint8_t *rgba, uint32_t texture_format,
+                                  uint32_t levels, uint32_t layers, const uint8_t *rgba, uint32_t texture_format,
                                   char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
@@ -636,29 +636,33 @@ bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, 
         if (blockBytes && ![r.device supportsBCTextureCompression])
             return fail(error, error_len, @"BC texture compression is not supported by the Metal device");
         if (!texture || texture.width != width || texture.height != height ||
-            texture.pixelFormat != format || texture.mipmapLevelCount != levels) {
+            texture.pixelFormat != format || texture.mipmapLevelCount != levels ||
+            texture.textureType != MTLTextureType2DArray || texture.arrayLength != layers) {
             MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:YES];
             desc.mipmapLevelCount = levels;
             desc.textureType = MTLTextureType2DArray;
-            desc.arrayLength = 1;
+            desc.arrayLength = layers;
             desc.storageMode = MTLStorageModeShared;
             desc.usage = MTLTextureUsageShaderRead;
             texture = [r.device newTextureWithDescriptor:desc];
             if (!texture) return fail(error, error_len, @"sampled texture allocation failed");
         }
-        uint32_t w = width, h = height;
         const uint8_t *levelPixels = rgba;
-        for (uint32_t level = 0; level < levels; ++level) {
-            size_t rowBytes = blockBytes ? (((size_t)w + 3) / 4) * blockBytes : (size_t)w * 4;
-            size_t rows = blockBytes ? ((size_t)h + 3) / 4 : h;
-            size_t imageBytes = rowBytes * rows;
-            [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0
-                         withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:imageBytes];
-            levelPixels += imageBytes;
-            w = w > 1 ? w / 2 : 1;
-            h = h > 1 ? h / 2 : 1;
+        for (uint32_t slice = 0; slice < layers; ++slice) {
+            uint32_t w = width, h = height;
+            for (uint32_t level = 0; level < levels; ++level) {
+                size_t rowBytes = blockBytes ? (((size_t)w + 3) / 4) * blockBytes : (size_t)w * 4;
+                size_t rows = blockBytes ? ((size_t)h + 3) / 4 : h;
+                size_t imageBytes = rowBytes * rows;
+                [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:slice
+                             withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:imageBytes];
+                levelPixels += imageBytes;
+                w = w > 1 ? w / 2 : 1;
+                h = h > 1 ? h / 2 : 1;
+            }
         }
-        // IRDescriptorTableEntry is 24 bytes: gpuVA, textureViewID, metadata.
+        // IRDescriptorTableSetTexture encodes the resource ID independently of
+        // texture dimensions and leaves the 24-byte entry's metadata zero.
         uint64_t *tex = (uint64_t *)r.textureHeap.contents + (size_t)index * 3;
         tex[0] = 0; tex[1] = texture.gpuResourceID._impl; tex[2] = 0;
         r.sampledTextures[key] = texture;
