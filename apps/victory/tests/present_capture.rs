@@ -45,7 +45,8 @@ fn drawable_capture_checks_channels_alpha_orientation_and_changed_source_size() 
     // waiting for the announced payload, even when its pixel count is small.
     for fields in [[0, 64, 28, 256, 16384, 1], [64, 64, 30, 256, 16384, 1],
         [64, 64, 28, 255, 16384, 1], [64, 64, 28, 256, 16384, 2],
-        [3841, 1, 28, 15364, 15364, 0], [1, 2161, 28, 4, 8644, 0],
+        [16_385, 1, 28, 65_540, 65_540, 0], [1, 16_385, 28, 4, 65_540, 0],
+        [4096, 1025, 28, 16384, 16_793_600, 0], [2048, 2161, 28, 8192, 17_702_912, 0],
         [1, 1, 28, u32::MAX, 4, 0], [3840, 2160, 28, 16384, 35_388_416, 0],
         [3840, 2160, 28, 15360, 33_177_599, 0]] {
         let (status, _, message) = request(addr, &token, fields, &[]);
@@ -54,7 +55,8 @@ fn drawable_capture_checks_channels_alpha_orientation_and_changed_source_size() 
     }
     // BGRA expectations at top-left, top-right, bottom-left and bottom-right.
     let colors = [[19, 37, 223, 255], [201, 42, 13, 192], [31, 209, 53, 128], [177, 91, 7, 64]];
-    for (width, height, format) in [(64usize, 64usize, 28u32), (64, 64, 29), (96, 80, 87), (96, 80, 91)] {
+    for (width, height, format) in [(64usize, 64usize, 28u32), (64, 64, 29), (96, 80, 87),
+        (96, 80, 91), (1080, 2560, 28)] {
         let pitch = width * 4 + 16;
         let mut pixels = vec![0x5a; (height - 1) * pitch + width * 4];
         for y in 0..height { for x in 0..width {

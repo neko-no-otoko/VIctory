@@ -884,12 +884,20 @@ preserved. The caller must not modify mapped resources concurrently. Other
 formats, multiple planes, placement, non-null present parameters, HDR and
 general swap-chain behavior are unsupported.
 
-The presentation source can be 1–3840 pixels wide and 1–2160 pixels high.
-A packed 3840×2160 image occupies 33,177,600 bytes; the helper uploads the
-full source to a matching Metal texture. Padded rows are accepted when
-`width * 4 <= pitch <= 16384` and `(height - 1) * pitch + width * 4`
-is at most 32 MiB. The wire length must equal this extent; there is no
-padding after the last row. These limits apply only to presentation input.
+The presentation wire length is `(height - 1) * pitch + width * 4`: rows may
+have padding between them, but there is none after the last row. Two source
+budgets apply:
+
+- **Up to 16 MiB:** landscape and portrait layouts are accepted, including
+  1080×2560 and 4096×1024. Each dimension must be 1–16,384 texels and the
+  pitch must be at least `width * 4` and at most 64 KiB. For a single row
+  the stride is unused, so it is capped at the greater of 16 KiB and the row
+  size rounded up to a 256-byte boundary.
+- **Above 16 MiB, up to 32 MiB:** width is limited to 3840, height to 2160,
+  and pitch to 16 KiB. A packed 3840×2160 source occupies 33,177,600 bytes;
+  the helper uploads it to a matching Metal texture.
+
+These budgets apply only to presentation input.
 The optional drawable readback still rejects more than 16 MiB of BGRA8
 output: to capture a UHD source, present it into a smaller window.
 Without capture, a UHD source does not require or guarantee a UHD drawable.
@@ -1407,22 +1415,23 @@ cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_
 cargo test --locked -p victory --target x86_64-apple-darwin --test present_capture -- --ignored --nocapture --test-threads=1
 ```
 
-For the UHD proof, restart the helper with `VICTORY_WINE_METAL_DRAWABLE_DIR`
-pointing to a new empty directory. In the test terminal set
-`VICTORY_TEST_DRAWABLE_DIR` to that directory and update the address/token for
-the fresh helper. Then run:
+The UHD and legacy wide-layout proof starts a fresh helper for each source.
+Set `VICTORY_TEST_METAL_HOST` to the arm64 helper, `VICTORY_TEST_METAL_CONVERTER`
+to the converter, `VICTORY_TEST_D3D12X_DLL` to the x86-64 Wine provider, and
+`LLVM_MINGW` to the LLVM-MinGW root. No external token or capture directory
+is needed for this test:
 
 ```sh
 cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_graphics normal_wine_presents_uhd_and_scaled_drawable -- --ignored --nocapture
 ```
 
-The test first presents a small frame to size the window. A normal x86-64
-Wine PE then fills a 3840×2160 RGBA8 upload buffer with a coordinate-dependent
-color/alpha pattern, copies it to a texture and calls `PresentX`. On an M3 Max,
-the arm64 helper's GPU readback was a 128×128 BGRA8 drawable: four samples
-matched their corresponding UHD source coordinates after nearest scaling.
-This verifies UHD **input**, not 4K display output. `present_capture` also
-checks malformed source headers without sending a pixel payload.
+Each helper receives a small frame to size the window. A normal x86-64 Wine
+PE then fills a 3840×2160 or 4096×1024 RGBA8 upload buffer with a
+coordinate-dependent color/alpha pattern, copies it to a texture and calls
+`PresentX`. The test checks four corresponding pixel coordinates in the scaled
+BGRA8 drawable. This verifies source data, not 4K display output.
+`present_capture` also checks a padded 1080×2560 portrait source and rejects
+malformed source headers without reading a pixel payload.
 
 On an M3 Max, an arm64 CLI and arm64-only helper passed the normal x86-64 Wine
 mip GPU readback and offline import tests. Separately, the arm64 helper passed

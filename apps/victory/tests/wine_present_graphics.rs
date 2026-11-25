@@ -115,41 +115,23 @@ mod normal_wine {
     }
 
     #[test]
-    #[ignore = "requires Wine, LLVM-MinGW, provider DLLs and a fresh presentation helper with drawable capture enabled"]
+    #[ignore = "requires Wine, LLVM-MinGW, provider DLLs, a presentation-enabled Metal helper and Aqua"]
     fn normal_wine_presents_uhd_and_scaled_drawable() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpStream;
+        use std::process::Child;
 
-        let addr = std::env::var("VICTORY_WINE_METAL_ADDR").expect("set VICTORY_WINE_METAL_ADDR");
-        let token = std::env::var("VICTORY_WINE_METAL_TOKEN").expect("set VICTORY_WINE_METAL_TOKEN");
-        assert_eq!(token.len(), 32);
-        let mut auth = [0u8; 16];
-        for (i, byte) in auth.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&token[2*i..2*i+2], 16).unwrap();
+        struct Helper(Child);
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let capture = PathBuf::from(std::env::var_os("VICTORY_TEST_DRAWABLE_DIR").expect("set VICTORY_TEST_DRAWABLE_DIR"));
-        assert!(!capture.join("drawable-00000000.bgra").exists(), "capture directory must be empty");
-        // Prime the helper with a small presentation so its drawable stays
-        // bounded while the following UHD source is downscaled into it.
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-        for value in [0x3147_4d56u32, 4, 64, 64, 28, 256, 16384, 0] {
-            stream.write_all(&value.to_le_bytes()).unwrap();
-        }
-        stream.write_all(&auth).unwrap();
-        stream.write_all(&vec![0; 16384]).unwrap();
-        let mut header = [0u8; 16];
-        stream.read_exact(&mut header).unwrap();
-        let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
-        assert_eq!(word(0), 0x3147_4d56);
-        let (status, len, message_len) = (word(4), word(8) as usize, word(12) as usize);
-        assert!(len <= 16 * 1024 * 1024 + 12 && message_len <= 4096);
-        let mut payload = vec![0; len + message_len];
-        stream.read_exact(&mut payload).unwrap();
-        assert_eq!(status, 0, "priming presentation failed: {:?}", &payload[len..]);
-        drop(stream);
 
         let llvm = PathBuf::from(std::env::var_os("LLVM_MINGW").expect("set LLVM_MINGW"));
+        let host = PathBuf::from(std::env::var_os("VICTORY_TEST_METAL_HOST").expect("set VICTORY_TEST_METAL_HOST"));
+        let converter = PathBuf::from(std::env::var_os("VICTORY_TEST_METAL_CONVERTER").expect("set VICTORY_TEST_METAL_CONVERTER"));
         let dll = fs::canonicalize(std::env::var_os("VICTORY_TEST_D3D12X_DLL").expect("set VICTORY_TEST_D3D12X_DLL")).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
@@ -160,35 +142,85 @@ mod normal_wine {
         checked(Command::new(llvm.join("bin/llvm-dlltool")).current_dir(dir)
             .args(["-m", "i386:x86-64", "-d", "d3d12_xs.def", "-l", "d3d12_xs.lib"]), dir);
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/windows_d3d12x_present_graphics.c");
-        checked(Command::new(llvm.join("bin/x86_64-w64-mingw32-clang")).current_dir(dir)
-            .args(["-std=c11", "-fno-emulated-tls", "-O1", "-DNORMAL_WINE_PRESENT", "-DUHD_PRESENT"])
-            .arg(source).arg("d3d12_xs.lib").args(["-o", "uhd.exe"]), dir);
         let runtime = checked(Command::new("winepath").env("WINEPREFIX", &prefix.0).env("WINEDEBUG", "-all")
             .env("WINEDLLOVERRIDES", "d3d12_xs=n;mscoree,mshtml=").arg("-w")
             .arg(llvm.join("x86_64-w64-mingw32/bin")), dir);
-        let output = run(Command::new("wine").current_dir(dir).arg(dir.join("uhd.exe"))
-            .env("WINEPREFIX", &prefix.0).env("WINEDEBUG", "-all")
-            .env("WINEDLLOVERRIDES", "d3d12_xs=n;mscoree,mshtml=")
-            .env("MVK_CONFIG_LOG_LEVEL", "0").env("WINEPATH", String::from_utf8(runtime.stdout).unwrap().trim()), dir);
-        let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert_eq!(output.status.code(), Some(42), "{text}");
-        assert!(text.contains("Wine UHD PresentX passed"), "{text}");
+        let runtime = String::from_utf8(runtime.stdout).unwrap();
 
-        let bytes = fs::read(capture.join("drawable-00000001.bgra")).expect("UHD guest drawable capture");
-        assert!(bytes.len() >= 8);
-        let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        assert!(width >= 8 && height >= 8 && width < 3840 && height < 2160);
-        assert_eq!(bytes.len(), 8 + width * height * 4);
-        for (x, y) in [(width/8, height/8), (3*width/8, 5*height/8),
-                       (5*width/8, 3*height/8), (7*width/8, 7*height/8)] {
-            let sx = ((2*x+1)*3840)/(2*width);
-            let sy = ((2*y+1)*2160)/(2*height);
-            let (bx, by) = (sx/64, sy/64);
-            let expected = [(bx*31+by*3) as u8, (bx*7+by*29) as u8,
-                            (bx*17+by*13) as u8, (64+(bx+by)%192) as u8];
-            let at = 8 + (y*width+x)*4;
-            assert_eq!(&bytes[at..at+4], &expected, "drawable ({x},{y}), source ({sx},{sy})");
+        for (source_width, source_height) in [(3840usize, 2160usize), (4096, 1024)] {
+            let capture = dir.join(format!("capture-{source_width}x{source_height}"));
+            fs::create_dir(&capture).unwrap();
+            let mut auth = [0u8; 16];
+            File::open("/dev/urandom").unwrap().read_exact(&mut auth).unwrap();
+            let token = auth.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let stderr_path = dir.join(format!("helper-{source_width}x{source_height}.log"));
+            let mut child = Helper(Command::new(&host).args(["127.0.0.1:0", "--announce"])
+                .env("VICTORY_WINE_METAL_PRESENT", "1")
+                .env("VICTORY_WINE_METAL_DRAWABLE_DIR", &capture)
+                .env("VICTORY_WINE_METAL_TOKEN", &token)
+                .env("VICTORY_METAL_CONVERTER", &converter)
+                .stdout(Stdio::piped()).stderr(File::create(&stderr_path).unwrap())
+                .spawn().expect("spawn presentation helper"));
+            let stdout = child.0.stdout.take().unwrap();
+            let (send, recv) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+                let _ = send.send(result);
+            });
+            let ready = recv.recv_timeout(Duration::from_secs(30)).expect("helper readiness timed out").unwrap();
+            let addr = ready.trim().strip_prefix("VICTORY_WINE_METAL_READY=").expect("helper readiness address");
+
+            // Prime a small drawable; each case then captures its guest frame
+            // in the helper's second and final diagnostic capture slot.
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            for value in [0x3147_4d56u32, 4, 64, 64, 28, 256, 16384, 0] {
+                stream.write_all(&value.to_le_bytes()).unwrap();
+            }
+            stream.write_all(&auth).unwrap();
+            stream.write_all(&[0; 16384]).unwrap();
+            let mut header = [0u8; 16];
+            stream.read_exact(&mut header).unwrap();
+            let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
+            assert_eq!(word(0), 0x3147_4d56);
+            let (status, len, message_len) = (word(4), word(8) as usize, word(12) as usize);
+            assert!(len <= 16 * 1024 * 1024 + 12 && message_len <= 4096);
+            let mut payload = vec![0; len + message_len];
+            stream.read_exact(&mut payload).unwrap();
+            assert_eq!(status, 0, "priming presentation failed: {:?}", &payload[len..]);
+            drop(stream);
+
+            checked(Command::new(llvm.join("bin/x86_64-w64-mingw32-clang")).current_dir(dir)
+                .args(["-std=c11", "-fno-emulated-tls", "-O1", "-DNORMAL_WINE_PRESENT", "-DUHD_PRESENT"])
+                .arg(format!("-DUHD_WIDTH={source_width}")).arg(format!("-DUHD_HEIGHT={source_height}"))
+                .arg(&source).arg("d3d12_xs.lib").args(["-o", "uhd.exe"]), dir);
+            let output = run(Command::new("wine").current_dir(dir).arg(dir.join("uhd.exe"))
+                .env("WINEPREFIX", &prefix.0).env("WINEDEBUG", "-all")
+                .env("WINEDLLOVERRIDES", "d3d12_xs=n;mscoree,mshtml=")
+                .env("VICTORY_WINE_METAL_ADDR", addr).env("VICTORY_WINE_METAL_TOKEN", &token)
+                .env("MVK_CONFIG_LOG_LEVEL", "0").env("WINEPATH", runtime.trim()), dir);
+            let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.status.code(), Some(42), "{source_width}x{source_height}: {text}");
+            assert!(text.contains("Wine UHD PresentX passed"), "{text}");
+
+            let bytes = fs::read(capture.join("drawable-00000001.bgra")).expect("guest drawable capture");
+            assert!(bytes.len() >= 8);
+            let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            assert!(width >= 8 && height >= 8 && width < source_width && height < source_height);
+            assert_eq!(bytes.len(), 8 + width * height * 4);
+            for (x, y) in [(width/8, height/8), (3*width/8, 5*height/8),
+                           (5*width/8, 3*height/8), (7*width/8, 7*height/8)] {
+                let sx = ((2*x+1)*source_width)/(2*width);
+                let sy = ((2*y+1)*source_height)/(2*height);
+                let (bx, by) = (sx/64, sy/64);
+                let expected = [(bx*31+by*3) as u8, (bx*7+by*29) as u8,
+                                (bx*17+by*13) as u8, (64+(bx+by)%192) as u8];
+                let at = 8 + (y*width+x)*4;
+                assert_eq!(&bytes[at..at+4], &expected, "{source_width}x{source_height} drawable ({x},{y}), source ({sx},{sy})");
+            }
+            eprintln!("Wine PresentX {source_width}x{source_height} captured {width}x{height} drawable");
         }
     }
 }

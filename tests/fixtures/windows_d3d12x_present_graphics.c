@@ -79,8 +79,14 @@ static void copy_texture(void *list,void *buffer,void *texture,unsigned width,un
     SLOT(list,0x80,Copy)(list,upload?&tex:&buf,0,0,0,upload?&buf:&tex,0);
 }
 #ifdef UHD_PRESENT
+#ifndef UHD_WIDTH
+#define UHD_WIDTH 3840
+#endif
+#ifndef UHD_HEIGHT
+#define UHD_HEIGHT 2160
+#endif
 static int present_uhd(void) {
-    enum { WIDTH=3840, HEIGHT=2160, PITCH=WIDTH*4, SIZE=PITCH*HEIGHT };
+    enum { WIDTH=UHD_WIDTH, HEIGHT=UHD_HEIGHT, PITCH=WIDTH*4, SIZE=PITCH*HEIGHT };
     unsigned version=0x00020004; void *dev=0,*upload=0,*texture=0,*mapped=0;
     if (D3D12XboxCreateDevice(0,&version,&IID_ID3D12Device,&dev)!=S_OK || !dev) return 1;
     D3D12_HEAP_PROPERTIES hp={D3D12_HEAP_TYPE_DEFAULT,0,0,0,0};
