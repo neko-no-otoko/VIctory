@@ -36,6 +36,84 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
+// Exact source paths admitted by type only. All other checks still apply.
+const ALLOWED_SOURCE_PATHS: &[&str] = &[
+    "crates/victory-gameinput-dll/GameInput.def",
+    "crates/victory-metal/src/metal_present.m",
+    "crates/victory-metal/tests/fixtures/wine_metal_bridge.c",
+    "crates/victory-metal/tests/fixtures/wine_metal_guest.c",
+    "tests/fixtures/macos_d3d12x_bc.c",
+    "tests/fixtures/macos_d3d12x_bgra.c",
+    "tests/fixtures/macos_d3d12x_blend.c",
+    "tests/fixtures/macos_d3d12x_cbv.c",
+    "tests/fixtures/macos_d3d12x_depth.c",
+    "tests/fixtures/macos_d3d12x_graphics.c",
+    "tests/fixtures/macos_d3d12x_group_barrier.c",
+    "tests/fixtures/macos_d3d12x_indexed.c",
+    "tests/fixtures/macos_d3d12x_mips.c",
+    "tests/fixtures/macos_d3d12x_srgb.c",
+    "tests/fixtures/macos_d3d12x_texture.c",
+    "tests/fixtures/macos_d3d12x_tiled.c",
+    "tests/fixtures/macos_d3d12x_tiled64.c",
+    "tests/fixtures/macos_d3d12x_uv.c",
+    "tests/fixtures/macos_d3d12x_varying.c",
+    "tests/fixtures/macos_d3d12x_viewport.c",
+    "tests/fixtures/windows_d3d12x_blend_graphics.c",
+    "tests/fixtures/windows_d3d12x_blend_shaders.h",
+    "tests/fixtures/windows_d3d12x_depth_graphics.c",
+    "tests/fixtures/windows_d3d12x_graphics_shaders.h",
+    "tests/fixtures/windows_d3d12x_indexed_graphics.c",
+    "tests/fixtures/windows_d3d12x_ordered_graphics.c",
+    "tests/fixtures/windows_d3d12x_ordered_shaders.h",
+    "tests/fixtures/windows_d3d12x_present_graphics.c",
+    "tests/fixtures/windows_d3d12x_tls_compute.c",
+    "tests/fixtures/windows_d3d12x_tls_graphics.c",
+    "tests/fixtures/windows_d3d12x_uv_graphics.c",
+    "tests/fixtures/windows_d3d12x_uv_shaders.h",
+    "tests/fixtures/wine_acphal.c",
+    "tests/fixtures/wine_acphal_pin.c",
+    "tests/fixtures/wine_gameinput.c",
+    "tests/fixtures/wine_gameinput_pin.c",
+    "tests/fixtures/wine_launcher_bc.c",
+    "tests/fixtures/wine_launcher_cbv.c",
+    "tests/fixtures/wine_launcher_compute_bounds.c",
+    "tests/fixtures/wine_launcher_dynamic_bounds.c",
+    "tests/fixtures/wine_launcher_fence.c",
+    "tests/fixtures/wine_launcher_formats.c",
+    "tests/fixtures/wine_launcher_gameinput.c",
+    "tests/fixtures/wine_launcher_group_barrier.c",
+    "tests/fixtures/wine_launcher_large.c",
+    "tests/fixtures/wine_launcher_mips.c",
+    "tests/fixtures/wine_launcher_mrt.c",
+    "tests/fixtures/wine_launcher_multi_views.c",
+    "tests/fixtures/wine_launcher_multitexture.c",
+    "tests/fixtures/wine_launcher_pls.c",
+    "tests/fixtures/wine_launcher_raster.c",
+    "tests/fixtures/wine_launcher_raw_views.c",
+    "tests/fixtures/wine_launcher_relaunch.c",
+    "tests/fixtures/wine_launcher_sampler_address.c",
+    "tests/fixtures/wine_launcher_sampler_lod.c",
+    "tests/fixtures/wine_launcher_saves.c",
+    "tests/fixtures/wine_launcher_static_tables.c",
+    "tests/fixtures/wine_launcher_stencil.c",
+    "tests/fixtures/wine_launcher_texture_3d.c",
+    "tests/fixtures/wine_launcher_texture_array.c",
+    "tests/fixtures/wine_launcher_texture_cube.c",
+    "tests/fixtures/wine_launcher_tiled.c",
+    "tests/fixtures/wine_launcher_tls_compute.c",
+    "tests/fixtures/wine_launcher_topology.c",
+    "tests/fixtures/wine_launcher_varying.c",
+    "tests/fixtures/wine_newer_graphics.c",
+    "tests/fixtures/wine_process_compute_tls.c",
+    "tests/fixtures/wine_process_providers.c",
+    "tests/fixtures/wine_process_tls.c",
+    "tests/fixtures/wine_process_tls_dep.c",
+    "tests/fixtures/wine_title_root.c",
+    "tests/fixtures/wine_xapu.c",
+    "tests/fixtures/wine_xapu_pin.c",
+    "tests/fixtures/wine_xmem.c",
+];
+
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
     "crates/victory-formats/src/bcpack-tables.bin",
@@ -156,7 +234,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
+    let allowed = ALLOWED_SOURCE_PATHS.contains(&path) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -251,6 +329,22 @@ mod tests {
         );
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn exact_source_paths_only_bypass_type_check() {
+        let allowed = "tests/fixtures/macos_d3d12x_uv.c";
+        assert!(check(allowed, b"int main(void) { return 42; }\n").is_empty());
+        assert!(check("other/macos_d3d12x_uv.c", b"int main(void) { return 42; }\n")
+            .iter().any(|p| p == "file type not on the allowlist"));
+        assert!(check(allowed, b"MZ executable").iter().any(|p| p.contains("PE executable")));
+        assert!(check(allowed, b"code\0payload").iter().any(|p| p.contains("NUL")));
+        assert!(check(allowed, &vec![b'a'; super::MAX_FILE_SIZE + 1])
+            .iter().any(|p| p.contains("exceeds")));
+        assert!(check(allowed, format!("// {}\n", "A1".repeat(400)).as_bytes())
+            .iter().any(|p| p.contains("hex/base64")));
+        let literals = (0..300).map(|_| "0x42").collect::<Vec<_>>().join(", ");
+        assert!(check(allowed, literals.as_bytes()).iter().any(|p| p.contains("hex digits")));
     }
 
     #[test]

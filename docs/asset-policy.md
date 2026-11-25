@@ -48,6 +48,11 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    type, be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs. Exceptions need an entry
    with a reason in `xtask/src/policy.rs`.
+   Specifically listed repository-relative synthetic C, header, Objective-C
+   and linker-definition source paths are admitted by type only; the size,
+   magic, NUL and encoded-payload checks still apply. A matching basename
+   elsewhere is not admitted by those path entries. These entries are not
+   exceptions and do not authorize title-derived data.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables
