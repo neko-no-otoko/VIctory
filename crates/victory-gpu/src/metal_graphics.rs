@@ -80,6 +80,8 @@ pub(crate) struct Prepared {
     pub(crate) vertex_stride: u32,
     pub(crate) color_format: victory_metal::ColorFormat,
     pub(crate) blend: victory_metal::BlendState,
+    color_targets: Vec<victory_metal::RenderTarget>,
+    pub(crate) legacy_attributes: Vec<victory_metal::VertexAttribute>,
     renderer: Option<(u32, u32, victory_metal::Renderer)>,
     input_renderer: Option<(u32, u32, Vec<victory_metal::VertexAttribute>, victory_metal::Renderer)>,
     renderer_texture: [Option<SampledTextureKey>; 16],
@@ -229,11 +231,32 @@ mod sampled_texture_cache_tests {
 
 impl Prepared {
     pub(crate) fn new(vertex: &[u8], pixel: &[u8], graphics: GraphicsState) -> Result<Self, String> {
+        Self::new_mrt(vertex, pixel, graphics, &[])
+    }
+
+    pub(crate) fn new_mrt(vertex: &[u8], pixel: &[u8], graphics: GraphicsState,
+        extra: &[(victory_metal::ColorFormat, victory_metal::BlendState)]) -> Result<Self, String> {
+        let count = extra.len() + 1;
+        validate_color_signature(pixel, count)?;
         let varying = varying_signatures(vertex, pixel, graphics.input_uv)?;
-        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None)?;
+        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, graphics.input_uv, None, count)?;
         let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries) =
-            validate(pixel, HwStage::Ps, &varying, false, None)?;
-        let vertex = convert(&vertex_host, HwStage::Vs, false)?;
+            validate(pixel, HwStage::Ps, &varying, false, None, count)?;
+        let (vertex, legacy_attributes) = if extra.is_empty() {
+            (convert(&vertex_host, HwStage::Vs, false)?, Vec::new())
+        } else {
+            let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
+            let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(std::path::Path::new(&path), &vertex_host.dxil)?;
+            let names: &[(&str, u32, u32)] = if graphics.input_uv { &[("POSITION0", 2, 0), ("TEXCOORD0", 16, 16)] } else { &[("POSITION0", 2, 0)] };
+            if reflected.len() != names.len() { return Err("converter vertex reflection does not match input signature".into()); }
+            let mut attributes = Vec::with_capacity(names.len());
+            for &(name, format, offset) in names {
+                let a = reflected.iter().find(|a| a.name.eq_ignore_ascii_case(name)).ok_or("missing reflected vertex attribute")?;
+                let index = a.index.checked_add(11).filter(|&i| i < 31).ok_or("reflected vertex attribute exceeds Metal limits")?;
+                attributes.push(victory_metal::VertexAttribute { index: u32::from(index), format, slot: 0, offset, stride: if graphics.input_uv { 24 } else { 16 }, per_instance: false, step_rate: 0 });
+            }
+            (vertex, attributes)
+        };
         let pixel = convert(&pixel_host, HwStage::Ps, !texture_slots.is_empty())?;
         let dwords = pixel_host.user_data_dwords() as usize;
         let user_data = pixel_host.user_data;
@@ -250,6 +273,8 @@ impl Prepared {
             blend: graphics.blend,
             vertex_stride: if graphics.input_uv { 24 } else { 16 },
             color_format: graphics.color_format,
+            color_targets: std::iter::once((graphics.color_format, graphics.blend)).chain(extra.iter().copied()).map(|(format, blend)| victory_metal::RenderTarget { format, blend }).collect(),
+            legacy_attributes,
             renderer: None,
             input_renderer: None,
             renderer_texture: [None; 16],
@@ -263,11 +288,21 @@ impl Prepared {
         vertex: &[u8], pixel: &[u8], graphics: GraphicsState,
         inputs: &[crate::wine_transport::VertexInput],
     ) -> Result<(Self, Vec<ResolvedVertexInput>), String> {
+        Self::new_inputs_mrt(vertex, pixel, graphics, inputs, &[])
+    }
+
+    pub(crate) fn new_inputs_mrt(
+        vertex: &[u8], pixel: &[u8], graphics: GraphicsState,
+        inputs: &[crate::wine_transport::VertexInput],
+        extra: &[(victory_metal::ColorFormat, victory_metal::BlendState)],
+    ) -> Result<(Self, Vec<ResolvedVertexInput>), String> {
+        let count = extra.len() + 1;
+        validate_color_signature(pixel, count)?;
         let signatures = vertex_signatures(vertex, inputs)?;
         let varying = varying_signatures_for_stages(vertex, pixel)?;
-        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures))?;
+        let (vertex_host, _, _, _, _) = validate(vertex, HwStage::Vs, &varying, false, Some(&signatures), count)?;
         let (pixel_host, texture_slots, sampler_slots, texture_entries, sampler_entries) =
-            validate(pixel, HwStage::Ps, &varying, false, None)?;
+            validate(pixel, HwStage::Ps, &varying, false, None, count)?;
         let path = std::env::var_os("VICTORY_METAL_CONVERTER").ok_or("set VICTORY_METAL_CONVERTER")?;
         let (vertex, reflected) = victory_metal::converter::convert_vertex_with_reflection(
             std::path::Path::new(&path), &vertex_host.dxil,
@@ -295,6 +330,8 @@ impl Prepared {
             texture_entries, sampler_entries,
             depth: graphics.depth, blend: graphics.blend, vertex_stride: 0,
             color_format: graphics.color_format, renderer: None, input_renderer: None,
+            color_targets: std::iter::once((graphics.color_format, graphics.blend)).chain(extra.iter().copied()).map(|(format, blend)| victory_metal::RenderTarget { format, blend }).collect(),
+            legacy_attributes: Vec::new(),
             renderer_texture: [None; 16], input_renderer_texture: [None; 16],
         }, resolved))
     }
@@ -410,11 +447,25 @@ impl Prepared {
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
+        self.draw_inputs_mrt(width, height, attributes, buffers, indices, first_vertex, vertex_count,
+            instance_count, start_instance, viewport, scissor, depth, stencil, stencil_reference,
+            constants, textures, samplers, &mut [pixels], preserve)
+    }
+
+    pub(crate) fn draw_inputs_mrt(
+        &mut self, width: u32, height: u32, attributes: &[victory_metal::VertexAttribute],
+        buffers: &[victory_metal::VertexBuffer<'_>], indices: Option<(victory_metal::IndexData<'_>, i32)>,
+        first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
+        viewport: [f64; 6], scissor: [u32; 4], mut depth: Option<&mut [f32]>,
+        mut stencil: Option<&mut [u8]>, stencil_reference: u32, constants: &[u32],
+        textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
+        samplers: &[(victory_metal::TextureFilter, f32, f32)], pixels: &mut [&mut [u8]], preserve: bool,
+    ) -> Result<(), String> {
         if textures.len() != self.texture_entries.len() || samplers.len() != self.sampler_entries.len() {
             return Err("texture or sampler binding count does not match pixel shader".into());
         }
-        if self.vertex_stride != 0 {
-            return Err("layout-aware rendering requires a generic input pipeline".into());
+        if pixels.len() != self.color_targets.len() {
+            return Err("color attachment count does not match pipeline".into());
         }
         
         if depth.is_some() != self.depth.is_some() {
@@ -430,10 +481,9 @@ impl Prepared {
         if !matches!(&self.input_renderer, Some((w, h, layout, _))
             if *w == width && *h == height && matches_layout(layout))
         {
-            let renderer = victory_metal::Renderer::new_configured_layout(
+            let renderer = victory_metal::Renderer::new_configured_mrt(
                 &self.vertex, "main", &self.pixel, "main", width, height,
-                self.dwords as u32, self.texture_slot.is_some(), self.depth, self.blend,
-                self.color_format, attributes,
+                self.dwords as u32, self.texture_slot.is_some(), self.depth, &self.color_targets, attributes,
             ).map_err(|e| e.to_string())?;
             self.input_renderer_texture = [None; 16];
             self.input_renderer = Some((width, height, attributes.to_vec(), renderer));
@@ -454,7 +504,7 @@ impl Prepared {
         for (&(filter, min_lod, max_lod), entry) in samplers.iter().zip(&self.sampler_entries) {
             renderer.set_fragment_sampler_at(entry.heap_index, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
         }
-        renderer.draw_buffers(
+        renderer.draw_buffers_mrt(
             buffers, indices, first_vertex, vertex_count, instance_count, start_instance,
             constants, pixels, preserve,
         ).map_err(|e| e.to_string())?;
@@ -733,7 +783,6 @@ fn varying_signatures_for_stages(vertex: &[u8], pixel: &[u8]) -> Result<Vec<Vary
     let ps = Container::parse(pixel).map_err(|e| e.to_string())?;
     let output = stage_varyings(&vs, FourCC::OSG1, true)?;
     let input = stage_varyings(&ps, FourCC::ISG1, false)?;
-    signature(&ps, FourCC::OSG1, Some((b"SV_Target", 64)), false, false)?;
     if output.len() != input.len() { return Err("vertex and pixel varying signatures do not match".into()); }
     output.iter().map(|out| {
         let input = input.iter().find(|input| input.index == out.index
@@ -743,12 +792,36 @@ fn varying_signatures_for_stages(vertex: &[u8], pixel: &[u8]) -> Result<Vec<Vary
     }).collect()
 }
 
+fn validate_color_signature(pixel: &[u8], count: usize) -> Result<(), String> {
+    if !(1..=8).contains(&count) { return Err("unsupported color target count".into()); }
+    let container = Container::parse(pixel).map_err(|e| e.to_string())?;
+    let data = container.part(FourCC::OSG1).ok_or("missing pixel output signature")?.data;
+    if word(data, 0)? as usize != count { return Err("pixel output count does not match pipeline".into()); }
+    let base = word(data, 4)? as usize;
+    let mut seen = 0u16;
+    for i in 0..count {
+        let at = base.checked_add(i * 32).ok_or("signature offset overflow")?;
+        let tail = data.get(word(data, at + 4)? as usize..).ok_or("signature name out of bounds")?;
+        let end = tail.iter().position(|&b| b == 0).ok_or("unterminated signature name")?;
+        let index = word(data, at + 8)? as usize;
+        if !tail[..end].eq_ignore_ascii_case(b"SV_Target") || index >= count
+            || seen & (1 << index) != 0 || word(data, at)? != 0
+            || word(data, at + 12)? != 64 || word(data, at + 16)? != 3
+            || word(data, at + 20)? as usize != index
+            || data.get(at + 24) != Some(&15) || word(data, at + 28)? != 0
+        { return Err("unsupported pixel output signature".into()); }
+        seen |= 1 << index;
+    }
+    Ok(())
+}
+
 fn validate(
     bytes: &[u8],
     stage: HwStage,
     varying: &[Varying],
     input_uv: bool,
     vertex_signatures: Option<&[VertexSignature]>,
+    color_count: usize,
 ) -> Result<(emit::HostShader, Vec<u8>, Vec<u8>, Vec<TableEntry>, Vec<TableEntry>), String> {
     let c = Container::parse(bytes).map_err(|e| e.to_string())?;
     let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
@@ -994,6 +1067,7 @@ fn validate(
         }
     }
     let mut param_exports = vec![0u8; varying.len()];
+    let mut color_exports = 0u16;
     for export in &raised.exports {
         let valid = match (stage, export.target) {
             (HwStage::Vs, io::Target::Position(0) | io::Target::Null) => true,
@@ -1005,16 +1079,18 @@ fn validate(
                     !export.compressed && mask == varying[index].mask
                 } else { false }
             }
-            (HwStage::Ps, io::Target::Color(0) | io::Target::Null) => true,
+            (HwStage::Ps, io::Target::Color(n)) if (n as usize) < color_count => {
+                color_exports |= 1 << n;
+                color_count == 1 || !export.compressed
+            }
+            (HwStage::Ps, io::Target::Null) => true,
             _ => false,
         };
         if !valid { return Err("unsupported shader export".into()); }
     }
-    if (stage == HwStage::Vs && param_exports.iter().zip(varying).any(|(&mask, v)| mask != v.mask))
-        || !raised.exports.iter().any(|e| match stage {
-            HwStage::Vs => matches!(e.target, io::Target::Position(0)),
-            _ => matches!(e.target, io::Target::Color(0)),
-        })
+    if (stage == HwStage::Vs && (param_exports.iter().zip(varying).any(|(&mask, v)| mask != v.mask)
+        || !raised.exports.iter().any(|e| matches!(e.target, io::Target::Position(0)))))
+        || (stage == HwStage::Ps && color_exports != (1u16 << color_count) - 1)
     {
         return Err("missing shader export".into());
     }

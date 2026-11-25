@@ -404,10 +404,18 @@ typed RGBA8 and BGRA8 UNORM or UNORM_SRGB, and typed BC1/BC3 linear or sRGB
 sampled textures (including multiple mips); single-mip RGBA8/BGRA8 UNORM or
 UNORM_SRGB color targets; single-mip D32_FLOAT or D32_FLOAT_S8X24_UINT
 depth/stencil textures; and buffers.
-Graphics supports one color target and optional depth target per draw; the
-native depth comparison/write subset; restricted single-target D3D blending
-and color write masks; and multiple sampled textures with point or linear
-clamp samplers.
+Graphics supports one to eight color targets and an optional depth target per
+draw. Each target must have matching dimensions and an exactly matching typed
+pipeline format; targets must be distinct and cannot alias sampled textures or
+other draw resources. Pixel output signatures must contain exactly one full
+float4 SV_Target per attachment, with contiguous indices starting at zero.
+Render-target descriptor heaps support up to 256 entries. Both contiguous and
+explicit RTV handle arrays are supported, and recorded descriptors are checked
+for mutation before execution. Independent blending and write masks apply per
+target when enabled; otherwise target zero's state is shared. Logic operations
+and unsupported blend factors remain rejected. The native depth comparison/write
+subset and multiple sampled textures with point or linear clamp samplers are
+also supported.
 Pixel shaders may access multiple texture and sampler entries at statically
 traced table-relative indices, including nonzero indices and table bases.
 Guest shader-visible resource and sampler heaps hold up to 256 entries; per

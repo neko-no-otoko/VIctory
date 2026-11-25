@@ -90,7 +90,7 @@ enum Data {
     Queue(Arc<ProxyQueue>),
     Fence(Arc<ProxyFence>),
     Texture(Arc<Texture>),
-    Rtv(Arc<Mutex<(Option<Arc<Texture>>, u64)>>),
+    Rtv(Arc<Vec<RtvSlot>>),
     Dsv(Arc<Mutex<(Option<Arc<Texture>>, u64)>>),
     GraphicsPipeline(Arc<GraphicsPipeline>),
 }
@@ -181,8 +181,9 @@ struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, flags
 struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32 }
 type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
 type SamplerHeap = Arc<Mutex<Vec<Option<Arc<bool>>>>>;
-struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
-type Rtv = (Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64);
+struct GraphicsPipeline { id: u64, vs: Vec<u8>, ps: Vec<u8>, stride: u32, format: u32, extra_targets: Vec<wine_transport::ColorTarget>, inputs: Vec<VertexInput>, legacy: bool, depth: Option<PipelineDepth>, blend: Blend }
+type RtvSlot = Arc<Mutex<(Option<Arc<Texture>>, u64)>>;
+type Rtv = (RtvSlot, Arc<Texture>, u64);
 #[derive(Clone)]
 enum GraphicsResource { Buffer(Arc<Buffer>), Texture(Arc<Texture>) }
 impl GraphicsResource {
@@ -218,7 +219,7 @@ impl GraphicsResource {
 }
 #[derive(Clone)]
 struct GraphicsJob {
-    command: Command, resources: Vec<GraphicsResource>, descriptor: Option<Rtv>,
+    command: Command, resources: Vec<GraphicsResource>, descriptor: Option<Rtv>, extra_descriptors: Vec<Rtv>,
     depth_descriptor: Option<Rtv>,
     pipeline: Option<Arc<GraphicsPipeline>>,
     textures: Vec<(TextureHeap, usize, Arc<Srv>)>,
@@ -227,7 +228,7 @@ struct GraphicsJob {
 #[derive(Default)]
 struct GraphicsState {
     pipeline: Option<Arc<GraphicsPipeline>>,
-    target: Option<Rtv>,
+    targets: Vec<Rtv>,
     depth: Option<Rtv>,
     stencil_ref: u32,
     viewport: Option<[f32; 6]>, scissor: Option<[i32; 4]>, topology: bool,
@@ -594,8 +595,9 @@ extern "system" fn create_heap(this: This, d: *const HeapDesc, iid: *const Iid, 
     if device(this).is_none() || d.count == 0 || d.count > 256 || d.nodes != 0 {
         return E_INVALIDARG;
     }
-    if d.kind == 2 && d.flags == 0 && d.count == 1 {
-        return new(Data::Rtv(Arc::new(Mutex::new((None, 0)))), &HEAP_TABLE, iid, HEAP, out);
+    if d.kind == 2 && d.flags == 0 {
+        let slots=(0..d.count).map(|_|Arc::new(Mutex::new((None,0)))).collect();
+        return new(Data::Rtv(Arc::new(slots)), &HEAP_TABLE, iid, HEAP, out);
     }
     if d.kind == 3 && d.flags == 0 && d.count == 1 {
         return new(Data::Dsv(Arc::new(Mutex::new((None, 0)))), &HEAP_TABLE, iid, HEAP, out);
@@ -1439,8 +1441,8 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     let mut stencil_state = None;
     let mut front_counter_clockwise = false;
     let mut depth_format = 0;
-    let mut color_format = 0;
-    let mut blend = Blend::new(false, 15, [0; 6]).unwrap();
+    let mut color_formats = Vec::new();
+    let mut blend_offset = None;
     while at < b.len() {
         if b.len() - at < 8 { return E_INVALIDARG; }
         let kind = u32::from_ne_bytes(b[at..at+4].try_into().unwrap());
@@ -1453,14 +1455,8 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
             1 => { vp = stream_ptr(b,at+8); vl = stream_ptr(b,at+16); }
             2 => { pp = stream_ptr(b,at+8); pl = stream_ptr(b,at+16); }
             8 => {
-                let enabled = word(12);
-                let mask = b[at+48];
-                if word(4) != 0 || word(8) != 0 || enabled > 1 || word(16) != 0 || mask > 15 {
-                    return E_INVALIDARG;
-                }
-                let factors = [word(20),word(24),word(28),word(32),word(36),word(40)];
-                let Some(state) = Blend::new(enabled == 1, mask, factors) else { return E_INVALIDARG; };
-                blend = state;
+                if word(4) != 0 || word(8) > 1 { return E_INVALIDARG; }
+                blend_offset = Some(at);
             }
             9 => if word(4) != u32::MAX { return E_INVALIDARG; },
             12 => { ep = stream_ptr(b,at+8); input_count = word(16); if !(1..=16).contains(&input_count) { return E_INVALIDARG; } }
@@ -1483,9 +1479,13 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
             13 => if word(4) != 0 { return E_INVALIDARG; },
             14 => if word(4) != 3 { return E_INVALIDARG; },
             15 => {
-                color_format = word(4);
-                if !matches!(color_format, 28 | 29 | 87 | 91) || word(36) != 1
-                    || (8..36).step_by(4).any(|offset| word(offset) != 0) { return E_INVALIDARG; }
+                let count=word(36) as usize;
+                if !(1..=8).contains(&count) {return E_INVALIDARG;}
+                for i in 0..8 {
+                    let format=word(4+i*4);
+                    if (i<count && !matches!(format,28|29|87|91)) || (i>=count && format!=0) {return E_INVALIDARG;}
+                    if i<count {color_formats.push(format);}
+                }
             },
             16 => { depth_format = word(4); if !matches!(depth_format, 0 | 20 | 40) { return E_INVALIDARG; } }
             17 => if word(4) != 1 || word(8) != 0 { return E_INVALIDARG; },
@@ -1497,6 +1497,24 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
     if seen & required != required || (depth.is_some() && !matches!(depth_format, 20 | 40))
         || (depth_format == 0 && depth.is_some()) || (depth_format == 40 && stencil_state.as_ref().is_some_and(|s| s.enabled))
         || (depth.is_none() && depth_format != 0) { return E_INVALIDARG; }
+    let mut blends=Vec::with_capacity(color_formats.len());
+    for i in 0..color_formats.len() {
+        let state=if let Some(at)=blend_offset {
+            let word=|offset:usize| u32::from_ne_bytes(b[at+offset..at+offset+4].try_into().unwrap());
+            let index=if word(8)==0 {0} else {i};
+            let off=12+index*40;
+            let enabled=word(off);let mask=b[at+off+36];
+            if enabled>1 || word(off+4)!=0 || mask>15 {return E_INVALIDARG;}
+            let factors=[word(off+8),word(off+12),word(off+16),word(off+20),word(off+24),word(off+28)];
+            let Some(value)=Blend::new(enabled==1,mask,factors) else {return E_INVALIDARG;};
+            value
+        } else {Blend::new(false,15,[0;6]).unwrap()};
+        blends.push(state);
+    }
+    let color_format=color_formats[0];
+    let blend=blends[0].clone();
+    let extra_targets=color_formats.iter().copied().skip(1).zip(blends.iter().skip(1))
+        .map(|(format,blend)|wine_transport::ColorTarget {format,blend:blend.clone()}).collect();
     if front_counter_clockwise && stencil_state.as_ref().is_some_and(|s| s.enabled) { return E_INVALIDARG; }
     if depth_format == 20 {
         let Some(d) = depth.as_mut() else { return E_INVALIDARG; };
@@ -1526,14 +1544,14 @@ extern "system" fn create_graphics_pipeline(this: This, desc: *const StreamDesc,
         && (inputs.len()==1 || (inputs.len()==2 && inputs[1].semantic.eq_ignore_ascii_case("TEXCOORD")
             && inputs[1].semantic_index==0 && inputs[1].format==16 && inputs[1].slot==0
             && inputs[1].offset==16 && !inputs[1].per_instance));
-    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, inputs, legacy, depth, blend };
+    let p = GraphicsPipeline { id: resource_id(), vs: unsafe { std::slice::from_raw_parts(vp as *const u8,vl) }.to_vec(), ps: unsafe { std::slice::from_raw_parts(pp as *const u8,pl) }.to_vec(), stride: if inputs.len()==2 { 24 } else { 16 }, format: color_format, extra_targets, inputs, legacy, depth, blend };
     new(Data::GraphicsPipeline(Arc::new(p)), &PIPELINE_TABLE, iid, PIPELINE, out)
 }
 extern "system" fn gpu_address(this: This) -> u64 {
     match data(this) { Some(Data::Buffer(b)) => b.ptr() as u64, _ => trap("invalid GPU address") }
 }
 extern "system" fn create_rtv(this: This, resource: This, desc: *const c_void, handle: u64) {
-    let (Some(Data::Texture(t)), Some(Data::Rtv(h))) = (data(resource), data(handle as This)) else { trap("invalid RTV"); };
+    let (Some(Data::Texture(t)), Some(h)) = (data(resource), rtv_slot(handle)) else { trap("invalid RTV"); };
     if device(this).is_none() || !matches!(t.format, 28 | 29 | 87 | 91)
         || t.tiled.is_some() || t.flags & 1 == 0 || t.mips != 1 { trap("unsupported RTV"); }
     if !desc.is_null() {
@@ -1558,8 +1576,16 @@ fn graphics_list(this: This) -> Arc<Mutex<ListState>> {
     { let s = l.lock().unwrap(); if s.closed || s.kind != 0 { trap("invalid graphics list"); } }
     l
 }
+fn rtv_slot(handle: u64) -> Option<RtvSlot> {
+    let map=objects().lock().unwrap();
+    map.iter().find_map(|(&base,entry)| {
+        let Data::Rtv(slots)=&entry.data else {return None};
+        let index=usize::try_from(handle.checked_sub(base as u64)?).ok()?;
+        slots.get(index).cloned()
+    })
+}
 fn rtv(handle: u64) -> Option<(Arc<Mutex<(Option<Arc<Texture>>, u64)>>, Arc<Texture>, u64)> {
-    let Some(Data::Rtv(h)) = data(handle as This) else { return None; };
+    let h = rtv_slot(handle)?;
     let (t, revision) = { let d = h.lock().unwrap(); (d.0.clone()?, d.1) };
     Some((h,t,revision))
 }
@@ -1578,7 +1604,7 @@ extern "system" fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, st
     let command = if desc.1.format == 20 { Command::ClearStencil { target: resource.id(), flags, depth, stencil } }
         else { Command::ClearDepth { target: resource.id(), depth } };
     l.graphics.jobs.push(GraphicsJob { command, resources: vec![resource], descriptor: Some(desc),
-        depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+        extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 extern "system" fn clear_rtv(this: This, handle: u64, color: *const f32, n: u32, rects: *const c_void) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
@@ -1587,14 +1613,22 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const f32, n: u32,
     let c = unsafe { *(color as *const [f32;4]) };
     if !c.iter().all(|v| v.is_finite()) { l.invalid = true; return; }
     let resource = GraphicsResource::Texture(desc.1.clone());
-    l.graphics.jobs.push(GraphicsJob { command: Command::Clear { target: resource.id(), color: c }, resources: vec![resource], descriptor: Some(desc), depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+    l.graphics.jobs.push(GraphicsJob { command: Command::Clear { target: resource.id(), color: c }, resources: vec![resource], descriptor: Some(desc), extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 extern "system" fn targets(this: This, n: u32, handles: *const u64, single: i32, depth: *const u64) {
     let l = graphics_list(this); let mut l = l.lock().unwrap();
-    if n != 1 || handles.is_null() || !matches!(single, 0 | 1) { l.invalid = true; return; }
-    l.graphics.target = rtv(unsafe { *handles });
+    if n == 0 || n > 8 || handles.is_null() || !matches!(single, 0 | 1) { l.invalid = true; return; }
+    let first=unsafe {*handles};
+    let mut targets=Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let handle=if single==1 {first.checked_add(u64::from(i))} else {Some(unsafe {*handles.add(i as usize)})};
+        let Some(view)=handle.and_then(rtv) else {l.invalid=true;return;};
+        if targets.iter().any(|t:&Rtv| Arc::ptr_eq(&t.1,&view.1)) {l.invalid=true;return;}
+        targets.push(view);
+    }
+    l.graphics.targets=targets;
     l.graphics.depth = if depth.is_null() { None } else { dsv(unsafe { *depth }) };
-    if l.graphics.target.is_none() || (!depth.is_null() && l.graphics.depth.is_none()) { l.invalid = true; }
+    if !depth.is_null() && l.graphics.depth.is_none() { l.invalid = true; }
 }
 extern "system" fn set_stencil_ref(this: This, value: u32) {
     let l = graphics_list(this); l.lock().unwrap().graphics.stencil_ref = value & 255;
@@ -1668,7 +1702,7 @@ extern "system" fn draw_indexed(this: This, count: u32, instances: u32, first: u
 fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32, base: Option<i32>) {
     let l = graphics_list(this); let mut l = l.lock().unwrap(); let g = &mut l.graphics;
     let (Some(desc), Some(pipeline), Some(viewport), Some(scissor), Some(constants)) =
-        (g.target.clone(), g.pipeline.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>())
+        (g.targets.first().cloned(), g.pipeline.clone(), g.viewport, g.scissor, g.constants.iter().copied().collect::<Option<Vec<_>>>())
         else { l.invalid = true; return; };
     let index = if let Some(base_vertex) = base {
         let Some((b, offset, size, format)) = g.index.clone() else { l.invalid = true; return; };
@@ -1676,13 +1710,16 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         if first.checked_add(count).and_then(|n| n.checked_mul(element)).is_none_or(|n| n > size) { l.invalid = true; return; }
         Some((b.clone(), Index { buffer: b.id, offset: offset as u64, size, format, first, base_vertex }))
     } else { None };
-    if desc.1.format != pipeline.format || !g.topology || count == 0 || instances == 0
+    if g.targets.len()!=pipeline.extra_targets.len()+1 || desc.1.format != pipeline.format
+        || g.targets.iter().skip(1).zip(&pipeline.extra_targets).any(|(d,p)|d.1.format!=p.format || d.1.width!=desc.1.width || d.1.height!=desc.1.height)
+        || !g.topology || count == 0 || instances == 0
         || !viewport.iter().all(|v| v.is_finite()) || viewport[2] <= 0.0 || viewport[3] <= 0.0
         || scissor[0] < 0 || scissor[1] < 0 || scissor[2] <= scissor[0] || scissor[3] <= scissor[1] {
         l.invalid = true; return;
     }
     let target = desc.1.clone();
     let mut resources = vec![GraphicsResource::Texture(target.clone())];
+    for extra in g.targets.iter().skip(1) {resources.push(GraphicsResource::Texture(extra.1.clone()));}
     let mut views = Vec::new();
     for a in &pipeline.inputs {
         let Some((buffer,offset,size,stride)) = g.vertices[a.slot as usize].as_ref() else { l.invalid=true; return; };
@@ -1725,11 +1762,11 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
     let sampler = single.then(|| &samplers[0]);
     if pipeline.depth.as_ref().is_some_and(|d| d.stencil.is_some()) {
         g.jobs.push(GraphicsJob { command: Command::SetStencilRef(g.stencil_ref), resources: vec![],
-            descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+            descriptor: None, extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
     }
     if pipeline.depth.is_some() != g.depth.is_some() { l.invalid = true; return; }
     if let Some((_,t,_)) = &g.depth { resources.push(GraphicsResource::Texture(t.clone())); }
-    let command = Command::Draw(Draw { target: target.id, pipeline: pipeline.id,
+    let command = Command::Draw(Draw { target: target.id, extra_targets:g.targets.iter().skip(1).map(|v|v.1.id).collect(), pipeline: pipeline.id,
         vertex_buffer: first_view.buffer, vertex_offset: first_view.offset, vertex_size: first_view.size, vertex_stride: first_view.stride,
         vertex_count: count, instance_count: instances, first_vertex: if index.is_some() { 0 } else { first }, first_instance: instance,
         viewport, scissor, topology: 4, constants, texture: texture.map(|v| v.4.texture.id),
@@ -1742,7 +1779,7 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
             slot:v.0,offset:v.1,resource:v.4.texture.id,first_mip:v.4.first_mip,mip_count:v.4.mip_count }).collect()},
         samplers: if single {Vec::new()} else {samplers.iter().map(|v| wine_transport::SamplerBinding {
             slot:v.0,offset:v.1,linear_filter:*v.4 }).collect()} });
-    g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
+    g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), extra_descriptors:g.targets.iter().skip(1).cloned().collect(), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
         textures: textures.into_iter().map(|v| (v.2,v.3,v.4)).collect(),
         samplers: samplers.into_iter().map(|v| (v.2,v.3,v.4)).collect() });
 }
@@ -1753,7 +1790,7 @@ extern "system" fn copy_buffer(this: This, dst: This, dst_offset: u64, src: This
         || src_offset.checked_add(size).is_none_or(|v| v > s.len() as u64) { l.invalid = true; return; }
     let command = Command::CopyBuffer { src: s.id, dst: d.id, src_offset, dst_offset, size };
     l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(s),GraphicsResource::Buffer(d)],
-        descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+        descriptor: None, extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 #[repr(C)]
 struct Transition { kind: u32, flags: u32, resource: This, subresource: u32, before: u32, after: u32, padding: u32 }
@@ -1763,7 +1800,7 @@ extern "system" fn barrier(this: This, n: u32, p: *const Transition) -> u32 {
     for b in unsafe { std::slice::from_raw_parts(p, n as usize) } {
         let resource = match data(b.resource) { Some(Data::Texture(t)) => GraphicsResource::Texture(t), Some(Data::Buffer(b)) => GraphicsResource::Buffer(b), _ => { l.invalid = true; return 0; } };
         if b.kind != 0 || b.flags != 0 || b.subresource != u32::MAX { l.invalid = true; return 0; }
-        l.graphics.jobs.push(GraphicsJob { command: Command::Barrier { id: resource.id(), before: b.before, after: b.after }, resources: vec![resource], descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+        l.graphics.jobs.push(GraphicsJob { command: Command::Barrier { id: resource.id(), before: b.before, after: b.after }, resources: vec![resource], descriptor: None, extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
     }
     0
 }
@@ -1801,7 +1838,7 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
         let (src,dst) = if upload { (buffer.id,texture.id) } else { (texture.id,buffer.id) };
         let command = Command::CopyDepthStencil { src,dst,offset:footprint.offset,pitch:footprint.pitch,width,height,plane:mip,upload };
         l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer),GraphicsResource::Texture(texture)],
-            descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+            descriptor: None, extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
         return;
     }
     let Some((width, height, _, _)) = wine_transport::mip_layout(texture.format, texture.width, texture.height, texture.mips, mip) else { l.invalid = true; return; };
@@ -1817,7 +1854,7 @@ extern "system" fn copy_texture(this: This, dst: *const CopyLocation, x: u32, y:
     let (src_id, dst_id) = if upload { (buffer.id, texture.id) } else { (texture.id, buffer.id) };
     let command = Command::CopyTexture(CopyTexture { src: src_id, dst: dst_id, offset: footprint.offset,
         pitch: footprint.pitch, width, height, format: texture.format, mip, buffer_to_texture: upload });
-    l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer), GraphicsResource::Texture(texture)], descriptor: None, depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
+    l.graphics.jobs.push(GraphicsJob { command, resources: vec![GraphicsResource::Buffer(buffer), GraphicsResource::Texture(texture)], descriptor: None, extra_descriptors: vec![], depth_descriptor: None, pipeline: None, textures: vec![], samplers: vec![] });
 }
 fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let mut resources = HashMap::new();
@@ -1827,6 +1864,10 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         if let Some((h,t,revision)) = &j.descriptor {
             let d = h.lock().unwrap();
             if d.1 != *revision || !d.0.as_ref().is_some_and(|v| Arc::ptr_eq(v,t)) { return Err("RTV descriptor changed".into()); }
+        }
+        for (h,t,revision) in &j.extra_descriptors {
+            let d=h.lock().unwrap();
+            if d.1!=*revision || !d.0.as_ref().is_some_and(|v|Arc::ptr_eq(v,t)) {return Err("RTV descriptor changed".into());}
         }
         if let Some((h,t,revision)) = &j.depth_descriptor {
             let d = h.lock().unwrap();
@@ -1840,7 +1881,7 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
         }
         if let Some(p) = &j.pipeline {
             let entry = pipelines.entry(p.id).or_insert_with(|| Pipeline { id: p.id, vertex_shader: p.vs.clone(), pixel_shader: p.ps.clone(), vertex_stride: p.stride,
-                format: p.format, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new() });
+                format: p.format, depth: p.depth.clone(), blend: p.blend.clone(), inputs: Vec::new(), extra_targets:p.extra_targets.clone() });
             if matches!(&j.command,Command::Draw(d) if !d.vertices.is_empty()) { entry.inputs=p.inputs.clone(); }
         }
         for r in &j.resources { resources.entry(r.id()).or_insert_with(|| r.clone()); }
@@ -1863,7 +1904,8 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let mut s = TcpStream::connect_timeout(&c.addr, Duration::from_secs(10)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
-    let version = if payload.is_some() {5} else {9};
+    let mrt=batch.pipelines.iter().any(|p|!p.extra_targets.is_empty());
+    let version = match (payload.is_some(),mrt) {(true,false)=>5,(false,false)=>9,(true,true)=>10,(false,true)=>11};
     let payload_len = payload.as_ref().map_or(0, |p| p.len() as u32);
     for v in [MAGIC,version,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
     s.write_all(&c.token).map_err(|e| e.to_string())?;
@@ -1873,13 +1915,13 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
     let (magic,status,len,msg) = (word(0),word(4),word(8) as usize,word(12) as usize);
     if magic != MAGIC || len > wine_transport::MAX_PAYLOAD || msg > 4096 || (status == 0 && msg != 0)
-        || (status != 0 && len != 0) || (version == 9 && len != 0)
+        || (status != 0 && len != 0) || (matches!(version,9|11) && len != 0)
     { return Err("invalid proxy response".into()); }
     if status != 0 {
         let mut message = vec![0;msg]; s.read_exact(&mut message).map_err(|e| e.to_string())?;
         return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
     }
-    let results = if version == 9 { wine_transport::read_stream_results(&mut s)? } else {
+    let results = if matches!(version,9|11) { wine_transport::read_stream_results(&mut s)? } else {
         let mut bytes = vec![0;len]; s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         wine_transport::decode_results(&bytes)?
     };

@@ -103,21 +103,21 @@ unsafe extern "C" {
         depth_compare: u32,
         depth_write: bool,
         stencil: *const u32,
-        blend_enabled: bool,
-        write_mask: u8,
-        blend_factors: *const u32,
+        targets: *const NativeRenderTarget,
+        target_count: usize,
         attributes: *const VertexAttribute,
         attribute_count: usize,
-        format: u32,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
-    fn victory_metal_draw_buffers(
+    fn victory_metal_draw_buffers_mrt(
         renderer: *mut c_void, buffers: *const NativeVertexBuffer, buffer_count: usize,
         indices: *const c_void, index_count: u32, index_size: u32, base_vertex: i32,
         first_vertex: u32, vertex_count: u32, instance_count: u32,
-        constants: *const u32, pixels: *mut u8, preserve: bool,
-        viewport: *const f64, scissor: *const u32, error: *mut c_char, error_len: usize,
+        constants: *const u32, pixels: *const *mut u8, pixel_count: usize, preserve: bool,
+        viewport: *const f64, scissor: *const u32,
+        error: *mut c_char,
+        error_len: usize,
     ) -> bool;
     fn victory_metal_draw(
         renderer: *mut c_void,
@@ -306,6 +306,22 @@ pub struct BlendState {
     pub factors: [u32; 6],
 }
 
+/// Format and independent blending state for one color attachment.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderTarget {
+    pub format: ColorFormat,
+    pub blend: BlendState,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeRenderTarget {
+    format: u32,
+    blend_enabled: bool,
+    write_mask: u8,
+    blend_factors: [u32; 6],
+}
+
 
 /// A reflected Metal attribute index and its D3D input-slot layout.
 /// Supported DXGI formats are 2, 16, 34 and 35.
@@ -348,6 +364,7 @@ struct NativeVertexBuffer {
 pub struct Renderer {
     handle: NonNull<c_void>,
     pixel_len: usize,
+    target_count: usize,
     fragment_constant_dwords: usize,
     fragment_texture: bool,
     texture_bound: bool,
@@ -455,8 +472,18 @@ impl Renderer {
         format: ColorFormat, attributes: &[VertexAttribute],
     ) -> Result<Self, RenderError> {
         Self::create_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
-            width, height, fragment_constant_dwords, fragment_texture, depth, blend, false,
-            format, Some(attributes))
+            width, height, fragment_constant_dwords, fragment_texture, depth, false,
+            &[RenderTarget { format, blend }], Some(attributes))
+    }
+
+    /// Create a pipeline with one to eight contiguous color attachments.
+    pub fn new_configured_mrt(
+        vertex: &[u8], vertex_name: &str, fragment: &[u8], fragment_name: &str,
+        width: u32, height: u32, constant_dwords: u32, texture_enabled: bool,
+        depth: Option<DepthState>, targets: &[RenderTarget], attributes: &[VertexAttribute],
+    ) -> Result<Self, RenderError> {
+        Self::create_configured(vertex, vertex_name, fragment, fragment_name, width, height,
+            constant_dwords, texture_enabled, depth, false, targets, Some(attributes))
     }
 
     fn new_configured_inner(
@@ -466,15 +493,15 @@ impl Renderer {
         format: ColorFormat,
     ) -> Result<Self, RenderError> {
         Self::create_configured(vertex_metallib, vertex_entry, fragment_metallib, fragment_entry,
-            width, height, fragment_constant_dwords, fragment_texture, depth, blend, vertex_uv,
-            format, None)
+            width, height, fragment_constant_dwords, fragment_texture, depth, vertex_uv,
+            &[RenderTarget { format, blend }], None)
     }
 
     fn create_configured(
         vertex_metallib: &[u8], vertex_entry: &str, fragment_metallib: &[u8],
         fragment_entry: &str, width: u32, height: u32, fragment_constant_dwords: u32,
-        fragment_texture: bool, depth: Option<DepthState>, blend: BlendState, vertex_uv: bool,
-        format: ColorFormat, attributes: Option<&[VertexAttribute]>,
+        fragment_texture: bool, depth: Option<DepthState>, vertex_uv: bool,
+        targets: &[RenderTarget], attributes: Option<&[VertexAttribute]>,
     ) -> Result<Self, RenderError> {
         let legacy = [
             VertexAttribute { index: 11, format: 2, slot: 0, offset: 0,
@@ -507,7 +534,10 @@ impl Renderer {
         if depth.is_some_and(|state| !(1..=8).contains(&state.compare)) {
             return Err(RenderError("invalid depth comparison".into()));
         }
-        if blend.write_mask & !15 != 0 {
+        if targets.is_empty() || targets.len() > 8 {
+            return Err(RenderError("expected one to eight color targets".into()));
+        }
+        if targets.iter().any(|target| target.blend.write_mask & !15 != 0) {
             return Err(RenderError("invalid color write mask".into()));
         }
         if width == 0 || height == 0 || vertex_metallib.is_empty() || fragment_metallib.is_empty() {
@@ -534,6 +564,15 @@ impl Renderer {
             s.front[0],s.front[1],s.front[2],s.front[3],
             s.back[0],s.back[1],s.back[2],s.back[3],
         ]);
+        let mut native_targets = [NativeRenderTarget {
+            format: 0, blend_enabled: false, write_mask: 0, blend_factors: [0; 6],
+        }; 8];
+        for (native, target) in native_targets.iter_mut().zip(targets) {
+            *native = NativeRenderTarget {
+                format: target.format.native_value(), blend_enabled: target.blend.enabled,
+                write_mask: target.blend.write_mask, blend_factors: target.blend.factors,
+            };
+        }
         // SAFETY: input slices and strings remain alive for the synchronous call;
         // Metal owns the resulting libraries and pipeline independently.
         let ptr = unsafe {
@@ -551,12 +590,10 @@ impl Renderer {
                 depth.map_or(0, |s| s.compare),
                 depth.is_some_and(|s| s.write),
                 stencil.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                blend.enabled,
-                blend.write_mask,
-                blend.factors.as_ptr(),
+                native_targets.as_ptr(),
+                targets.len(),
                 layout.as_ptr(),
                 layout.len(),
-                format.native_value(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -565,6 +602,7 @@ impl Renderer {
         Ok(Self {
             handle,
             pixel_len,
+            target_count: targets.len(),
             fragment_constant_dwords: fragment_constant_dwords as usize,
             fragment_texture,
             texture_bound: false,
@@ -923,9 +961,20 @@ impl Renderer {
         first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
         constants: &[u32], pixels: &mut [u8], preserve: bool,
     ) -> Result<(), RenderError> {
+        self.draw_buffers_mrt(buffers, indices, first_vertex, vertex_count, instance_count,
+                              start_instance, constants, &mut [pixels], preserve)
+    }
+
+    /// Draw to all configured color attachments, in attachment order.
+    pub fn draw_buffers_mrt(
+        &mut self, buffers: &[VertexBuffer<'_>], indices: Option<(IndexData<'_>, i32)>,
+        first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
+        constants: &[u32], pixels: &mut [&mut [u8]], preserve: bool,
+    ) -> Result<(), RenderError> {
         let layout = self.attributes.as_ref()
             .ok_or_else(|| RenderError("draw_buffers requires a custom vertex layout".into()))?;
-        if pixels.len() != self.pixel_len || constants.len() != self.fragment_constant_dwords {
+        if pixels.len() != self.target_count || pixels.iter().any(|p| p.len() != self.pixel_len)
+            || constants.len() != self.fragment_constant_dwords {
             return Err(RenderError("expected exact-sized constants and output buffers".into()));
         }
         if self.fragment_texture && !self.texture_bound && !self.sampler_bound {
@@ -1011,13 +1060,17 @@ impl Renderer {
             return Ok(());
         }
         let mut error = [0 as c_char; 1024];
+        let mut pixel_ptrs = [std::ptr::null_mut(); 8];
+        for (ptr, pixels) in pixel_ptrs.iter_mut().zip(pixels.iter_mut()) {
+            *ptr = pixels.as_mut_ptr();
+        }
         // SAFETY: all bound slices and the output remain live throughout the
         // synchronous call; every fetched vertex and instance was checked.
         let ok = unsafe {
-            victory_metal_draw_buffers(self.handle.as_ptr(), native.as_ptr(), count,
+            victory_metal_draw_buffers_mrt(self.handle.as_ptr(), native.as_ptr(), count,
                 index_ptr, if index_size == 0 { 0 } else { vertex_count }, index_size,
                 base_vertex, first_vertex, vertex_count, instance_count, constants.as_ptr(),
-                pixels.as_mut_ptr(), preserve, self.viewport.as_ptr(), self.scissor.as_ptr(),
+                pixel_ptrs.as_ptr(), pixels.len(), preserve, self.viewport.as_ptr(), self.scissor.as_ptr(),
                 error.as_mut_ptr(), error.len())
         };
         if ok { Ok(()) } else { Err(native_error(&error)) }

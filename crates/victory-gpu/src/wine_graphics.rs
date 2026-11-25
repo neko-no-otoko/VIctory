@@ -66,11 +66,22 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
     if d.instance_count==0 || d.topology!=4 || d.vertex_count==0 || d.vertex_count%3!=0
         || (!generic && (d.instance_count!=1 || d.first_instance!=0 || !d.vertices.is_empty() || !matches!(d.vertex_stride,16|24) || d.vertex_stride!=p.vertex_stride))
     {return Err("unsupported draw topology, instances or vertex layout".into())}
-    if d.target==d.vertex_buffer || d.depth==Some(d.target) {
-        return Err("draw resource alias is unsupported".into())
+    if p.extra_targets.len()>7 || d.extra_targets.len()!=p.extra_targets.len() {
+        return Err("pipeline color attachment count mismatch".into());
     }
+    let target_ids:Vec<u64>=std::iter::once(d.target).chain(d.extra_targets.iter().copied()).collect();
+    if target_ids.iter().enumerate().any(|(i,id)| *id==0 || target_ids[..i].contains(id)
+        || *id==d.vertex_buffer || Some(*id)==d.depth
+        || d.vertices.iter().any(|v|v.buffer==*id)
+        || d.index.as_ref().is_some_and(|v|v.buffer==*id))
+    {return Err("draw resource alias is unsupported".into())}
     let target=rs.get(&d.target).ok_or("unknown target")?; let (width,height,color_format)=target_image(target)?;
     if format(p.format)?!=color_format || p.depth.is_some()!=d.depth.is_some() {return Err("pipeline attachment mismatch".into())}
+    for (id,desc) in d.extra_targets.iter().zip(&p.extra_targets) {
+        let r=rs.get(id).ok_or("unknown target")?;
+        let (w,h,f)=target_image(r)?;
+        if (w,h)!=(width,height) || f!=format(desc.format)? {return Err("pipeline attachment mismatch".into())}
+    }
     let vb=rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?; buffer(vb)?;
     let view=range(d.vertex_offset,d.vertex_size as u64,vb.bytes.len())?;
     let (first,size)=if generic {(0,0)} else if d.index.is_some() {(0,view.len()/d.vertex_stride as usize*d.vertex_stride as usize)} else {((d.first_vertex as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex offset overflow")?,(d.vertex_count as usize).checked_mul(d.vertex_stride as usize).ok_or("vertex size overflow")?)};
@@ -91,8 +102,13 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         let depth=if let Some(z)=&p.depth {if !(1..=8).contains(&z.compare) {return Err("unsupported depth comparison".into())} Some(DepthState {write:z.write,compare:z.compare,stencil:z.stencil.as_ref().map(|s|victory_metal::StencilState {enabled:s.enabled,read_mask:s.read_mask,write_mask:s.write_mask,front:s.front,back:s.back})})} else {None};
         if p.blend.write_mask>15 {return Err("invalid blend mask".into())}
         let state=GraphicsState {depth,blend:BlendState {enabled:p.blend.enabled,write_mask:p.blend.write_mask,factors:p.blend.factors},input_uv:p.vertex_stride==24,color_format};
-        let value=if generic { Prepared::new_inputs(&p.vertex_shader,&p.pixel_shader,state,&p.inputs)? }
-            else { (Prepared::new(&p.vertex_shader,&p.pixel_shader,state)?,Vec::new()) };
+        let mut extra=Vec::with_capacity(p.extra_targets.len());
+        for target in &p.extra_targets {
+            if target.blend.write_mask>15 {return Err("invalid blend mask".into())}
+            extra.push((format(target.format)?,BlendState {enabled:target.blend.enabled,write_mask:target.blend.write_mask,factors:target.blend.factors}));
+        }
+        let value=if generic { Prepared::new_inputs_mrt(&p.vertex_shader,&p.pixel_shader,state,&p.inputs,&extra)? }
+            else { (Prepared::new_mrt(&p.vertex_shader,&p.pixel_shader,state,&extra)?,Vec::new()) };
         prepared.insert(d.pipeline,value);
     }
     let (prepared,resolved)=prepared.get_mut(&d.pipeline).unwrap();
@@ -133,7 +149,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             .copied().ok_or("missing static descriptor binding")
     ).collect::<Result<_,_>>()?;
     for &(_,_,id,_,_) in &texture_bindings {
-        if id==d.target || Some(id)==d.depth {return Err("draw resource alias is unsupported".into())}
+        if target_ids.contains(&id) || Some(id)==d.depth {return Err("draw resource alias is unsupported".into())}
         access(rs,touched,id,0x80)?;
     }
     let mut constants=vec![0;prepared.dwords];let mut has_constants=false;
@@ -150,7 +166,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
     let viewport=d.viewport.map(f64::from); let scissor=[left,top,right-left,bottom-top];
     let mut stencil=None;
     let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} let combined=matches!(r.kind,ResourceKind::Texture {format:20,..});if combined != p.depth.as_ref().is_some_and(|z|z.stencil.is_some()) {return Err("pipeline depth format mismatch".into())} let size=(width as usize)*(height as usize)*4;if combined {stencil=Some(r.bytes[size..].to_vec());} Some(r.bytes[..size].chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
-    let mut target=rs.remove(&d.target).ok_or("unknown target")?;
+    let mut targets:Vec<Vec<u8>>=target_ids.iter().map(|id|std::mem::take(&mut rs.get_mut(id).unwrap().bytes)).collect();
     let mut sampled=Vec::with_capacity(texture_bindings.len());
     for &(_,_,id,first_mip,mip_count) in &texture_bindings {
         let r=rs.get(&id).ok_or("unknown sampled texture")?;let (w,h,mips,f)=image(r)?;
@@ -180,9 +196,17 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             let v=views.iter().find(|v|v.slot==a.slot).ok_or("missing vertex buffer")?;
             attributes.push(victory_metal::VertexAttribute {index:u32::from(r.attribute_index),format:a.format,slot:a.slot,offset:a.offset,stride:v.stride,per_instance:a.per_instance,step_rate:a.step_rate});
         }
-        prepared.draw_inputs(width,height,&attributes,&buffers,index,d.first_vertex,d.vertex_count,d.instance_count,d.first_instance,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes,true)
-    } else if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes)} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut target.bytes)};
-    rs.insert(d.target,target);result?;
+        let mut outputs:Vec<&mut [u8]>=targets.iter_mut().map(Vec::as_mut_slice).collect();
+        prepared.draw_inputs_mrt(width,height,&attributes,&buffers,index,d.first_vertex,d.vertex_count,d.instance_count,d.first_instance,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut outputs,true)
+    } else if !d.extra_targets.is_empty() {
+        let bytes=&rs.get(&d.vertex_buffer).ok_or("unknown vertex buffer")?.bytes[view.start+first..view.start+end];
+        let buffers=[victory_metal::VertexBuffer {slot:0,bytes}];
+        let attributes=prepared.legacy_attributes.clone();
+        let mut outputs:Vec<&mut [u8]>=targets.iter_mut().map(Vec::as_mut_slice).collect();
+        prepared.draw_inputs_mrt(width,height,&attributes,&buffers,index,0,d.vertex_count,1,0,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut outputs,true)
+    } else if d.vertex_stride==16 {let v:Vec<[f32;4]>=words.chunks_exact(4).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::Position(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut targets[0])} else {let v:Vec<[f32;6]>=words.chunks_exact(6).map(|x|x.try_into().unwrap()).collect();prepared.draw_multi(width,height,Vertices::PositionUv(&v),index,viewport,scissor,depth.as_deref_mut(),stencil.as_deref_mut(),stencil_reference,&constants,&sampled,&samplers,&mut targets[0])};
+    result?;
+    for (id,bytes) in target_ids.into_iter().zip(targets) {rs.get_mut(&id).unwrap().bytes=bytes;}
     if let (Some(id),Some(depth))=(d.depth,depth) {let r=rs.get_mut(&id).ok_or("unknown depth target")?;let size=depth.len()*4;for (bytes,value) in r.bytes[..size].chunks_exact_mut(4).zip(depth) {bytes.copy_from_slice(&value.to_bits().to_le_bytes());}if let Some(stencil)=stencil {r.bytes[size..].copy_from_slice(&stencil);}}
     Ok(())
 }
@@ -198,6 +222,7 @@ fn mark_writes(generations:&mut HashMap<u64,usize>,command:&Command,generation:u
         Command::Barrier {..} | Command::SetStencilRef(_) => (None,None),
     };
     for id in [first,second].into_iter().flatten() {generations.insert(id,generation);}
+    if let Command::Draw(d)=command {for &id in &d.extra_targets {generations.insert(id,generation);}}
 }
 /// Execute a complete batch in order. Returned snapshots are the only committed state.
 pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
@@ -218,6 +243,7 @@ pub fn execute_wine_batch(batch:Batch)->Result<Vec<Resource>,String> {
         Command::Clear {target,color}=>{access(&mut rs,&mut touched,target,4)?;let r=rs.get_mut(&target).ok_or("unknown clear target")?;let (w,h,f)=target_image(r)?; victory_metal::clear_color_float(f,w,h,w as usize*4,&mut r.bytes,color,&[]).map_err(|e|e.to_string())?;},
         Command::Draw(d)=>{
             access(&mut rs,&mut touched,d.target,4)?;
+            for &id in &d.extra_targets {access(&mut rs,&mut touched,id,4)?;}
             if d.vertices.is_empty() {access(&mut rs,&mut touched,d.vertex_buffer,1)?;}
             else {for v in &d.vertices {access(&mut rs,&mut touched,v.buffer,1)?;}}
             if let Some(i)=&d.index {access(&mut rs,&mut touched,i.buffer,2)?;}
@@ -272,6 +298,7 @@ mod tests {
             texture: Some(3), first_mip: 0, mip_count: 1, index: None, depth: Some(4),
             linear_filter: false, constant_slot: None, texture_slot: None, sampler_slot: None,
             vertices: vec![], textures: vec![], samplers: vec![],
+            extra_targets: vec![],
         };
         mark_writes(&mut generations, &Command::Draw(draw), 1);
         assert_eq!(generations.get(&1), Some(&1));

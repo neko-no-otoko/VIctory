@@ -174,7 +174,8 @@ bool victory_metal_clear_float(uint32_t width, uint32_t height, size_t pitch, ui
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLRenderPipelineState> pipeline;
-@property(nonatomic, strong) id<MTLTexture> texture;
+@property(nonatomic, strong) NSMutableArray<id<MTLTexture>> *colorTextures;
+@property(nonatomic, strong) NSMutableArray<id<MTLBuffer>> *colorReadbacks;
 @property(nonatomic, strong) id<MTLTexture> depthTexture;
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic) BOOL hasStencil;
@@ -279,23 +280,35 @@ typedef struct {
     size_t len, offset;
 } VictoryVertexBuffer;
 
+typedef struct {
+    uint32_t format;
+    bool blend_enabled;
+    uint8_t write_mask;
+    uint32_t blend_factors[6];
+} VictoryRenderTarget;
+
 void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const char *vertex_name,
                            const uint8_t *fragment_data, size_t fragment_len, const char *fragment_name,
                            uint32_t width, uint32_t height, uint32_t constant_dwords,
                            bool texture_enabled, uint32_t depth_compare, bool depth_write,
-                           const uint32_t *stencil, bool blend_enabled, uint8_t write_mask, const uint32_t *blend_factors,
+                           const uint32_t *stencil, const VictoryRenderTarget *targets, size_t target_count,
                            const VictoryVertexAttribute *attributes, size_t attribute_count,
-                           uint32_t format, char *error, size_t error_len) {
+                           char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
 #define FAIL(message) do { fail(error, error_len, (message)); return NULL; } while (0)
-        if (write_mask & ~0x0f) FAIL(@"invalid color write mask");
-        if (!blend_factors || blendFactor(blend_factors[0]) == (MTLBlendFactor)NSUIntegerMax
-            || blend_factors[1] > 10 || blendFactor(blend_factors[1]) == (MTLBlendFactor)NSUIntegerMax
-            || !alphaBlendFactor(blend_factors[3]) || !alphaBlendFactor(blend_factors[4])
-            || blendOperation(blend_factors[2]) == (MTLBlendOperation)NSUIntegerMax
-            || blendOperation(blend_factors[5]) == (MTLBlendOperation)NSUIntegerMax)
-            FAIL(@"unsupported blend state");
+        if (!targets || target_count == 0 || target_count > 8) FAIL(@"invalid color target count");
+        for (size_t i = 0; i < target_count; ++i) {
+            const uint32_t *blend_factors = targets[i].blend_factors;
+            if (targets[i].write_mask & ~0x0f) FAIL(@"invalid color write mask");
+            if (blendFactor(blend_factors[0]) == (MTLBlendFactor)NSUIntegerMax
+                || blend_factors[1] > 10 || blendFactor(blend_factors[1]) == (MTLBlendFactor)NSUIntegerMax
+                || !alphaBlendFactor(blend_factors[3]) || !alphaBlendFactor(blend_factors[4])
+                || blendOperation(blend_factors[2]) == (MTLBlendOperation)NSUIntegerMax
+                || blendOperation(blend_factors[5]) == (MTLBlendOperation)NSUIntegerMax)
+                FAIL(@"unsupported blend state");
+            if (colorPixelFormat(targets[i].format) == MTLPixelFormatInvalid) FAIL(@"invalid color format");
+        }
         VictoryMetalRenderer *r = [VictoryMetalRenderer new];
         r.vertexBuffers = [NSMutableDictionary dictionary];
         r.sampledTextures = [NSMutableDictionary dictionary];
@@ -337,32 +350,38 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         desc.vertexFunction = vertex;
         desc.fragmentFunction = fragment;
         desc.vertexDescriptor = layout;
-        MTLPixelFormat colorFormat = colorPixelFormat(format);
-        if (colorFormat == MTLPixelFormatInvalid) FAIL(@"invalid color format");
-        desc.colorAttachments[0].pixelFormat = colorFormat;
-        MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[0];
-        color.writeMask = ((write_mask & 1) ? MTLColorWriteMaskRed : 0)
-                        | ((write_mask & 2) ? MTLColorWriteMaskGreen : 0)
-                        | ((write_mask & 4) ? MTLColorWriteMaskBlue : 0)
-                        | ((write_mask & 8) ? MTLColorWriteMaskAlpha : 0);
-        color.blendingEnabled = blend_enabled;
-        color.rgbBlendOperation = blendOperation(blend_factors[2]);
-        color.alphaBlendOperation = blendOperation(blend_factors[5]);
-        // D3D MIN/MAX compare the unweighted inputs.
-        bool rgb_minmax = blend_factors[2] >= 4, alpha_minmax = blend_factors[5] >= 4;
-        color.sourceRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[0]);
-        color.destinationRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[1]);
-        color.sourceAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[3]);
-        color.destinationAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[4]);
+        for (size_t i = 0; i < target_count; ++i) {
+            const uint32_t *blend_factors = targets[i].blend_factors;
+            uint8_t write_mask = targets[i].write_mask;
+            MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[i];
+            color.pixelFormat = colorPixelFormat(targets[i].format);
+            color.writeMask = ((write_mask & 1) ? MTLColorWriteMaskRed : 0)
+                            | ((write_mask & 2) ? MTLColorWriteMaskGreen : 0)
+                            | ((write_mask & 4) ? MTLColorWriteMaskBlue : 0)
+                            | ((write_mask & 8) ? MTLColorWriteMaskAlpha : 0);
+            color.blendingEnabled = targets[i].blend_enabled;
+            color.rgbBlendOperation = blendOperation(blend_factors[2]);
+            color.alphaBlendOperation = blendOperation(blend_factors[5]);
+            // D3D MIN/MAX compare the unweighted inputs.
+            bool rgb_minmax = blend_factors[2] >= 4, alpha_minmax = blend_factors[5] >= 4;
+            color.sourceRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[0]);
+            color.destinationRGBBlendFactor = rgb_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[1]);
+            color.sourceAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[3]);
+            color.destinationAlphaBlendFactor = alpha_minmax ? MTLBlendFactorOne : blendFactor(blend_factors[4]);
+        }
         if (depth_compare) desc.depthAttachmentPixelFormat = stencil ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatDepth32Float;
         if (stencil) desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         r.pipeline = [r.device newRenderPipelineStateWithDescriptor:desc error:&e];
         if (!r.pipeline) FAIL(e.localizedDescription ?: @"pipeline creation failed");
-        MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:colorFormat width:width height:height mipmapped:NO];
-        texture.storageMode = MTLStorageModePrivate;
-        texture.usage = MTLTextureUsageRenderTarget;
-        r.texture = [r.device newTextureWithDescriptor:texture];
-        if (!r.texture) FAIL(@"texture allocation failed");
+        r.colorTextures = [NSMutableArray arrayWithCapacity:target_count];
+        for (size_t i = 0; i < target_count; ++i) {
+            MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:colorPixelFormat(targets[i].format) width:width height:height mipmapped:NO];
+            texture.storageMode = MTLStorageModePrivate;
+            texture.usage = MTLTextureUsageRenderTarget;
+            id<MTLTexture> attachment = [r.device newTextureWithDescriptor:texture];
+            if (!attachment) FAIL(@"texture allocation failed");
+            [r.colorTextures addObject:attachment];
+        }
         if (depth_compare) {
             if (depth_compare > 8) FAIL(@"invalid depth comparison");
             MTLDepthStencilDescriptor *depth = [MTLDepthStencilDescriptor new];
@@ -384,9 +403,15 @@ void *victory_metal_create(const uint8_t *vertex_data, size_t vertex_len, const 
         size_t row = (size_t)width * 4;
         r.stride = (row + 255) & ~(size_t)255;
         if (r.stride > SIZE_MAX / height) FAIL(@"readback dimensions overflow");
-        r.readback = [r.device newBufferWithLength:r.stride * height options:MTLResourceStorageModeShared];
+        r.colorReadbacks = [NSMutableArray arrayWithCapacity:target_count];
+        for (size_t i = 0; i < target_count; ++i) {
+            id<MTLBuffer> buffer = [r.device newBufferWithLength:r.stride * height options:MTLResourceStorageModeShared];
+            if (!buffer) FAIL(@"readback allocation failed");
+            [r.colorReadbacks addObject:buffer];
+        }
+        r.readback = r.colorReadbacks[0];
         r.queue = [r.device newCommandQueue];
-        if (!r.readback || !r.queue) FAIL(@"readback or queue allocation failed");
+        if (!r.queue) FAIL(@"queue allocation failed");
         if (r.depthTexture) {
             id<MTLCommandBuffer> command = [r.queue commandBuffer];
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -667,11 +692,15 @@ bool victory_metal_set_sampler_at(void *handle, uint32_t index, bool linear,
 static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
                  const void *indices, uint32_t index_count, uint32_t index_size,
                  int32_t base_vertex, uint32_t first_vertex, uint32_t count, uint32_t instance_count,
-                 const uint32_t *constants, uint8_t *pixels, bool preserve,
+                 const uint32_t *constants, uint8_t *const *pixels, size_t pixel_count, bool preserve,
                  const double *viewport, const uint32_t *scissor, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
+        if (!pixels || pixel_count != r.colorTextures.count)
+            return fail(error, error_len, @"color target count mismatch");
+        for (size_t i = 0; i < pixel_count; ++i)
+            if (!pixels[i]) return fail(error, error_len, @"null color pixels");
         for (size_t i = 0; i < buffer_count; ++i) {
             NSNumber *slot = @(buffers[i].slot);
             id<MTLBuffer> buffer = r.vertexBuffers[slot];
@@ -697,21 +726,25 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
         if (!command) return fail(error, error_len, @"render command creation failed");
         if (preserve) {
             size_t row = (size_t)r.width * 4;
-            for (uint32_t y = 0; y < r.height; ++y)
-                memcpy((uint8_t *)r.readback.contents + (size_t)y * r.stride, pixels + (size_t)y * row, row);
+            for (size_t i = 0; i < pixel_count; ++i)
+                for (uint32_t y = 0; y < r.height; ++y)
+                    memcpy((uint8_t *)r.colorReadbacks[i].contents + (size_t)y * r.stride, pixels[i] + (size_t)y * row, row);
             id<MTLBlitCommandEncoder> upload = [command blitCommandEncoder];
             if (!upload) return fail(error, error_len, @"upload blit command creation failed");
-            [upload copyFromBuffer:r.readback sourceOffset:0 sourceBytesPerRow:r.stride
-               sourceBytesPerImage:r.stride * r.height sourceSize:MTLSizeMake(r.width, r.height, 1)
-                         toTexture:r.texture destinationSlice:0 destinationLevel:0
-                 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            for (size_t i = 0; i < pixel_count; ++i)
+                [upload copyFromBuffer:r.colorReadbacks[i] sourceOffset:0 sourceBytesPerRow:r.stride
+                   sourceBytesPerImage:r.stride * r.height sourceSize:MTLSizeMake(r.width, r.height, 1)
+                             toTexture:r.colorTextures[i] destinationSlice:0 destinationLevel:0
+                     destinationOrigin:MTLOriginMake(0, 0, 0)];
             [upload endEncoding];
         }
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = r.texture;
-        pass.colorAttachments[0].loadAction = preserve ? MTLLoadActionLoad : MTLLoadActionClear;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        for (size_t i = 0; i < pixel_count; ++i) {
+            pass.colorAttachments[i].texture = r.colorTextures[i];
+            pass.colorAttachments[i].loadAction = preserve ? MTLLoadActionLoad : MTLLoadActionClear;
+            pass.colorAttachments[i].clearColor = MTLClearColorMake(0, 0, 0, 0);
+            pass.colorAttachments[i].storeAction = MTLStoreActionStore;
+        }
         if (r.depthTexture) {
             pass.depthAttachment.texture = r.depthTexture;
             pass.depthAttachment.loadAction = MTLLoadActionLoad;
@@ -770,17 +803,19 @@ static bool draw(void *handle, const VictoryVertexBuffer *buffers, size_t buffer
         [render endEncoding];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
         if (!blit) return fail(error, error_len, @"blit command creation failed");
-        [blit copyFromTexture:r.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(r.width, r.height, 1) toBuffer:r.readback destinationOffset:0
-              destinationBytesPerRow:r.stride destinationBytesPerImage:r.stride * r.height];
+        for (size_t i = 0; i < pixel_count; ++i)
+            [blit copyFromTexture:r.colorTextures[i] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(r.width, r.height, 1) toBuffer:r.colorReadbacks[i] destinationOffset:0
+                  destinationBytesPerRow:r.stride destinationBytesPerImage:r.stride * r.height];
         [blit endEncoding];
         [command commit];
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted)
             return fail(error, error_len, command.error.localizedDescription ?: @"GPU command failed");
         size_t row = (size_t)r.width * 4;
-        for (uint32_t y = 0; y < r.height; ++y)
-            memcpy(pixels + (size_t)y * row, (const uint8_t *)r.readback.contents + (size_t)y * r.stride, row);
+        for (size_t i = 0; i < pixel_count; ++i)
+            for (uint32_t y = 0; y < r.height; ++y)
+                memcpy(pixels[i] + (size_t)y * row, (const uint8_t *)r.colorReadbacks[i].contents + (size_t)y * r.stride, row);
         return true;
     }
 }
@@ -793,7 +828,7 @@ bool victory_metal_draw(void *handle, const float *vertices, uint32_t count,
     if (r.vertexStride && count > SIZE_MAX / r.vertexStride)
         return fail(error, error_len, @"vertex buffer size overflow");
     VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)count * r.vertexStride, 0 };
-    return draw(handle, &buffer, 1, NULL, 0, 0, 0, 0, count, 1, constants, pixels,
+    return draw(handle, &buffer, 1, NULL, 0, 0, 0, 0, count, 1, constants, &pixels, 1,
                 preserve, viewport, scissor, error, error_len);
 }
 
@@ -807,17 +842,19 @@ bool victory_metal_draw_indexed(void *handle, const float *vertices, uint32_t ve
         return fail(error, error_len, @"vertex buffer size overflow");
     VictoryVertexBuffer buffer = { 0, (const uint8_t *)vertices, (size_t)vertex_count * r.vertexStride, 0 };
     return draw(handle, &buffer, 1, indices, index_count, index_size, base_vertex, 0, vertex_count, 1,
-                constants, pixels, true, viewport, scissor, error, error_len);
+                constants, &pixels, 1, true, viewport, scissor, error, error_len);
 }
 
-bool victory_metal_draw_buffers(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
-                                const void *indices, uint32_t index_count, uint32_t index_size,
-                                int32_t base_vertex, uint32_t first_vertex, uint32_t vertex_count,
-                                uint32_t instance_count, const uint32_t *constants, uint8_t *pixels,
-                                bool preserve, const double *viewport, const uint32_t *scissor,
-                                char *error, size_t error_len) {
+
+bool victory_metal_draw_buffers_mrt(void *handle, const VictoryVertexBuffer *buffers, size_t buffer_count,
+                                    const void *indices, uint32_t index_count, uint32_t index_size,
+                                    int32_t base_vertex, uint32_t first_vertex, uint32_t vertex_count,
+                                    uint32_t instance_count, const uint32_t *constants,
+                                    uint8_t *const *pixels, size_t pixel_count, bool preserve,
+                                    const double *viewport, const uint32_t *scissor,
+                                    char *error, size_t error_len) {
     return draw(handle, buffers, buffer_count, indices, index_count, index_size, base_vertex,
-                first_vertex, vertex_count, instance_count, constants, pixels, preserve,
+                first_vertex, vertex_count, instance_count, constants, pixels, pixel_count, preserve,
                 viewport, scissor, error, error_len);
 }
 
