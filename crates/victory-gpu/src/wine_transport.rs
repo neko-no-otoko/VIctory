@@ -75,6 +75,11 @@ pub fn requires_array_protocol(batch:&Batch)->bool {
             _=>false,
         })
 }
+
+/// Whether a batch contains a cube view requiring the cube-capable host protocol.
+pub fn requires_cube_protocol(batch:&Batch)->bool {
+    batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.textures.iter().any(|t|t.cube)))
+}
 #[derive(Clone, Debug)]
 pub struct Resource { pub id: u64, pub state: u32, pub kind: ResourceKind, pub bytes: Vec<u8> }
 #[derive(Clone, Copy, Debug)]
@@ -108,7 +113,7 @@ pub struct Draw {
     pub samplers: Vec<SamplerBinding>,
 }
 #[derive(Clone, Debug)]
-pub struct SampledTextureBinding { pub slot:u32, pub offset:u32, pub resource:u64, pub first_mip:u32, pub mip_count:u32, pub array:Option<(u32,u32)> }
+pub struct SampledTextureBinding { pub slot:u32, pub offset:u32, pub resource:u64, pub first_mip:u32, pub mip_count:u32, pub array:Option<(u32,u32)>, pub cube:bool }
 #[derive(Clone, Debug)]
 pub struct SamplerBinding { pub slot:u32, pub offset:u32, pub linear_filter:bool, pub address:[u32;3], pub mip_linear:bool, pub min_lod:f32, pub max_lod:f32 }
 impl SamplerBinding {
@@ -260,12 +265,15 @@ fn validate_commands(resources:&[Resource],commands:&[Command])->Result<(),Strin
                 if !extended && d.texture.is_none() && (d.first_mip!=0 || d.mip_count!=0) {
                     return Err("texture view without texture".into());
                 }
-                for (slot,id,first,count,array) in d.textures.iter().map(|t|(Some((t.slot,t.offset)),t.resource,t.first_mip,t.mip_count,t.array))
-                    .chain(d.texture.map(|id|(None,id,d.first_mip,d.mip_count,None)))
+                for (slot,id,first,count,array,cube) in d.textures.iter().map(|t|(Some((t.slot,t.offset)),t.resource,t.first_mip,t.mip_count,t.array,t.cube))
+                    .chain(d.texture.map(|id|(None,id,d.first_mip,d.mip_count,None,false)))
                 {
                     if let Some((slot,offset))=slot {
                         if slot>=64 || offset>=256 || !texture_entries.insert((slot,offset)) {return Err("invalid texture slot or offset".into())}
                         slots.insert(slot);
+                    }
+                    if cube && (array!=Some((0,6)) || !matches!(resources.iter().find(|r|r.id==id).map(|r|r.kind),Some(ResourceKind::TextureArray {width,height,layers,..}) if width==height && layers>=6)) {
+                        return Err("invalid cube texture view".into());
                     }
                     let mips=match (resources.iter().find(|r|r.id==id).map(|r|r.kind),array) {
                         (Some(ResourceKind::Texture {mips,..}),None)=>mips,
@@ -351,7 +359,7 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
     count(w,batch.commands.len())?;
     for c in &batch.commands { match c {
         Command::Clear {target,color} => {w.u32(0);w.u64(*target);for v in color {w.u32(v.to_bits());}},
-        Command::Draw(d) => {let arrays=d.textures.iter().any(|t|t.array.is_some());let mrt=!d.extra_targets.is_empty();let lod=arrays || d.samplers.iter().any(SamplerBinding::has_extended_lod);let addressed=lod || d.samplers.iter().any(|s|s.address!=[3;3]);let extended=!d.textures.is_empty() || !d.samplers.is_empty();let offsets=mrt || addressed || d.textures.iter().any(|t|t.offset!=0) || d.samplers.iter().any(|s|s.offset!=0);w.u32(if arrays {16} else if lod {14} else if addressed {13} else if mrt {12} else if offsets {11} else if extended {10} else if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
+        Command::Draw(d) => {let cube=d.textures.iter().any(|t|t.cube);let arrays=d.textures.iter().any(|t|t.array.is_some());let mrt=!d.extra_targets.is_empty();let lod=arrays || d.samplers.iter().any(SamplerBinding::has_extended_lod);let addressed=lod || d.samplers.iter().any(|s|s.address!=[3;3]);let extended=!d.textures.is_empty() || !d.samplers.is_empty();let offsets=mrt || addressed || d.textures.iter().any(|t|t.offset!=0) || d.samplers.iter().any(|s|s.offset!=0);w.u32(if cube {17} else if arrays {16} else if lod {14} else if addressed {13} else if mrt {12} else if offsets {11} else if extended {10} else if d.vertices.is_empty(){1}else{9});w.u64(d.target);w.u64(d.pipeline);w.u64(d.vertex_buffer);w.u64(d.vertex_offset);for v in [d.vertex_size,d.vertex_count,d.instance_count,d.first_vertex,d.first_instance] {w.u32(v);} for v in d.viewport {w.u32(v.to_bits());} for v in d.scissor {w.u32(v as u32);} w.u32(d.topology); if d.constants.len()>64 {return Err("too many constants".into());} w.u32(d.constants.len() as u32);for v in &d.constants {w.u32(*v);} w.u64(d.texture.unwrap_or(0));w.u32(d.first_mip);w.u32(d.mip_count);
             if d.texture==Some(0) || d.depth==Some(0) || [d.constant_slot,d.texture_slot,d.sampler_slot].contains(&Some(u32::MAX)) {return Err("invalid optional identifier or slot".into())}
             if let Some(i)=&d.index {w.u32(1);w.u64(i.buffer);w.u64(i.offset);for v in [i.size,i.format,i.first,i.base_vertex as u32] {w.u32(v);}} else {w.u32(0);}
             w.u64(d.depth.unwrap_or(0));w.u32(d.linear_filter as u32);
@@ -367,7 +375,7 @@ fn encode_metadata(w:&mut Writer,batch:&Batch)->Result<(),String> {
             }
             if extended || mrt {
                 w.u32(d.textures.len() as u32);
-                for t in &d.textures {w.u32(t.slot);if offsets {w.u32(t.offset);}w.u64(t.resource);w.u32(t.first_mip);w.u32(t.mip_count);if arrays {let (first,count)=t.array.unwrap_or((0,0));w.u32(first);w.u32(count);}}
+                for t in &d.textures {w.u32(t.slot);if offsets {w.u32(t.offset);}w.u64(t.resource);w.u32(t.first_mip);w.u32(t.mip_count);if arrays {let (first,count)=t.array.unwrap_or((0,0));w.u32(first);w.u32(count);}if cube {w.u32(t.cube as u32);}}
                 w.u32(d.samplers.len() as u32);
                 for s in &d.samplers {w.u32(s.slot);if offsets {w.u32(s.offset);}w.u32(if addressed {(s.linear_filter as u32) | (s.address[0]<<1) | (s.address[1]<<3) | (s.address[2]<<5)} else {s.linear_filter as u32});if lod {w.u32(s.mip_linear as u32);w.u32(s.min_lod.to_bits());w.u32(s.max_lod.to_bits());}}
             }
@@ -436,7 +444,7 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
     let n=r.count()?; let mut commands=Vec::with_capacity(n);
     for _ in 0..n { commands.push(match r.u32()? {
         0=> {let target=r.u64()?;let mut color=[0.;4];for v in &mut color {*v=f32::from_bits(r.u32()?);} Command::Clear {target,color}},
-        kind @ (1|9|10|11|12|13|14|16)=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
+        kind @ (1|9|10|11|12|13|14|16|17)=> {let target=r.u64()?;let pipeline=r.u64()?;let vertex_buffer=r.u64()?;let vertex_offset=r.u64()?;let vertex_size=r.u32()?;let vertex_count=r.u32()?;let instance_count=r.u32()?;let first_vertex=r.u32()?;let first_instance=r.u32()?;let mut viewport=[0.;6];for v in &mut viewport {*v=f32::from_bits(r.u32()?);} let mut scissor=[0;4];for v in &mut scissor {*v=r.u32()? as i32;} let topology=r.u32()?;let count=r.u32()? as usize;if count>64 {return Err("too many constants".into());} let mut constants=Vec::with_capacity(count);for _ in 0..count {constants.push(r.u32()?);} let texture=match r.u64()? {0=>None,id=>Some(id)};let first_mip=r.u32()?;let mip_count=r.u32()?;
             let index=if r.boolean()? {Some(Index {buffer:r.u64()?,offset:r.u64()?,size:r.u32()?,format:r.u32()?,first:r.u32()?,base_vertex:r.u32()? as i32})} else {None};
             let depth=match r.u64()? {0=>None,id=>Some(id)};let linear_filter=r.boolean()?;let vertex_stride=r.u32()?;let mut slot=|| -> Result<Option<u32>,String> {Ok(match r.u32()? {u32::MAX=>None,v=>Some(v)})};let constant_slot=slot()?;let texture_slot=slot()?;let sampler_slot=slot()?;
             let mut vertices=Vec::new();
@@ -454,8 +462,9 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
                 let n=r.count()?;if n>256 {return Err("invalid texture binding count".into())}
                 for _ in 0..n {
                     let slot=r.u32()?;let offset=if kind>=11 {r.u32()?} else {0};let resource=r.u64()?;let first_mip=r.u32()?;let mip_count=r.u32()?;
-                    let array=if kind==16 {let first=r.u32()?;let count=r.u32()?;if count==0 {if first!=0 {return Err("invalid array view".into())} None} else {Some((first,count))}} else {None};
-                    textures.push(SampledTextureBinding {slot,offset,resource,first_mip,mip_count,array});
+                    let array=if kind>=16 {let first=r.u32()?;let count=r.u32()?;if count==0 {if first!=0 {return Err("invalid array view".into())} None} else {Some((first,count))}} else {None};
+                    let cube=if kind==17 {r.boolean()?} else {false};
+                    textures.push(SampledTextureBinding {slot,offset,resource,first_mip,mip_count,array,cube});
                 }
                 let n=r.count()?;if n>256 || (kind!=12 && n==0 && textures.is_empty()) {return Err("invalid sampler binding count".into())}
                 for _ in 0..n {
@@ -466,7 +475,7 @@ fn decode_metadata(r:&mut Reader<'_>,resources:Vec<Resource>)->Result<Batch,Stri
                         if packed & !0x7f != 0 || address.contains(&0) {return Err("invalid packed sampler".into())}
                         (packed & 1 != 0,address)
                     } else {(r.boolean()?,[3;3])};
-                    let (mip_linear,min_lod,max_lod)=if kind==14 || kind==16 {
+                    let (mip_linear,min_lod,max_lod)=if kind==14 || kind>=16 {
                         (r.boolean()?,f32::from_bits(r.u32()?),f32::from_bits(r.u32()?))
                     } else {(linear_filter,0.0,0.0)};
                     samplers.push(SamplerBinding {slot,offset,linear_filter,address,mip_linear,min_lod,max_lod});
@@ -625,6 +634,50 @@ pub fn read_stream_batch<R:std::io::Read>(r:&mut R)->Result<Batch,String> {
 mod tests {
     use super::*;
     #[test]
+    fn cube_views_round_trip_and_validate() {
+        let mut b=batch();
+        b.resources.push(Resource {id:3,state:0,kind:ResourceKind::TextureArray {width:4,height:4,format:28,mips:2,layers:6},bytes:vec![0;480]});
+        b.commands=vec![Command::Draw(Draw {target:2,extra_targets:vec![],pipeline:7,vertex_buffer:1,vertex_offset:0,vertex_size:4,vertex_stride:16,
+            vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
+            topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
+            constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
+            textures:vec![SampledTextureBinding {slot:1,offset:0,resource:3,first_mip:0,mip_count:2,array:Some((0,6)),cube:true},
+                SampledTextureBinding {slot:1,offset:1,resource:2,first_mip:0,mip_count:1,array:None,cube:false}],
+            samplers:vec![SamplerBinding {slot:2,offset:0,linear_filter:true,address:[1,2,3],mip_linear:true,min_lod:0.,max_lod:1.}]})];
+        assert!(requires_cube_protocol(&b));
+        let bytes=encode_batch(&b).unwrap();
+        let opcode=encode_results(&b.resources).unwrap().len()+8;
+        assert_eq!(&bytes[opcode..opcode+4],&17u32.to_le_bytes());
+        let decoded=decode_batch(&bytes).unwrap();
+        let Command::Draw(d)=&decoded.commands[0] else {unreachable!()};
+        assert!(d.textures[0].cube);
+        assert!(!d.textures[1].cube);
+        assert_eq!(encode_batch(&decoded).unwrap(),bytes);
+        let mut stream=Vec::new();
+        write_stream_batch(&mut stream,&b).unwrap();
+        assert_eq!(encode_batch(&read_stream_batch(&mut stream.as_slice()).unwrap()).unwrap(),bytes);
+        for end in 0..bytes.len() {assert!(decode_batch(&bytes[..end]).is_err());}
+        let cube_flag=bytes.len()-4-24-4-36-4;
+        let mut malformed=bytes.clone();
+        malformed[cube_flag..cube_flag+4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_batch(&malformed).is_err());
+        let Command::Draw(d)=&mut b.commands[0] else {unreachable!()};
+        d.textures[0].array=Some((1,5));
+        assert!(encode_batch(&b).is_err());
+        let Command::Draw(d)=&mut b.commands[0] else {unreachable!()};
+        d.textures[0].array=None;
+        assert!(encode_batch(&b).is_err());
+        let Command::Draw(d)=&mut b.commands[0] else {unreachable!()};
+        d.textures[0].array=Some((0,6));
+        b.resources[2].kind=ResourceKind::TextureArray {width:4,height:2,format:28,mips:2,layers:6};
+        b.resources[2].bytes=vec![0;240];
+        assert!(encode_batch(&b).is_err());
+        b.resources[2].kind=ResourceKind::TextureArray {width:4,height:4,format:28,mips:2,layers:5};
+        b.resources[2].bytes=vec![0;400];
+        assert!(encode_batch(&b).is_err());
+    }
+
+    #[test]
     fn array_layout_and_wire_round_trip() {
         assert_eq!(array_texture_size(28,4,4,2,3),Some(240));
         assert_eq!(array_mip_layout(28,4,4,2,3,1,1),Some((2,2,144,16)));
@@ -643,8 +696,8 @@ mod tests {
                 vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
                 topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
                 constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
-                textures:vec![SampledTextureBinding {slot:1,offset:0,resource:3,first_mip:1,mip_count:1,array:Some((1,2))},
-                    SampledTextureBinding {slot:1,offset:1,resource:2,first_mip:0,mip_count:1,array:None}],samplers:vec![]}),
+                textures:vec![SampledTextureBinding {slot:1,offset:0,resource:3,first_mip:1,mip_count:1,array:Some((1,2)),cube:false},
+                    SampledTextureBinding {slot:1,offset:1,resource:2,first_mip:0,mip_count:1,array:None,cube:false}],samplers:vec![]}),
         ];
         assert!(requires_array_protocol(&b));
         let bytes=encode_batch(&b).unwrap();
@@ -925,7 +978,7 @@ mod tests {
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
             constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
-            textures:vec![SampledTextureBinding {slot:1,offset:0,resource:2,first_mip:0,mip_count:1,array:None},SampledTextureBinding {slot:2,offset:0,resource:3,first_mip:0,mip_count:1,array:None}],
+            textures:vec![SampledTextureBinding {slot:1,offset:0,resource:2,first_mip:0,mip_count:1,array:None,cube:false},SampledTextureBinding {slot:2,offset:0,resource:3,first_mip:0,mip_count:1,array:None,cube:false}],
             samplers:vec![SamplerBinding {slot:3,offset:0,linear_filter:false,address:[3;3],mip_linear:false,min_lod:0.,max_lod:0.},SamplerBinding {slot:4,offset:0,linear_filter:true,address:[3;3],mip_linear:true,min_lod:0.,max_lod:0.}]}));
         let bytes=encode_batch(&b).unwrap();
         for end in 0..bytes.len() {assert!(decode_batch(&bytes[..end]).is_err());}
@@ -942,8 +995,8 @@ mod tests {
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
             constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
-            textures:vec![SampledTextureBinding {slot:1,offset:0,resource:2,first_mip:0,mip_count:1,array:None},
-                SampledTextureBinding {slot:1,offset:2,resource:2,first_mip:0,mip_count:1,array:None}],
+            textures:vec![SampledTextureBinding {slot:1,offset:0,resource:2,first_mip:0,mip_count:1,array:None,cube:false},
+                SampledTextureBinding {slot:1,offset:2,resource:2,first_mip:0,mip_count:1,array:None,cube:false}],
             samplers:vec![SamplerBinding {slot:3,offset:0,linear_filter:false,address:[3;3],mip_linear:false,min_lod:0.,max_lod:0.},SamplerBinding {slot:3,offset:1,linear_filter:true,address:[3;3],mip_linear:true,min_lod:0.,max_lod:0.}]}));
         let bytes=encode_batch(&b).unwrap();
         for end in 0..bytes.len() {assert!(decode_batch(&bytes[..end]).is_err());}
@@ -970,7 +1023,7 @@ mod tests {
             vertex_count:3,instance_count:1,first_vertex:0,first_instance:0,viewport:[0.,0.,1.,1.,0.,1.],scissor:[0,0,1,1],
             topology:4,constants:vec![],texture:None,first_mip:0,mip_count:0,index:None,depth:None,linear_filter:false,
             constant_slot:None,texture_slot:None,sampler_slot:None,vertices:vec![],
-            textures:vec![SampledTextureBinding {slot:1,offset:2,resource:2,first_mip:0,mip_count:1,array:None}],
+            textures:vec![SampledTextureBinding {slot:1,offset:2,resource:2,first_mip:0,mip_count:1,array:None,cube:false}],
             samplers:vec![SamplerBinding {slot:3,offset:4,linear_filter:true,address:[3;3],mip_linear:true,min_lod:0.,max_lod:0.}]})];
         let opcode=encode_results(&b.resources).unwrap().len()+8;
         let legacy=encode_batch(&b).unwrap();

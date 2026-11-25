@@ -264,7 +264,7 @@ mod host {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
         let fields: [u32; 8] = std::array::from_fn(|i| word(&header[i * 4..i * 4 + 4]));
-        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19) {
+        if fields[0] != MAGIC || !matches!(fields[1], 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21) {
             return Err("invalid protocol header".into());
         }
         if matches!(fields[1], 1 | 6 | 7) {
@@ -276,12 +276,12 @@ mod host {
                 return Err("invalid request lengths or dispatch dimensions".into());
             }
         }
-        if matches!(fields[1], 5 | 10 | 12 | 14 | 16 | 18) && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
+        if matches!(fields[1], 5 | 10 | 12 | 14 | 16 | 18 | 20) && (fields[2] as usize > victory_gpu::wine_transport::MAX_PAYLOAD
             || fields[3..].iter().any(|&v| v != 0))
         {
             return Err("invalid batch request length or reserved fields".into());
         }
-        if matches!(fields[1], 9 | 11 | 13 | 15 | 17 | 19) && fields[2..].iter().any(|&v| v != 0) {
+        if matches!(fields[1], 9 | 11 | 13 | 15 | 17 | 19 | 21) && fields[2..].iter().any(|&v| v != 0) {
             return Err("invalid stream request reserved fields".into());
         }
         if fields[1] == 8 && (fields[2] < 32 || fields[2] as usize > 64 * 1024 * 1024
@@ -298,20 +298,26 @@ mod host {
             1 | 6 | 7 => compute_request(stream, fields, cache).map(Response::Bytes),
             8 => raw_heap_request(stream, fields[2] as usize, cache).map(Response::Bytes),
             2 => graphics_request(stream, fields).map(Response::Bytes),
-            5 | 10 | 12 | 14 | 16 | 18 => {
+            5 | 10 | 12 | 14 | 16 | 18 | 20 => {
                 let mut payload = vec![0; fields[2] as usize];
                 stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
                 let batch = victory_gpu::wine_transport::decode_batch(&payload)?;
-                if fields[1] != 18 && victory_gpu::wine_transport::requires_array_protocol(&batch) {
-                    return Err("texture arrays require protocol 18 or 19".into());
+                if fields[1] != 20 && victory_gpu::wine_transport::requires_cube_protocol(&batch) {
+                    return Err("cube views require protocol 20 or 21".into());
+                }
+                if !matches!(fields[1],18|20) && victory_gpu::wine_transport::requires_array_protocol(&batch) {
+                    return Err("texture arrays require protocol 18 or later".into());
                 }
                 let results = victory_gpu::execute_wine_batch(batch)?;
                 victory_gpu::wine_transport::encode_results(&results).map(Response::Bytes)
             }
-            9 | 11 | 13 | 15 | 17 | 19 => {
+            9 | 11 | 13 | 15 | 17 | 19 | 21 => {
                 let batch = victory_gpu::wine_transport::read_stream_batch(stream)?;
-                if fields[1] != 19 && victory_gpu::wine_transport::requires_array_protocol(&batch) {
-                    return Err("texture arrays require protocol 18 or 19".into());
+                if fields[1] != 21 && victory_gpu::wine_transport::requires_cube_protocol(&batch) {
+                    return Err("cube views require protocol 20 or 21".into());
+                }
+                if !matches!(fields[1],19|21) && victory_gpu::wine_transport::requires_array_protocol(&batch) {
+                    return Err("texture arrays require protocol 19 or later".into());
                 }
                 let results = victory_gpu::execute_wine_batch(batch)?;
                 victory_gpu::wine_transport::validate_stream_results(&results)?;
@@ -457,14 +463,14 @@ mod host {
 
         #[test]
         fn extended_batch_versions_validate_headers_and_authentication() {
-            for version in [12u32,13,14,15,16,17] {
+            for version in [12u32,13,14,15,16,17,18,19,20,21] {
                 for (reserved, token, expected) in [
                     (1, [0;16], "reserved"),
                     (0, [1;16], "authentication"),
                 ] {
                     let listener=TcpListener::bind("127.0.0.1:0").unwrap();
                     let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-                    let fields=if matches!(version,12|14|16) {[MAGIC,version,0,reserved,0,0,0,0]}
+                    let fields=if matches!(version,12|14|16|18|20) {[MAGIC,version,0,reserved,0,0,0,0]}
                         else {[MAGIC,version,reserved,0,0,0,0,0]};
                     for value in fields {client.write_all(&value.to_le_bytes()).unwrap();}
                     client.write_all(&token).unwrap();

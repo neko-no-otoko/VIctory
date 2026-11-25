@@ -148,7 +148,7 @@ unsafe extern "C" {
     ) -> bool;
     fn victory_metal_set_texture_at(
         renderer: *mut c_void, index: u32, width: u32, height: u32, levels: u32, layers: u32,
-        pixels: *const u8, format: u32, error: *mut c_char, error_len: usize,
+        cube: bool, pixels: *const u8, format: u32, error: *mut c_char, error_len: usize,
     ) -> bool;
     fn victory_metal_set_sampler_at(
         renderer: *mut c_void, index: u32, linear_filter: bool, mip_linear: bool,
@@ -759,6 +759,25 @@ impl Renderer {
         &mut self, index: u32, width: u32, height: u32, levels: u32, layers: u32,
         pixels: &[u8], format: TextureFormat,
     ) -> Result<(), RenderError> {
+        self.set_fragment_texture_layers_mips_at(index, width, height, levels, layers, false, pixels, format)
+    }
+
+    /// Upload six square cube faces in +X, -X, +Y, -Y, +Z, -Z order.
+    /// Each face contains its tightly packed mip levels consecutively.
+    pub fn set_fragment_texture_cube_mips_at(
+        &mut self, index: u32, width: u32, height: u32, levels: u32,
+        pixels: &[u8], format: TextureFormat,
+    ) -> Result<(), RenderError> {
+        if width != height {
+            return Err(RenderError("cube texture faces must be square".into()));
+        }
+        self.set_fragment_texture_layers_mips_at(index, width, height, levels, 6, true, pixels, format)
+    }
+
+    fn set_fragment_texture_layers_mips_at(
+        &mut self, index: u32, width: u32, height: u32, levels: u32, layers: u32,
+        cube: bool, pixels: &[u8], format: TextureFormat,
+    ) -> Result<(), RenderError> {
         if !self.fragment_texture || index >= 16 || width == 0 || height == 0 || levels == 0 || layers == 0
             || levels > u32::BITS - width.max(height).leading_zeros()
         {
@@ -788,7 +807,7 @@ impl Renderer {
         // synchronous upload, which retains its own Metal texture.
         let ok = unsafe {
             victory_metal_set_texture_at(
-                self.handle.as_ptr(), index, width, height, levels, layers, pixels.as_ptr(),
+                self.handle.as_ptr(), index, width, height, levels, layers, cube, pixels.as_ptr(),
                 format.native_value(), error.as_mut_ptr(), error.len(),
             )
         };

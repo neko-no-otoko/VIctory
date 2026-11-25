@@ -178,7 +178,7 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 struct Texture { id: u64, width: u32, height: u32, format: u32, mips: u32, layers:u32, flags: u32, state: Mutex<u32>, bytes: Mutex<Vec<u8>>, tiled: Option<(Buffer, victory_formats::texture::Texture)> }
 #[derive(Clone)]
-struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32, array:Option<(u32,u32)> }
+struct Srv { texture: Arc<Texture>, first_mip: u32, mip_count: u32, array:Option<(u32,u32)>, cube:bool }
 type TextureHeap = Arc<Mutex<Vec<Option<Arc<Srv>>>>>;
 struct Sampler { linear:bool, mip_linear:bool, address:[u32;3], min_lod:f32, max_lod:f32 }
 type SamplerHeap = Arc<Mutex<Vec<Option<Arc<Sampler>>>>>;
@@ -818,8 +818,8 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
     }
     let (Some(Data::Texture(t)), Some((h,index))) = (data(res), texture_handle(handle)) else { trap("invalid SRV"); };
     if device(this).is_none() || !matches!(t.format, 28 | 29 | 71 | 72 | 77 | 78 | 87 | 91) { trap("unsupported SRV"); }
-    let (first_mip,mip_count,array) = if desc.is_null() {
-        (0,t.mips,if t.layers>1 {Some((0,t.layers))} else {None})
+    let (first_mip,mip_count,array,cube) = if desc.is_null() {
+        (0,t.mips,if t.layers>1 {Some((0,t.layers))} else {None},false)
     } else {
         // Texture2DArray's active union contains mip range, slice range,
         // plane, and minimum LOD in that order.
@@ -832,20 +832,25 @@ extern "system" fn create_srv(this: This, res: This, desc: *const c_void, handle
             4 if t.layers==1 => {
                 let (plane,lod)=unsafe {(p.add(6).read(),f32::from_bits(p.add(7).read()))};
                 if plane!=0 || lod!=0.0 {trap("unsupported SRV");}
-                (first,count,None)
+                (first,count,None,false)
             }
             5 => {
                 let (start,layers,plane,lod)=unsafe {(p.add(6).read(),p.add(7).read(),p.add(8).read(),f32::from_bits(p.add(9).read()))};
                 let remaining=t.layers.checked_sub(start).filter(|&n|n!=0).unwrap_or_else(||trap("invalid SRV array range"));
                 let layers=if layers==u32::MAX {remaining} else {layers};
                 if layers==0 || layers>remaining || plane!=0 || lod!=0.0 {trap("unsupported SRV");}
-                (first,count,Some((start,layers)))
+                (first,count,Some((start,layers)),false)
+            }
+            9 => {
+                let lod=unsafe {f32::from_bits(p.add(6).read())};
+                if t.width!=t.height || t.layers<6 || lod!=0.0 {trap("unsupported cube SRV");}
+                (first,count,Some((0,6)),true)
             }
             _=>trap("unsupported SRV"),
         }
     };
     clear_buffer_descriptor(handle);
-    h.lock().unwrap()[index] = Some(Arc::new(Srv { texture:t, first_mip, mip_count, array }));
+    h.lock().unwrap()[index] = Some(Arc::new(Srv { texture:t, first_mip, mip_count, array, cube }));
 }
 extern "system" fn create_sampler(this: This, desc: *const [u32; 13], handle: u64) {
     let (Some((h,index)), Some(d)) = (sampler_handle(handle), unsafe { desc.as_ref() }) else { trap("invalid sampler"); };
@@ -1794,7 +1799,7 @@ fn record_draw(this: This, count: u32, instances: u32, first: u32, instance: u32
         constant_slot: g.constant_slot, texture_slot: texture.map(|v| v.0),
         sampler_slot: sampler.map(|v| v.0), vertices: if legacy {Vec::new()} else {views},
         textures: if single {Vec::new()} else {textures.iter().map(|v| wine_transport::SampledTextureBinding {
-            slot:v.0,offset:v.1,resource:v.4.texture.id,first_mip:v.4.first_mip,mip_count:v.4.mip_count,array:v.4.array }).collect()},
+            slot:v.0,offset:v.1,resource:v.4.texture.id,first_mip:v.4.first_mip,mip_count:v.4.mip_count,array:v.4.array,cube:v.4.cube }).collect()},
         samplers: if single {Vec::new()} else {samplers.iter().map(|v| wine_transport::SamplerBinding {
             slot:v.0,offset:v.1,linear_filter:v.4.linear,address:v.4.address,mip_linear:v.4.mip_linear,min_lod:v.4.min_lod,max_lod:v.4.max_lod }).collect()} });
     g.jobs.push(GraphicsJob { command, resources, descriptor: Some(desc), extra_descriptors:g.targets.iter().skip(1).cloned().collect(), depth_descriptor: g.depth.clone(), pipeline: Some(pipeline),
@@ -1930,7 +1935,8 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let addressed=batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.samplers.iter().any(|s|s.address!=[3;3])));
     let lod=batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.samplers.iter().any(|s|s.mip_linear!=s.linear_filter || s.min_lod!=0.0 || s.max_lod!=0.0)));
     let array=batch.resources.iter().any(|r|matches!(r.kind,ResourceKind::TextureArray {..})) || batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.textures.iter().any(|t|t.array.is_some())));
-    let version = match (payload.is_some(),mrt,raster,addressed,lod,array) {(true,_,_,_,_,true)=>18,(false,_,_,_,_,true)=>19,(true,_,_,_,true,false)=>16,(false,_,_,_,true,false)=>17,(true,_,_,true,false,false)=>14,(false,_,_,true,false,false)=>15,(true,_,true,false,false,false)=>12,(false,_,true,false,false,false)=>13,(true,false,false,false,false,false)=>5,(false,false,false,false,false,false)=>9,(true,true,false,false,false,false)=>10,(false,true,false,false,false,false)=>11};
+    let cube=batch.commands.iter().any(|c|matches!(c,Command::Draw(d) if d.textures.iter().any(|t|t.cube)));
+    let version = match (payload.is_some(),mrt,raster,addressed,lod,array,cube) {(true,_,_,_,_,_,true)=>20,(false,_,_,_,_,_,true)=>21,(true,_,_,_,_,true,false)=>18,(false,_,_,_,_,true,false)=>19,(true,_,_,_,true,false,false)=>16,(false,_,_,_,true,false,false)=>17,(true,_,_,true,false,false,false)=>14,(false,_,_,true,false,false,false)=>15,(true,_,true,false,false,false,false)=>12,(false,_,true,false,false,false,false)=>13,(true,false,false,false,false,false,false)=>5,(false,false,false,false,false,false,false)=>9,(true,true,false,false,false,false,false)=>10,(false,true,false,false,false,false,false)=>11};
     let payload_len = payload.as_ref().map_or(0, |p| p.len() as u32);
     for v in [MAGIC,version,payload_len,0,0,0,0,0] { s.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?; }
     s.write_all(&c.token).map_err(|e| e.to_string())?;
@@ -1940,13 +1946,13 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     let word = |n| u32::from_le_bytes(header[n..n+4].try_into().unwrap());
     let (magic,status,len,msg) = (word(0),word(4),word(8) as usize,word(12) as usize);
     if magic != MAGIC || len > wine_transport::MAX_PAYLOAD || msg > 4096 || (status == 0 && msg != 0)
-        || (status != 0 && len != 0) || (matches!(version,9|11|13|15|17|19) && len != 0)
+        || (status != 0 && len != 0) || (matches!(version,9|11|13|15|17|19|21) && len != 0)
     { return Err("invalid proxy response".into()); }
     if status != 0 {
         let mut message = vec![0;msg]; s.read_exact(&mut message).map_err(|e| e.to_string())?;
         return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
     }
-    let results = if matches!(version,9|11|13|15|17|19) { wine_transport::read_stream_results(&mut s)? } else {
+    let results = if matches!(version,9|11|13|15|17|19|21) { wine_transport::read_stream_results(&mut s)? } else {
         let mut bytes = vec![0;len]; s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         wine_transport::decode_results(&bytes)?
     };

@@ -149,7 +149,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
     if extended && (d.texture.is_some() || d.texture_slot.is_some() || d.sampler_slot.is_some()
         || d.first_mip!=0 || d.mip_count!=0 || d.linear_filter)
     {return Err("mixed legacy and extended texture bindings".into())}
-    let mut texture_bindings:Vec<_>=d.textures.iter().map(|t|(t.slot,t.offset,t.resource,t.first_mip,t.mip_count,t.array)).collect();
+    let mut texture_bindings:Vec<_>=d.textures.iter().map(|t|(t.slot,t.offset,t.resource,t.first_mip,t.mip_count,t.array,t.cube)).collect();
     let mut sampler_bindings:Vec<_>=d.samplers.iter().map(|s| {
         if !s.min_lod.is_finite() || !s.max_lod.is_finite() || s.min_lod<0. || s.max_lod<s.min_lod {
             return Err("unsupported sampler LOD".into());
@@ -165,7 +165,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             || prepared.texture_slots.len()>1 || prepared.sampler_slots.len()>1
         {return Err("shader texture or sampler slot mismatch".into())}
         if let (Some(slot),Some(resource))=(d.texture_slot,d.texture) {
-            texture_bindings.push((slot,0,resource,d.first_mip,d.mip_count,None));
+            texture_bindings.push((slot,0,resource,d.first_mip,d.mip_count,None,false));
         } else if d.first_mip!=0 || d.mip_count!=0 {return Err("unexpected texture view range".into())}
         if let Some(slot)=d.sampler_slot {sampler_bindings.push((slot,0,d.linear_filter,d.linear_filter,0.,0.,[SamplerAddress::Clamp;3]));}
     }
@@ -186,7 +186,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
         sampler_bindings.iter().find(|s|s.0==u32::from(e.slot) && s.1==e.offset)
             .copied().ok_or("missing static descriptor binding")
     ).collect::<Result<_,_>>()?;
-    for &(_,_,id,_,_,_) in &texture_bindings {
+    for &(_,_,id,_,_,_,_) in &texture_bindings {
         if target_ids.contains(&id) || Some(id)==d.depth {return Err("draw resource alias is unsupported".into())}
         access(rs,touched,id,0x80)?;
     }
@@ -206,7 +206,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
     let mut depth=if let Some(id)=d.depth {let r=rs.get(&id).ok_or("unknown depth target")?;if depth_image(r)?!=(width,height) {return Err("depth dimensions mismatch".into())} let combined=matches!(r.kind,ResourceKind::Texture {format:20,..});if combined != p.depth.as_ref().is_some_and(|z|z.stencil.is_some()) {return Err("pipeline depth format mismatch".into())} let size=(width as usize)*(height as usize)*4;if combined {stencil=Some(r.bytes[size..].to_vec());} Some(r.bytes[..size].chunks_exact(4).map(|b|f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect::<Vec<_>>())} else {None};
     let mut targets:Vec<Vec<u8>>=target_ids.iter().map(|id|std::mem::take(&mut rs.get_mut(id).unwrap().bytes)).collect();
     let mut packed=Vec::with_capacity(texture_bindings.len());
-    for &(_,_,id,first_mip,mip_count,array) in &texture_bindings {
+    for &(_,_,id,first_mip,mip_count,array,cube) in &texture_bindings {
         let r=rs.get(&id).ok_or("unknown sampled texture")?;
         let (w,h,fmt,mips,layers,f)=match r.kind {
             ResourceKind::Texture {format,..} => {let (w,h,mips,f)=image(r)?;(w,h,format,mips,1,f)},
@@ -214,6 +214,7 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             _ => return Err("expected sampled texture".into()),
         };
         if array.is_none() && matches!(r.kind,ResourceKind::TextureArray {..}) {return Err("texture array requires an array view".into())}
+        if cube && (array!=Some((0,6)) || w!=h) {return Err("invalid cube texture view".into())}
         let (first_slice,count)=array.unwrap_or((0,1));
         if count==0 || first_slice.checked_add(count).filter(|&end|end<=layers).is_none() {return Err("invalid texture slice view range".into())}
         let end=first_mip.checked_add(mip_count).ok_or("texture view range overflow")?;
@@ -235,10 +236,10 @@ fn draw(rs:&mut HashMap<u64,Resource>,touched:&mut HashMap<u64,bool>,pipelines:&
             }
             std::borrow::Cow::Owned(bytes)
         };
-        packed.push((view_width,view_height,mip_count,array.map(|_|count),bytes,f,id,first_mip,first_slice));
+        packed.push((view_width,view_height,mip_count,array.map(|_|count),cube,bytes,f,id,first_mip,first_slice));
     }
-    let sampled:Vec<_>=packed.iter().map(|(width,height,levels,layers,bytes,format,id,first_mip,first_slice)| {
-        (Texture {width:*width,height:*height,levels:*levels,array_layers:*layers,pixels:bytes,filter:TextureFilter::Nearest,format:*format,min_lod:0.,max_lod:0.},
+    let sampled:Vec<_>=packed.iter().map(|(width,height,levels,layers,cube,bytes,format,id,first_mip,first_slice)| {
+        (Texture {width:*width,height:*height,levels:*levels,array_layers:*layers,cube:*cube,pixels:bytes,filter:TextureFilter::Nearest,format:*format,min_lod:0.,max_lod:0.},
             Some(SampledTextureIdentity {resource:*id,generation:generations.get(id).copied().unwrap_or(0),first_mip:*first_mip,first_slice:*first_slice}))
     }).collect();
     let samplers:Vec<_>=sampler_bindings.iter().map(|&(_,_,linear,mip_linear,min_lod,max_lod,address)|(if linear {TextureFilter::Linear} else {TextureFilter::Nearest},mip_linear,min_lod,max_lod,address)).collect();

@@ -441,8 +441,11 @@ and samplers in the draw.
 Texture2D array SRVs select bounded slice and mip ranges. Subresources use D3D
 slice-major ordering, with each slice's mip chain in order; full subresource
 buffer copies preserve 256-byte row-pitch and 512-byte offset alignment.
-Array shader dimensions must match the view. Array render/depth targets, tiled
-arrays, cube and 3D textures, and per-subresource barriers remain unsupported.
+TextureCube SRVs select the first six square faces in +X, -X, +Y, -Y, +Z, -Z
+order and a bounded mip range. Shader dimensions must match the view. Cube
+arrays remain unsupported: the current console cube lowering emits a single
+cube and does not preserve the encoded cube-array index. Array render/depth
+targets, tiled arrays, 3D textures and per-subresource barriers remain unsupported.
 Pixel shaders may access multiple texture and sampler entries at statically
 traced table-relative indices, including nonzero indices and table bases.
 Guest shader-visible resource and sampler heaps hold up to 256 entries; per
