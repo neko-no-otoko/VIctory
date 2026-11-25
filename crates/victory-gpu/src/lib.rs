@@ -63,14 +63,14 @@ mod texture;
 mod watch;
 pub mod wine_transport;
 pub mod wine_present;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 mod wine_graphics;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 pub use wine_graphics::execute_wine_batch;
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 pub use metal::WineMetalCompute;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 pub use metal_graphics::WineMetalGraphics;
 
 #[cfg(windows)]

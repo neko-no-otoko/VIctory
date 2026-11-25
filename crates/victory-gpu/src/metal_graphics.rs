@@ -665,12 +665,10 @@ impl Prepared {
 ///
 /// Only pixel shader root constants at slot 3 are supported; descriptor
 /// tables, depth, blending and textures are not supported.
-#[cfg(target_arch = "x86_64")]
 pub struct WineMetalGraphics {
     prepared: Prepared,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl WineMetalGraphics {
     /// Translate and prepare the console vertex and pixel shaders.
     pub fn new(vertex: &[u8], pixel: &[u8]) -> Result<Self, String> {

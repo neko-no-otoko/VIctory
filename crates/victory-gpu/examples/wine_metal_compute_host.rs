@@ -1,6 +1,6 @@
 //! Opt-in loopback server for the restricted Wine Metal compute and graphics protocols.
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 mod host {
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -517,7 +517,7 @@ mod host {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 fn main() {
     if let Err(error) = host::run() {
         eprintln!("{error}");
@@ -525,8 +525,8 @@ fn main() {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("wine_metal_compute_host requires macOS x86_64");
+    eprintln!("wine_metal_compute_host requires macOS");
     std::process::exit(1);
 }

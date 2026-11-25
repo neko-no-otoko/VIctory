@@ -227,12 +227,10 @@ impl Prepared {
     }
 }
 /// A reusable restricted console compute pipeline.
-#[cfg(target_arch = "x86_64")]
 pub struct WineMetalCompute {
     prepared: Prepared,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl WineMetalCompute {
     /// Prepare a shader with root constants at slot 0, a UAV table at slot 1,
     /// and an optional root CBV at a slot from 2 through 63.

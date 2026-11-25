@@ -1161,6 +1161,58 @@ The synthetic tests cover a second guest checking its image and arguments and
 confirming the first process had exited, absent and relative targets failing,
 and host cleanup.
 
+### Apple Silicon native Metal helper
+
+The helper can run as an arm64 macOS process while the Windows guest remains
+x86-64 under Wine and the `victory` launcher runs under Rosetta. The converter
+must contain an arm64 slice; check it with `lipo -archs`. This changes neither
+the guest ABI nor Wine's execution architecture. The authenticated protocol
+uses explicit little-endian fields and carries no guest pointers.
+
+With the Wine and LLVM-MinGW prerequisites above, an Aqua session, Rust targets
+`aarch64-apple-darwin`, `x86_64-apple-darwin` and
+`x86_64-pc-windows-gnullvm`, and a trusted universal or arm64 converter:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/victory-arm-host-target
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang
+export VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib
+lipo -archs "$VICTORY_TEST_METAL_CONVERTER"
+cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3d12x-dll \
+  -p victory-xmem-dll -p victory-xmem-backend -p victory-acphal-dll -p victory-xapu-dll \
+  --target x86_64-pc-windows-gnullvm
+cargo build --locked -p victory-gpu --example wine_metal_compute_host --target aarch64-apple-darwin
+file "$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host"
+export VICTORY_TEST_WINE=/opt/homebrew/bin/wine
+export VICTORY_TEST_WINEPATH=/opt/homebrew/bin/winepath
+export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
+export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host"
+export VICTORY_TEST_DLL_DIR="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug"
+export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_mips \
+  launcher_runs_real_mip_sampling_and_rejects_invalid_cases -- --ignored --nocapture --test-threads=1
+```
+
+For presentation, start the arm64 helper in a separate terminal with
+`VICTORY_WINE_METAL_PRESENT=1`, a fresh 32-hex-digit
+`VICTORY_WINE_METAL_TOKEN` and `VICTORY_METAL_CONVERTER` set to the converter.
+Run `"$VICTORY_TEST_METAL_HOST" 127.0.0.1:0 --announce` and copy its
+`VICTORY_WINE_METAL_READY` address into `VICTORY_WINE_METAL_ADDR` in the test
+terminal. Export the same token there, then run:
+
+```sh
+export VICTORY_TEST_D3D12X_DLL="$VICTORY_TEST_DLL_DIR/d3d12_xs.dll"
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_graphics -- --ignored --nocapture --test-threads=1
+cargo test --locked -p victory --target x86_64-apple-darwin --test present_capture -- --ignored --nocapture --test-threads=1
+```
+
+On an M3 Max, an arm64-only helper and universal converter passed the normal
+x86-64 Wine mip GPU readback and all four typed-color presentation cases;
+drawable capture also passed. These synthetic tests do not establish game
+compatibility or ARM-native guest execution.
+
+### Focused launcher tests
+
 For the focused launcher tests, set the following paths (using the same
 target directory and LLVM-MinGW setup as above):
 
