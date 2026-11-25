@@ -319,10 +319,9 @@ extern "system" fn present(
             let format = crate::resource::metal_color_format(resource).ok_or("unsupported color format")?;
             if !matches!(format, 28 | 29 | 87 | 91) { return Err("unsupported color format".into()); }
             let (ptr, width, height, pitch) = crate::resource::metal_texture(resource).ok_or("unsupported color resource")?;
-            let len = (height as usize - 1).checked_mul(pitch)
-                .and_then(|n| n.checked_add(width as usize * 4)).ok_or("image size overflow")?;
-            if len > 16 * 1024 * 1024 { return Err("image too large".into()); }
             let pitch = u32::try_from(pitch).map_err(|_| "pitch overflow")?;
+            let len = victory_formats::presentation::source_len(width, height, pitch)
+                .ok_or("invalid presentation source dimensions or pitch")?;
             let (addr, token) = crate::wine_present::config()?;
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
             crate::wine_present::send(addr, token, width, height, format, pitch, bytes, false).map(|_| ())

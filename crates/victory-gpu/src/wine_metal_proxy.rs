@@ -1461,9 +1461,11 @@ extern "system" fn present(this: This, planes: u32, plane: *const crate::queue::
     if state.active { return crate::object::E_NOTIMPL; }
     let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Data::Texture(texture)) = data(unsafe { *plane.resources }) else { return E_INVALIDARG; };
-    if !matches!(texture.format, 28 | 29 | 87 | 91) || texture.tiled.is_some() { return E_INVALIDARG; }
+    if !matches!(texture.format, 28 | 29 | 87 | 91) || texture.tiled.is_some()
+        || texture.volume || texture.layers != 1 || texture.mips != 1 { return E_INVALIDARG; }
+    let Some(pitch) = texture.width.checked_mul(4) else { return E_INVALIDARG; };
     let bytes = texture.bytes.lock().unwrap_or_else(|e| e.into_inner());
-    match crate::wine_present::send(queue.config.addr, queue.config.token, texture.width, texture.height, texture.format, texture.width * 4, &bytes, false) {
+    match crate::wine_present::send(queue.config.addr, queue.config.token, texture.width, texture.height, texture.format, pitch, &bytes, false) {
         Ok(_) => S_OK,
         Err(e) => { tracing::error!(%e, "Wine presentation failed"); FAIL }
     }

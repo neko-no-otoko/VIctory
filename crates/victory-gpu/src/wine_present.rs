@@ -1,8 +1,8 @@
 //! Authenticated, synchronous presentation over the Wine Metal helper protocol.
 use std::{io::{Read, Write}, net::{SocketAddr, TcpStream}, time::Duration};
+use victory_formats::presentation::{MAX_CAPTURE_BYTES, source_len};
 
 const MAGIC: u32 = 0x31474d56;
-const MAX_IMAGE: usize = 16 * 1024 * 1024;
 
 /// The drawable dimensions and, when requested, tightly packed BGRA8 pixels.
 pub struct Capture {
@@ -31,9 +31,8 @@ pub fn send(addr: SocketAddr, token: [u8; 16], width: u32, height: u32, format: 
     if !addr.ip().is_loopback() || addr.port() == 0 || width == 0 || height == 0 || !matches!(format, 28 | 29 | 87 | 91) {
         return Err("invalid presentation endpoint or image".into());
     }
-    let row = (width as usize).checked_mul(4).ok_or("image row overflow")?;
-    let len = (height as usize - 1).checked_mul(pitch as usize).and_then(|n| n.checked_add(row)).ok_or("image size overflow")?;
-    if (pitch as usize) < row || len > MAX_IMAGE || bytes.len() != len { return Err("invalid presentation image length or pitch".into()); }
+    let len = source_len(width, height, pitch).filter(|&n| n == bytes.len())
+        .ok_or("invalid presentation image length or pitch")?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(30)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
@@ -45,20 +44,25 @@ pub fn send(addr: SocketAddr, token: [u8; 16], width: u32, height: u32, format: 
     s.read_exact(&mut header).map_err(|e| e.to_string())?;
     let word = |n| u32::from_le_bytes(header[n..n + 4].try_into().unwrap());
     let (magic, status, len, msg) = (word(0), word(4), word(8) as usize, word(12) as usize);
-    if magic != MAGIC || len > MAX_IMAGE + 12 || msg > 4096 || (status == 0 && (msg != 0 || len < 12)) || (status != 0 && len != 0) {
+    if magic != MAGIC || len > MAX_CAPTURE_BYTES + 12 || msg > 4096 || (status == 0 && (msg != 0 || len < 12)) || (status != 0 && len != 0) {
         return Err("invalid presentation response".into());
     }
-    let mut payload = vec![0; len];
-    let mut message = vec![0; msg];
-    s.read_exact(&mut payload).and_then(|_| s.read_exact(&mut message)).map_err(|e| e.to_string())?;
-    if status != 0 { return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message))); }
-    let word = |n| u32::from_le_bytes(payload[n..n + 4].try_into().unwrap());
+    if status != 0 {
+        let mut message = vec![0; msg];
+        s.read_exact(&mut message).map_err(|e| e.to_string())?;
+        return Err(format!("proxy status {status}: {}", String::from_utf8_lossy(&message)));
+    }
+    let mut info = [0; 12];
+    s.read_exact(&mut info).map_err(|e| e.to_string())?;
+    let word = |n| u32::from_le_bytes(info[n..n + 4].try_into().unwrap());
     let (width, height, captured) = (word(0), word(4), word(8) as usize);
     let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)).ok_or("drawable size overflow")?;
     if width == 0 || height == 0 || captured != len - 12 || (capture && captured != expected) || (!capture && captured != 0) {
         return Err("invalid drawable capture".into());
     }
-    Ok(Capture { width, height, bytes: payload.split_off(12) })
+    let mut bytes = vec![0; captured];
+    s.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(Capture { width, height, bytes })
 }
 
 #[cfg(test)]
@@ -103,5 +107,22 @@ mod tests {
             assert_eq!(send(addr, token, 1, 1, format, 3, &[0; 4], false).err().unwrap(), "invalid presentation image length or pitch");
             assert_eq!(send(addr, token, 1, 2, format, 6, &[0; 12], false).err().unwrap(), "invalid presentation image length or pitch");
         }
+    }
+
+    #[test]
+    fn rejects_uhd_drawable_payload_before_reading_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 32 + 16 + 4];
+            stream.read_exact(&mut request).unwrap();
+            for word in [MAGIC, 0, 12 + 3840 * 2160 * 4, 0] {
+                stream.write_all(&word.to_le_bytes()).unwrap();
+            }
+        });
+        let error = send(addr, [0; 16], 1, 1, 28, 4, &[0; 4], true).err().unwrap();
+        assert_eq!(error, "invalid presentation response");
+        server.join().unwrap();
     }
 }

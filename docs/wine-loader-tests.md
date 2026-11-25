@@ -856,13 +856,24 @@ CARGO_TARGET_DIR=/tmp/victory-wine-bridge-target cargo test -p victory \
 To enable presentation, set `VICTORY_WINE_METAL_PRESENT=1` in the helper's
 environment before starting it. Without that opt-in, presentation requests
 fail and the helper remains headless. The Wine queue accepts one plane with
-one live RGBA8_UNORM resource and null present parameters. The plane token is
+one live, non-tiled 2D RGBA8 or BGRA8 resource (UNORM or UNORM_SRGB),
+one mip, and null present parameters. The plane token is
 accepted but does not pace presentation, matching the upstream shortcut.
 Presentation is synchronous and serialized; it returns `E_NOTIMPL` rather
 than bypassing a pending queue wait. Source pixels and resource state are
 preserved. The caller must not modify mapped resources concurrently. Other
 formats, multiple planes, placement, non-null present parameters, HDR and
 general swap-chain behavior are unsupported.
+
+The presentation source can be 1–3840 pixels wide and 1–2160 pixels high.
+A packed 3840×2160 image occupies 33,177,600 bytes; the helper uploads the
+full source to a matching Metal texture. Padded rows are accepted when
+`width * 4 <= pitch <= 16384` and `(height - 1) * pitch + width * 4`
+is at most 32 MiB. The wire length must equal this extent; there is no
+padding after the last row. These limits apply only to presentation input.
+The optional drawable readback still rejects more than 16 MiB of BGRA8
+output: to capture a UHD source, present it into a smaller window.
+Without capture, a UHD source does not require or guarantee a UHD drawable.
 
 The helper owns a visible AppKit window and `CAMetalLayer` on the macOS main
 thread. It stretches each source to the current view backing size, presents
@@ -1373,9 +1384,26 @@ terminal. Export the same token there, then run:
 
 ```sh
 export VICTORY_TEST_D3D12X_DLL="$VICTORY_TEST_DLL_DIR/d3d12_xs.dll"
-cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_graphics -- --ignored --nocapture --test-threads=1
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_graphics normal_wine_presents_all_typed_color_formats -- --ignored --nocapture
 cargo test --locked -p victory --target x86_64-apple-darwin --test present_capture -- --ignored --nocapture --test-threads=1
 ```
+
+For the UHD proof, restart the helper with `VICTORY_WINE_METAL_DRAWABLE_DIR`
+pointing to a new empty directory. In the test terminal set
+`VICTORY_TEST_DRAWABLE_DIR` to that directory and update the address/token for
+the fresh helper. Then run:
+
+```sh
+cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_graphics normal_wine_presents_uhd_and_scaled_drawable -- --ignored --nocapture
+```
+
+The test first presents a small frame to size the window. A normal x86-64
+Wine PE then fills a 3840×2160 RGBA8 upload buffer with a coordinate-dependent
+color/alpha pattern, copies it to a texture and calls `PresentX`. On an M3 Max,
+the arm64 helper's GPU readback was a 128×128 BGRA8 drawable: four samples
+matched their corresponding UHD source coordinates after nearest scaling.
+This verifies UHD **input**, not 4K display output. `present_capture` also
+checks malformed source headers without sending a pixel payload.
 
 On an M3 Max, an arm64 CLI and arm64-only helper passed the normal x86-64 Wine
 mip GPU readback and offline import tests. Separately, the arm64 helper passed

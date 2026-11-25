@@ -78,12 +78,60 @@ static void copy_texture(void *list,void *buffer,void *texture,unsigned width,un
     tex.pResource=texture; tex.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     SLOT(list,0x80,Copy)(list,upload?&tex:&buf,0,0,0,upload?&buf:&tex,0);
 }
+#ifdef UHD_PRESENT
+static int present_uhd(void) {
+    enum { WIDTH=3840, HEIGHT=2160, PITCH=WIDTH*4, SIZE=PITCH*HEIGHT };
+    unsigned version=0x00020004; void *dev=0,*upload=0,*texture=0,*mapped=0;
+    if (D3D12XboxCreateDevice(0,&version,&IID_ID3D12Device,&dev)!=S_OK || !dev) return 1;
+    D3D12_HEAP_PROPERTIES hp={D3D12_HEAP_TYPE_DEFAULT,0,0,0,0};
+    D3D12_RESOURCE_DESC rd={D3D12_RESOURCE_DIMENSION_BUFFER,0,SIZE,1,1,1,DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,0};
+    CreateResource make=SLOT(dev,0xd8,CreateResource);
+    if (make(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&upload)!=S_OK) return 2;
+    rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width=WIDTH; rd.Height=HEIGHT;
+    rd.Format=DXGI_FORMAT_R8G8B8A8_UNORM; rd.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (make(dev,&hp,0,&rd,0x400,0,&IID_ID3D12Resource,&texture)!=S_OK) return 3;
+    if (SLOT(upload,0x40,Map)(upload,0,0,&mapped)!=S_OK || !mapped) return 4;
+    for (unsigned y=0;y<HEIGHT;y++) for (unsigned x=0;x<WIDTH;x++) {
+        unsigned char *dst=(unsigned char *)mapped+(size_t)y*PITCH+x*4;
+        unsigned bx=x/64,by=y/64;
+        dst[0]=(unsigned char)(bx*17+by*13); dst[1]=(unsigned char)(bx*7+by*29);
+        dst[2]=(unsigned char)(bx*31+by*3); dst[3]=(unsigned char)(64+(bx+by)%192);
+    }
+    ID3D12CommandAllocator *allocator=0; ID3D12GraphicsCommandList *list=0; ID3D12CommandQueue *queue=0;
+    if (ID3D12Device_CreateCommandAllocator((ID3D12Device *)dev,0,&IID_ID3D12CommandAllocator,(void **)&allocator)!=S_OK) return 5;
+    if (ID3D12Device_CreateCommandList((ID3D12Device *)dev,0,0,allocator,0,&IID_ID3D12GraphicsCommandList,(void **)&list)!=S_OK) return 6;
+    D3D12_TEXTURE_COPY_LOCATION src={0},dst={0};
+    src.pResource=upload; src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width=WIDTH; src.PlacedFootprint.Footprint.Height=HEIGHT;
+    src.PlacedFootprint.Footprint.Depth=1; src.PlacedFootprint.Footprint.RowPitch=PITCH;
+    dst.pResource=texture; dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    SLOT(list,0x80,Copy)(list,&dst,0,0,0,&src,0);
+    transition(list,texture,0x400,0x800);
+    if (ID3D12GraphicsCommandList_Close(list)!=S_OK) return 7;
+    D3D12_COMMAND_QUEUE_DESC qd={0,0,0,0};
+    if (ID3D12Device_CreateCommandQueue((ID3D12Device *)dev,&qd,&IID_ID3D12CommandQueue,(void **)&queue)!=S_OK) return 8;
+    ID3D12CommandList *lists[]={(ID3D12CommandList *)list};
+    ID3D12CommandQueue_ExecuteCommandLists(queue,1,lists);
+    PresentPlane plane={0x1234,1,&texture};
+    if (SLOT(queue,0xf0,Present)(queue,1,&plane,0)!=S_OK) return 9;
+    SAY("Wine UHD PresentX passed\r\n");
+    SLOT(queue,0x10,Release)(queue); SLOT(list,0x10,Release)(list);
+    SLOT(allocator,0x10,Release)(allocator); SLOT(texture,0x10,Release)(texture);
+    SLOT(upload,0x10,Release)(upload); SLOT(dev,0x10,Release)(dev);
+    return 42;
+}
+#endif
+
 #ifdef NORMAL_WINE_PRESENT
 int main(void) {
 #else
 unsigned mainCRTStartup(void *unused) {
     (void)unused;
 #endif
+#ifdef UHD_PRESENT
+    return present_uhd();
+#else
 #ifndef NATIVE_PRESENT
     HANDLE threads[2]; DWORD codes[2];
     if(tls_value!=17 || tls_bad) return 20;
@@ -205,4 +253,5 @@ unsigned mainCRTStartup(void *unused) {
     for(unsigned i=0;i<5;i++) SLOT(heap[i],0x10,Release)(heap[i]);
     SLOT(pipeline,0x10,Release)(pipeline); SLOT(queue,0x10,Release)(queue); SLOT(allocator,0x10,Release)(allocator); SLOT(dev,0x10,Release)(dev);
     SAY("PresentX ordered graphics, source preservation and resize passed\r\n"); return 42;
+#endif
 }

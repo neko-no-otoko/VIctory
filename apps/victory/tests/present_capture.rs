@@ -41,9 +41,16 @@ fn drawable_capture_checks_channels_alpha_orientation_and_changed_source_size() 
     let mut wrong = token; wrong[0] ^= 1;
     let (status, _, _) = request(addr, &wrong, [64, 64, 28, 256, 16384, 1], &[]);
     assert_ne!(status, 0, "wrong token must be rejected");
-    for fields in [[0, 64, 28, 256, 16384, 1], [64, 64, 30, 256, 16384, 1], [64, 64, 28, 255, 16384, 1], [64, 64, 28, 256, 16384, 2]] {
-        let (status, _, _) = request(addr, &token, fields, &[]);
+    // Send headers only: a malformed source must fail before allocating or
+    // waiting for the announced payload, even when its pixel count is small.
+    for fields in [[0, 64, 28, 256, 16384, 1], [64, 64, 30, 256, 16384, 1],
+        [64, 64, 28, 255, 16384, 1], [64, 64, 28, 256, 16384, 2],
+        [3841, 1, 28, 15364, 15364, 0], [1, 2161, 28, 4, 8644, 0],
+        [1, 1, 28, u32::MAX, 4, 0], [3840, 2160, 28, 16384, 35_388_416, 0],
+        [3840, 2160, 28, 15360, 33_177_599, 0]] {
+        let (status, _, message) = request(addr, &token, fields, &[]);
         assert_ne!(status, 0, "bad fields must be rejected: {fields:?}");
+        assert!(message.contains("invalid present request"), "{fields:?}: {message}");
     }
     // BGRA expectations at top-left, top-right, bottom-left and bottom-right.
     let colors = [[19, 37, 223, 255], [201, 42, 13, 192], [31, 209, 53, 128], [177, 91, 7, 64]];

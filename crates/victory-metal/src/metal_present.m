@@ -88,10 +88,8 @@ static int draw_frame(uint32_t width, uint32_t height, uint32_t format, uint32_t
                       uint32_t *out_height, uint8_t **out_pixels, size_t *out_len,
                       char *error, size_t error_len) {
     if (!running || !delegate || delegate.closed) { set_error(error, error_len, @"presentation window is closed or application is not running"); return -1; }
-    if (!width || !height || !pixels || (format != 28 && format != 29 && format != 87 && format != 91) || (uint64_t)pitch < (uint64_t)width * 4 ||
-        (uint64_t)(height - 1) * pitch + (uint64_t)width * 4 > MAX_CAPTURE) {
-        set_error(error, error_len, @"invalid presentation image"); return -1;
-    }
+    // The Rust present() boundary validated the source dimensions, format, stride
+    // and borrowed slice extent before passing its pointer to this private FFI.
     if (!create_window(width, height, error, error_len)) return -1;
     NSView *view = window.contentView;
     NSRect backing = [view convertRectToBacking:view.bounds];
@@ -99,7 +97,7 @@ static int draw_frame(uint32_t width, uint32_t height, uint32_t format, uint32_t
         set_error(error, error_len, @"presentation view has no drawable size"); return -1;
     }
     NSUInteger dw = (NSUInteger)backing.size.width, dh = (NSUInteger)backing.size.height;
-    if (capture && ((uint64_t)dw * dh * 4 > MAX_CAPTURE)) {
+    if (capture && (uint64_t)dw * dh > MAX_CAPTURE / 4) {
         set_error(error, error_len, @"presentation capture exceeds 16 MiB"); return -1;
     }
     layer.contentsScale = window.backingScaleFactor;
@@ -107,7 +105,7 @@ static int draw_frame(uint32_t width, uint32_t height, uint32_t format, uint32_t
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     if (!drawable) { set_error(error, error_len, @"no Metal drawable available"); return -1; }
     dw = drawable.texture.width; dh = drawable.texture.height;
-    if (!dw || !dh || dw > UINT32_MAX || dh > UINT32_MAX || (capture && (uint64_t)dw * dh * 4 > MAX_CAPTURE)) {
+    if (!dw || !dh || dw > UINT32_MAX || dh > UINT32_MAX || (capture && (uint64_t)dw * dh > MAX_CAPTURE / 4)) {
         set_error(error, error_len, @"invalid drawable dimensions"); return -1;
     }
     // sRGB DXGI backbuffers already contain encoded bytes; sampling an sRGB

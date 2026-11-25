@@ -235,18 +235,11 @@ mod host {
             return Err("presentation is not enabled".into());
         }
         let [_, _, width, height, format, pitch, bytes_len, flags] = fields;
-        let row_bytes = (width as usize).checked_mul(4).ok_or("image size overflow")?;
-        let required = (height as usize).checked_sub(1)
-            .and_then(|rows| rows.checked_mul(pitch as usize))
-            .and_then(|bytes| bytes.checked_add(row_bytes))
-            .ok_or("image size overflow")?;
-        if width == 0 || !matches!(format, 28 | 29 | 87 | 91) || flags > 1
-            || (pitch as usize) < row_bytes || required != bytes_len as usize
-            || required > MAX_BUFFER
-        {
+        let required = victory_formats::presentation::source_len(width, height, pitch);
+        if !matches!(format, 28 | 29 | 87 | 91) || flags > 1 || required != Some(bytes_len as usize) {
             return Err("invalid present request dimensions, format, or length".into());
         }
-        let mut pixels = vec![0; required];
+        let mut pixels = vec![0; bytes_len as usize];
         stream.read_exact(&mut pixels).map_err(|e| e.to_string())?;
         let capture_file = captures.as_ref().is_some_and(|c| c.next < MAX_DRAWABLE_CAPTURES);
         let capture = flags == 1 || capture_file;
@@ -256,7 +249,7 @@ mod host {
         let expected_capture = (result.width as usize).checked_mul(result.height as usize)
             .and_then(|n| n.checked_mul(4)).ok_or("drawable size overflow")?;
         if result.width == 0 || result.height == 0
-            || (capture && (capture_len != expected_capture || capture_len > MAX_BUFFER))
+            || (capture && (capture_len != expected_capture || capture_len > victory_formats::presentation::MAX_CAPTURE_BYTES))
             || (!capture && capture_len != 0)
         {
             return Err("invalid drawable capture returned by presenter".into());

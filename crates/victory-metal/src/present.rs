@@ -11,7 +11,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-const MAX_IMAGE: usize = 16 * 1024 * 1024;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -92,12 +91,8 @@ pub fn present(width: u32, height: u32, dxgi_format: u32, pitch: u32,
     if !RUNNING.load(Ordering::Acquire) {
         return Err(RenderError("presentation application is not running".into()));
     }
-    let row = (width as usize).checked_mul(4);
-    let required = row.and_then(|row| {
-        if width == 0 || height == 0 || (pitch as usize) < row { return None; }
-        (height as usize - 1).checked_mul(pitch as usize)?.checked_add(row)
-    });
-    if !matches!(dxgi_format, 28 | 29 | 87 | 91) || !matches!(required, Some(n) if n <= MAX_IMAGE && pixels.len() >= n) {
+    let required = victory_formats::presentation::source_len(width, height, pitch);
+    if !matches!(dxgi_format, 28 | 29 | 87 | 91) || required.is_none_or(|n| pixels.len() < n) {
         return Err(RenderError("invalid presentation image".into()));
     }
     let (mut out_width, mut out_height, mut out_len) = (0, 0, 0);

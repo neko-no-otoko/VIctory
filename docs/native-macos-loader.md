@@ -260,6 +260,8 @@ drawn into a drawable, presented, and completed before `PresentX` returns.
 The view's current backing size determines the drawable size; the source is
 stretched with nearest filtering. Closing the window makes later presents
 fail rather than creating a replacement.
+The [presentation input bounds](wine-loader-tests.md#opt-in-window-presentation)
+allow a full 3840×2160 source; the 16 MiB drawable readback limit is unchanged.
 
 The supported console ABI is one plane with one live linear RGBA8 or BGRA8
 UNORM/UNORM_SRGB color resource, a null present-parameters pointer, and the

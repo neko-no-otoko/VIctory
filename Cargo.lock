@@ -795,6 +795,7 @@ dependencies = [
  "cc",
  "libloading",
  "tempfile",
+ "victory-formats",
  "victory-shader",
 ]
 
