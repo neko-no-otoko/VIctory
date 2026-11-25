@@ -45,6 +45,9 @@ typedef void (__stdcall *SetHeaps)(void *, unsigned, void **);
 typedef void (__stdcall *SetTable)(void *, unsigned, U64);
 typedef void (__stdcall *SetConstants)(void *, unsigned, unsigned, const unsigned *, unsigned);
 typedef void (__stdcall *Dispatch)(void *, unsigned, unsigned, unsigned);
+#ifdef VICTORY_COMPUTE_INPUT
+extern unsigned VICTORY_COMPUTE_INPUT;
+#endif
 unsigned mainCRTStartup(void *unused) {
     (void)unused; unsigned params=0x00020004; ID3D12Device *dev=0;
     if (D3D12XboxCreateDevice(0,&params,&IID_ID3D12Device,(void **)&dev)!=S_OK || !dev) { SAY("device failed\r\n"); return 1; }
@@ -58,7 +61,12 @@ unsigned mainCRTStartup(void *unused) {
     if (SLOT(dev,0xd8,CreateResource)(dev,&hp,0,&rd,0,0,&IID_ID3D12Resource,&resource)!=S_OK || !resource) { SAY("resource failed\r\n"); return 3; }
     void *memory=0;
     if (SLOT(resource,0x40,Map)(resource,0,0,&memory)!=S_OK || !memory) { SAY("map failed\r\n"); return 4; }
-    ((volatile unsigned *)memory)[0]=7; ((volatile unsigned *)memory)[1]=1;
+    ((volatile unsigned *)memory)[0]=7;
+#ifdef VICTORY_COMPUTE_INPUT
+    ((volatile unsigned *)memory)[1]=VICTORY_COMPUTE_INPUT;
+#else
+    ((volatile unsigned *)memory)[1]=1;
+#endif
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {0};
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;

@@ -81,7 +81,7 @@ impl Fixture {
 
     fn build(&self) -> (PathBuf, PathBuf, PathBuf) {
         for (name, exports) in [
-            ("kernel32", "GetStdHandle\nWriteFile\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle"),
+            ("kernel32", "GetStdHandle\nWriteFile\nCreateFileW\nReadFile\nSetFilePointerEx\nGetLastError\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle"),
             ("d3d12_xs", "D3D12XboxCreateDevice"),
             ("xcrdapi", "DStorageGetFactory"),
         ] {
@@ -94,19 +94,42 @@ impl Fixture {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let obj = self.dir.join("compute fixture.obj");
         checked(Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"))
-            .args(["-O2", "-fno-emulated-tls", "-DVICTORY_TLS_ENTRY=tls_entry", "-c"])
+            .args(["-O2", "-fno-emulated-tls", "-DVICTORY_TLS_ENTRY=tls_entry", "-DVICTORY_COMPUTE_INPUT=streamed_input", "-c"])
             .arg(fixtures.join("windows_d3d12x_tls_compute.c")).arg("-o").arg(&obj), &self.dir);
         let wrapper = self.dir.join("canonical factory wrapper.c");
         fs::write(&wrapper, r#"
 #include <windows.h>
 __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(const GUID *, void **);
 unsigned tls_entry(void *);
+unsigned streamed_input;
 unsigned mainCRTStartup(void *arg) {
     const GUID factory_iid = {0x62959d11,0xd45f,0x4884,{0xa0,0xa3,0xf7,0x86,0x2e,0xa2,0x43,0xae}};
     void *factory = 0;
     if (DStorageGetFactory(&factory_iid, &factory) || !factory) return 31;
     typedef ULONG (WINAPI *Release)(void *);
     if (((Release)(*(void ***)factory)[2])(factory) != 1) return 32;
+    HANDLE missing = CreateFileW(L"G:\\missing-stream.bin", GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (missing != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_NOT_FOUND) return 34;
+    HANDLE file = CreateFileW(L"G:\\stream data.bin", GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (file == INVALID_HANDLE_VALUE) return 35;
+    LARGE_INTEGER offset; offset.QuadPart = 4;
+    unsigned char bytes[8] = {0xee,0xee,0xee,0xee,0xee,0xee,0xee,0xee};
+    DWORD count = 0;
+    if (!SetFilePointerEx(file, offset, 0, FILE_BEGIN) ||
+        !ReadFile(file, bytes + 1, 6, &count, 0) || count != 6 ||
+        bytes[0] != 0xee || bytes[7] != 0xee) return 36;
+    for (unsigned i = 0; i < 6; ++i) if (bytes[i+1] != i+1) return 37;
+    streamed_input = bytes[1];
+    offset.QuadPart = 14;
+    if (!SetFilePointerEx(file, offset, 0, FILE_BEGIN) ||
+        !ReadFile(file, bytes, sizeof(bytes), &count, 0) || count != 2 ||
+        bytes[0] != 11 || bytes[1] != 12 ||
+        !ReadFile(file, bytes, sizeof(bytes), &count, 0) || count != 0 ||
+        !CloseHandle(file)) return 38;
+    static const char file_message[] = "G: HLE file reads and missing-file error passed\r\n";
+    DWORD file_written;
+    if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), file_message, sizeof(file_message)-1, &file_written, 0) ||
+        file_written != sizeof(file_message)-1) return 39;
     static const char message[] = "DirectStorage canonical HLE factory passed\r\n";
     DWORD written;
     if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, sizeof(message)-1, &written, 0) ||
@@ -123,6 +146,7 @@ unsigned mainCRTStartup(void *arg) {
             .arg(format!("/out:{}", exe.display())).arg(obj).arg(wrapper_obj)
             .arg(self.dir.join("kernel32.lib")).arg(self.dir.join("d3d12_xs.lib")).arg(self.dir.join("xcrdapi.lib"))
             .arg(self.llvm.join("x86_64-w64-mingw32/lib/libmingw32.a")), &self.dir);
+        fs::write(self.dir.join("stream data.bin"), [0xa0,0xa1,0xa2,0xa3,1,2,3,4,5,6,7,8,9,10,11,12]).unwrap();
 
         let mut failures = Vec::new();
         for code in [13, 256] {
@@ -191,9 +215,12 @@ fn mapped_windows_guest_uses_hle_and_real_metal() {
     let text = logs(&output);
     assert_eq!(output.status.code(), Some(42), "{text}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.lines().any(|line| line.contains("bound          compute guest.exe:") && line.contains("2 hle,") && line.contains("0 missing")), "{text}");
+    assert!(stdout.lines().any(|line| line.contains("bound          compute guest.exe:") && line.contains("4 hle,") && line.contains("0 missing")), "{text}");
     assert!(text.contains("Wine Metal proxy connected"), "{text}");
     assert!(stdout.contains("DirectStorage canonical HLE factory passed"), "{text}");
+    assert!(stdout.contains("G: HLE file reads and missing-file error passed"), "{text}");
+    assert!(matches!(fs::symlink_metadata(f.prefix.join("dosdevices/g:")), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "guest must use VIctory's virtual G:, not a Wine drive");
     assert!(stdout.contains("TLS compiler state and thread callbacks passed"), "{text}");
     assert!(stdout.contains("D3D12X synthetic compute readback 42"), "{text}");
     assert!(stdout.contains("title exited with 42"), "{text}");

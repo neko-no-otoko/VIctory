@@ -474,12 +474,26 @@ cargo test --locked -p victory --target aarch64-apple-darwin --test wine_mapped_
 ```
 
 On Wine 11 under Rosetta with an arm64 Metal host, the synthetic test passed:
-it acquired and released the existing HLE DirectStorage factory, exercised
-one compiler-TLS pattern and two threads, dispatched Metal compute and read
-back 42. It also checked separate title results 13 and 256, startup failures,
-paths with spaces and explicit CPU-check opt-in. It did **not** test
-DirectStorage file transfer or any game data. The normal-Wine real Metal
-launcher regression passed separately after the shared-supervisor refactor.
+it acquired and released the existing HLE DirectStorage factory and exercised
+one compiler-TLS pattern and two threads. Its mapped guest used the HLE
+`CreateFileW` and `ReadFile` imports to read a self-authored file through the
+virtual `G:` drive, with no Wine `G:` mapping. It checked an offset-4 read,
+buffer guards, a short read at offset 14, EOF and a missing-file error; it
+then supplied the first byte read to Metal compute and read back 42. It also
+checked separate title results 13 and 256, startup failures, paths with spaces
+and explicit CPU-check opt-in. No game data was used.
+
+Separately, the Windows-target upstream DirectStorage HLE tests
+`raw_and_zlib_reads_from_a_file` and
+`statuses_complete_in_order_with_the_first_failure` passed under Wine. They
+exercise a file-backed raw offset read, zlib decompression, an EOF error and
+ordered status results. Their file, queue and status interface IDs are null:
+the current HLE ignores those IDs, so these are implementation tests, not
+evidence of the real console object ABI. The mapped guest does **not** submit
+DirectStorage requests; its `G:` read uses Win32 file imports, and only the
+first returned byte is copied into the Metal input. Neither test establishes
+title streaming compatibility. The normal-Wine real Metal launcher
+regression also passed.
 
 ### Restricted offscreen graphics
 
