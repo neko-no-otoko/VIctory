@@ -1161,13 +1161,14 @@ The synthetic tests cover a second guest checking its image and arguments and
 confirming the first process had exited, absent and relative targets failing,
 and host cleanup.
 
-### Apple Silicon native Metal helper
+### Apple Silicon native Wine launcher and Metal helper
 
-The helper can run as an arm64 macOS process while the Windows guest remains
-x86-64 under Wine and the `victory` launcher runs under Rosetta. The converter
-must contain an arm64 slice; check it with `lipo -archs`. This changes neither
-the guest ABI nor Wine's execution architecture. The authenticated protocol
-uses explicit little-endian fields and carries no guest pointers.
+The `wine-run` and `wine-imports` CLI commands and the Metal helper can run as
+arm64 macOS processes while the Windows guest remains x86-64 under Wine. The
+converter must contain an arm64 slice; check it with `lipo -archs`. This
+changes neither the guest ABI nor Wine's execution architecture. The
+authenticated protocol uses explicit little-endian fields and carries no
+guest pointers. In-process PE execution remains restricted to x86-64 macOS.
 
 With the Wine and LLVM-MinGW prerequisites above, an Aqua session, Rust targets
 `aarch64-apple-darwin`, `x86_64-apple-darwin` and
@@ -1182,6 +1183,8 @@ cargo build --locked -p victory-xg-dll -p victory-xgameruntime-dll -p victory-d3
   -p victory-xmem-dll -p victory-xmem-backend -p victory-acphal-dll -p victory-xapu-dll \
   --target x86_64-pc-windows-gnullvm
 cargo build --locked -p victory-gpu --example wine_metal_compute_host --target aarch64-apple-darwin
+cargo build --locked -p victory --target aarch64-apple-darwin
+file "$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/victory"
 file "$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host"
 export VICTORY_TEST_WINE=/opt/homebrew/bin/wine
 export VICTORY_TEST_WINEPATH=/opt/homebrew/bin/winepath
@@ -1189,8 +1192,24 @@ export VICTORY_TEST_WINESERVER=/opt/homebrew/bin/wineserver
 export VICTORY_TEST_METAL_HOST="$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/examples/wine_metal_compute_host"
 export VICTORY_TEST_DLL_DIR="$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/debug"
 export WINEPATH="$(/opt/homebrew/bin/winepath -w "$LLVM_MINGW/x86_64-w64-mingw32/bin")"
-cargo test --locked -p victory --target x86_64-apple-darwin --test wine_mips \
+cargo test --locked -p victory --target aarch64-apple-darwin --test wine_imports \
+  -- --ignored --nocapture --test-threads=1
+cargo test --locked -p victory --target aarch64-apple-darwin --test wine_mips \
   launcher_runs_real_mip_sampling_and_rejects_invalid_cases -- --ignored --nocapture --test-threads=1
+```
+
+To launch another trusted x86-64 Windows PE, first create an empty dedicated
+prefix directory and supply the same explicit paths:
+
+```sh
+mkdir -p /tmp/victory-arm-launch-prefix
+"$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/victory" wine-imports /path/to/guest.exe \
+  --dll-dir "$VICTORY_TEST_DLL_DIR"
+"$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/victory" wine-run /path/to/guest.exe \
+  --wine "$VICTORY_TEST_WINE" --winepath "$VICTORY_TEST_WINEPATH" \
+  --metal-host "$VICTORY_TEST_METAL_HOST" --converter "$VICTORY_TEST_METAL_CONVERTER" \
+  --dll-dir "$VICTORY_TEST_DLL_DIR" --wine-prefix /tmp/victory-arm-launch-prefix \
+  --allow-unverified-dll-search
 ```
 
 For presentation, start the arm64 helper in a separate terminal with
@@ -1206,10 +1225,11 @@ cargo test --locked -p victory --target x86_64-apple-darwin --test wine_present_
 cargo test --locked -p victory --target x86_64-apple-darwin --test present_capture -- --ignored --nocapture --test-threads=1
 ```
 
-On an M3 Max, an arm64-only helper and universal converter passed the normal
-x86-64 Wine mip GPU readback and all four typed-color presentation cases;
-drawable capture also passed. These synthetic tests do not establish game
-compatibility or ARM-native guest execution.
+On an M3 Max, an arm64 CLI and arm64-only helper passed the normal x86-64 Wine
+mip GPU readback and offline import tests. Separately, the arm64 helper passed
+all four typed-color Wine presentation cases and drawable capture using the
+x86-64 test launcher. These synthetic tests do not establish game compatibility
+or ARM-native guest execution.
 
 ### Focused launcher tests
 

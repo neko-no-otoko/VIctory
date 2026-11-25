@@ -4,7 +4,7 @@
 //! --test wine_imports -- --ignored`. The toolchain must provide
 //! bin/x86_64-w64-mingw32-clang and bin/llvm-dlltool. No Wine, Metal service,
 //! system DLLs, or externally built VIctory providers are needed.
-#![cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#![cfg(target_os = "macos")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -232,5 +232,18 @@ fn distinguishes_unclassified_imports_missing_guest_and_case_collision() {
         eprintln!("case-colliding guest DLLs rejected");
     } else {
         eprintln!("case-collision subcase unavailable on this filesystem");
+    }
+}
+
+#[test]
+fn wine_commands_do_not_enable_native_guest_execution_on_arm64() {
+    let output = Command::new(env!("CARGO_BIN_EXE_victory")).arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("wine-imports"), "{help}");
+    assert!(help.contains("wine-run"), "{help}");
+    if cfg!(target_arch = "aarch64") {
+        assert!(!help.contains("native-fixture"), "{help}");
+        assert!(!help.contains("native-census"), "{help}");
     }
 }

@@ -20,11 +20,11 @@ walkdir.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 victory-metal = { path = "../../crates/victory-metal" }
+libc = "0.2"
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 victory-loader.workspace = true
 victory-native = { path = "../../crates/victory-native" }
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 victory-loader.workspace = true

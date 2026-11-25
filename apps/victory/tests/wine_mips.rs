@@ -1,5 +1,5 @@
 //! End-to-end mip sampling through the real Wine Metal proxy and host.
-#![cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#![cfg(target_os = "macos")]
 
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
