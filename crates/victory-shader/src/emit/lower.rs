@@ -5430,7 +5430,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" => (60, true),
+            "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -5575,6 +5575,21 @@ impl<'a> Lower<'a> {
             args.extend(&cs);
             match op {
                 60 => {
+                    if offset_word {
+                        // GFX10 packs signed six-bit texel offsets into bytes.
+                        // DXIL Sample needs each spatial offset as an immediate.
+                        let w = addr_val(self, 0)?;
+                        let w = self.s.m.int_value(w)
+                            .ok_or("a sample offset that is not constant")? as u32;
+                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                            let x = (w >> (8 * k) & 0x3f) as i32;
+                            let x = if x >= 32 { x - 64 } else { x };
+                            if !(-8..=7).contains(&x) {
+                                return Err("a sample offset past -8..7");
+                            }
+                            *o = self.s.m.i32(x as u32);
+                        }
+                    }
                     args.extend(&os);
                     args.push(fu);
                     self.s

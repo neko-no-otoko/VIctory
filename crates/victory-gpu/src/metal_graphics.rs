@@ -1117,8 +1117,15 @@ fn validate(
             victory_shader::gfx10::Fields::Image { dim: 5, .. } => TextureDimension::D2Array,
             _ => return Err("only 2D, 2D array, cube and 3D texture sampling is supported".into()),
         };
-        if !matches!(inst.name(), "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d") {
-            return Err("only non-comparison texture sampling is supported".into());
+        match inst.name() {
+            "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d" => {}
+            "image_sample_o" => {
+                if stage != HwStage::Ps || !matches!(&inst.fields,
+                    victory_shader::gfx10::Fields::Image { dim: 1, a16: false, .. }) {
+                    return Err("sample offsets require a 2D pixel texture and 32-bit coordinates".into());
+                }
+            }
+            _ => return Err("only non-comparison texture sampling is supported".into()),
         }
         explicit_lod.0 |= inst.name() == "image_sample_l";
         explicit_lod.1 |= inst.name() == "image_sample_lz";

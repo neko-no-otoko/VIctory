@@ -114,6 +114,20 @@ submission, changes texture contents after recording, and checks the sampled
 pixels and row padding on readback. It also checks an unsupported device
 method terminates the child. This covers the existing restricted sampled
 texture path, not general descriptor or sampler support.
+
+For 2D pixel textures, `image_sample_o` can use a constant signed texel
+offset. This ports [upstream `260611a`](https://github.com/Marvisak/VIctory/commit/260611acaaf5ea33748e4d74986aee500e254353)
+from the `d2a4bae1..ccfb029` comparison: the first address word supplies
+the X and Y offsets, each signed six-bit and restricted to DXIL's `-8..7`.
+The offset is passed to the implicit-LOD sample, not added to normalized UVs.
+The shared translator follows upstream. Metal admission of the new instruction
+is limited to 2D pixel sampling with 32-bit coordinates; computed or wider
+offsets remain unsupported. In `native_uv`, a self-authored PS samples a
+2×2 point-filtered RGBA8 texture. At two interior UVs, the unshifted samples
+are red and blue; with the packed offset `0x3f01` (+1, −1), both are green.
+The test checks render-target readback; it uses no title assets and does not
+identify which first-mission draws use this instruction.
+
 The indexed fixture also draws 16- and 32-bit triangle-list indices with
 nonzero view offsets, start indices and a negative base vertex. It checks
 pixels after releasing the index resource, rejects invalid formats, ranges,

@@ -136,11 +136,25 @@ unsigned mainCRTStartup(void) {
     D3D12_COMMAND_QUEUE_DESC qd={0,0,0,0}; if (ID3D12Device_CreateCommandQueue((ID3D12Device *)dev,&qd,&IID_ID3D12CommandQueue,(void **)&queue)!=S_OK) return 15;
     ID3D12CommandList *lists[]={(ID3D12CommandList *)list}; ID3D12CommandQueue_ExecuteCommandLists(queue,1,lists);
     volatile unsigned char *pixels=p;
+#ifdef SAMPLE_OFFSET
+    /* Perspective interpolation gives UV (0.193,0.193) and (0.203,0.608).
+       They sample red and blue without offsets, but (+1,-1) shifts both
+       to the green upper-right texel. */
+    const unsigned offsets[2]={3*256+4*4,3*256+5*4};
+    const unsigned char expected[8]={0,255,0,255, 0,255,0,255};
+#else
+    const unsigned offsets[4]={3*256+4*4,3*256+7*4,1*256+4*4,1*256+5*4};
     /* Swapped UV samples red, blue, green, white; the last sample
        would be green under affine interpolation. */
-    const unsigned offsets[4]={3*256+4*4,3*256+7*4,1*256+4*4,1*256+5*4};
     const unsigned char expected[16]={255,0,0,255, 0,0,255,255, 0,255,0,255, 255,255,255,255};
-    for (unsigned i=0;i<4;i++) for(unsigned c=0;c<4;c++) if(pixels[offsets[i]+c]!=expected[4*i+c]) return 30+i;
+#endif
+    for (unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++) for(unsigned c=0;c<4;c++) if(pixels[offsets[i]+c]!=expected[4*i+c]) {
+#ifdef SAMPLE_OFFSET
+        return 1000+i*1024+c*256+pixels[offsets[i]+c];
+#else
+        return 30+i;
+#endif
+    }
     if (pixels[32]!=0x77) return 34;
     SLOT(queue,0x10,Release)(queue); SLOT(list,0x10,Release)(list); SLOT(allocator,0x10,Release)(allocator); SLOT(dev,0x10,Release)(dev);
     return 42;

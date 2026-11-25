@@ -20,10 +20,23 @@ fn signature(rows: &[(&[u8], u32, u32, u8)]) -> Vec<u8> {
 
 // GFX10: export POSITION and the independent UV input as param0; interpolate
 // attr0.xy at perspective center and pass those coordinates to image_sample.
+enum SampleOffset { None, Literal(u32), Dynamic }
+
 fn shader(vertex: bool, missing: bool, mismatch: u8, linear: bool) -> Vec<u8> {
-    let words: &[u32] = if vertex && missing { &[0xf80018cf, 0x07060504, 0xbf810000] }
-    else if vertex { &[0xf8000203, 0x00000908, 0xf80018cf, 0x07060504, 0xbf810000] }
-    else { &[0xc8080000, 0xc8090001, 0xc80c0100, 0xc80d0101, 0xbe820309, 0xbe890380, 0xbe830380, 0xf4080204, 0xfa000000, 0xf40c0001, 0xfa000000, 0xf0800f08, 0x00400002, 0xf800180f, 0x03020100, 0xbf810000] };
+    shader_with_offset(vertex, missing, mismatch, linear, SampleOffset::None)
+}
+
+fn shader_with_offset(vertex: bool, missing: bool, mismatch: u8, linear: bool, offset: SampleOffset) -> Vec<u8> {
+    let mut words = if vertex && missing { vec![0xf80018cf, 0x07060504, 0xbf810000] }
+    else if vertex { vec![0xf8000203, 0x00000908, 0xf80018cf, 0x07060504, 0xbf810000] }
+    else { vec![0xc8080000, 0xc8090001, 0xc80c0100, 0xc80d0101, 0xbe820309, 0xbe890380, 0xbe830380, 0xf4080204, 0xfa000000, 0xf40c0001, 0xfa000000, 0xf0800f08, 0x00400002, 0xf800180f, 0x03020100, 0xbf810000] };
+    if !vertex {
+        match offset {
+            SampleOffset::None => {}
+            SampleOffset::Literal(value) => { words.splice(11..13, [0x7e0202ff, value, 0xf0c00f08, 0x00400001]); }
+            SampleOffset::Dynamic => { words.splice(11..13, [0x7e020302, 0xf0c00f08, 0x00400001]); }
+        }
+    }
     let mut p = vec![0; 0x68]; put64(&mut p, 0, 6);
     for at in [8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] { put64(&mut p, at, 0xdeadbeefdeadbeef); }
     let record = p.len(); put64(&mut p, if vertex { 0x28 } else { 0x30 }, record as u64);
@@ -89,4 +102,35 @@ fn synthetic_uv_graphics_through_native_cli() {
     let output = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("uv.exe")).arg("--execute").output().unwrap();
     assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[ignore = "requires LLVM MinGW, a trusted Apple Metal Shader Converter and Metal GPU"]
+fn synthetic_sample_offset_through_native_cli() {
+    assert!(std::env::var_os("VICTORY_METAL_CONVERTER").is_some());
+    let dir = tempfile::tempdir().unwrap(); let root = dir.path();
+    let arrays = [("vs", shader(true, false, 0, false)), ("vs_missing", shader(true, false, 3, false)), ("vs_no_signature_uv", shader(true, false, 4, false)), ("ps", shader_with_offset(false, false, 0, false, SampleOffset::Literal(0x3f01)))].into_iter().map(|(name, bytes)| {
+        format!("static const unsigned char {name}[] = {{{}}};\n", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+    }).collect::<String>();
+    std::fs::write(root.join("shaders.h"), arrays).unwrap();
+    std::fs::write(root.join("uv.c"), include_str!("../../../tests/fixtures/macos_d3d12x_uv.c")).unwrap();
+    std::fs::write(root.join("d3d.def"), "LIBRARY d3d12_xs.dll\nEXPORTS\nD3D12XboxCreateDevice\n").unwrap();
+    tool(root, "llvm-dlltool", &["-m", "i386:x86-64", "-d", "d3d.def", "-l", "d3d.lib"]);
+    tool(root, "x86_64-w64-mingw32-clang", &["-O2", "-DSAMPLE_OFFSET", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-c", "uv.c", "-o", "uv.obj"]);
+    tool(root, "lld-link", &["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/dynamicbase", "/out:uv.exe", "uv.obj", "d3d.lib"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_victory")).arg("native-fixture").arg(root.join("uv.exe")).arg("--execute").output().unwrap();
+    assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture entry returned 42"), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn sample_offsets_reject_nonconstant_and_out_of_range() {
+    for offset in [8, 0x37] {
+        let bytes = shader_with_offset(false, false, 0, false, SampleOffset::Literal(offset));
+        let error = victory_shader::emit::translate(&bytes).err().expect("out-of-range sample offset must be rejected");
+        assert!(error.to_string().contains("a sample offset past -8..7"), "{error}");
+    }
+    let bytes = shader_with_offset(false, false, 0, false, SampleOffset::Dynamic);
+    let error = victory_shader::emit::translate(&bytes).err().expect("dynamic sample offset must be rejected");
+    assert!(error.to_string().contains("a sample offset that is not constant"), "{error}");
 }
