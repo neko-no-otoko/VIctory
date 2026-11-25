@@ -29,6 +29,7 @@ native-guest-abi = []
 workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+victory-core.workspace = true
 victory-metal = { path = "../victory-metal" }
 
 [target.'cfg(windows)'.dependencies]

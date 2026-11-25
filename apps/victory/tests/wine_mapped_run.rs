@@ -79,7 +79,7 @@ impl Fixture {
             converter: required("VICTORY_TEST_METAL_CONVERTER"), llvm: required("LLVM_MINGW") }
     }
 
-    fn build(&self) -> (PathBuf, PathBuf, PathBuf) {
+    fn build_imports(&self) {
         for (name, exports) in [
             ("kernel32", "GetStdHandle\nWriteFile\nCreateFileW\nReadFile\nSetFilePointerEx\nGetLastError\nCreateEventW\nCreateThread\nGetTickCount64\nSleep\nSetEvent\nWaitForSingleObject\nWaitForMultipleObjects\nGetExitCodeThread\nCloseHandle"),
             ("d3d12_xs", "D3D12XboxCreateDevice"),
@@ -91,6 +91,10 @@ impl Fixture {
                 .args(["-m", "i386:x86-64", "-d"]).arg(def).arg("-l")
                 .arg(self.dir.join(format!("{name}.lib"))), &self.dir);
         }
+    }
+
+    fn build(&self) -> (PathBuf, PathBuf, PathBuf) {
+        self.build_imports();
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
         let obj = self.dir.join("compute fixture.obj");
         checked(Command::new(self.llvm.join("bin/x86_64-w64-mingw32-clang"))
@@ -183,6 +187,7 @@ unsigned mainCRTStartup(void *arg) {
             .env_remove("VICTORY_CONFIG").env("WINEDLLOVERRIDES", "xcrdapi=n")
             .env("WINEPATH", "untrusted-provider-path")
             .env_remove("VICTORY_WINE_METAL_ADDR").env_remove("VICTORY_WINE_METAL_TOKEN")
+            .env("VICTORY_WINE_METAL_PRESENT", "0").env_remove("VICTORY_WINE_METAL_DRAWABLE_DIR")
             .env("WINEDEBUG", "-all").env("VICTORY_LOG", "info")
             .env_remove("VICTORY_SKIP_CPU_CHECK");
         command
@@ -267,4 +272,74 @@ fn mapped_windows_guest_uses_hle_and_real_metal() {
     assert_eq!(lines.len(), 3, "{}\n{env:?}", logs(&output));
     assert_eq!(&lines[..2], ["unset", "unset"]);
     assert!(!lines[2].contains(';') && lines[2].ends_with("\\bin") && !lines[2].contains("untrusted-provider-path"), "{env:?}");
+}
+
+#[test]
+#[ignore = "requires an Aqua session, Windows victory.exe, Wine, LLVM-MinGW and the native Metal host and converter"]
+fn mapped_graphics_present_drawable_contains_guest_pixels() {
+    let f = Fixture::new();
+    // Reuse the same import libraries as the compute fixture.
+    f.build_imports();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/windows_d3d12x_present_graphics.c");
+    let object = f.dir.join("present fixture.obj");
+    checked(Command::new(f.llvm.join("bin/x86_64-w64-mingw32-clang"))
+        .args(["-O2", "-fno-emulated-tls", "-c"]).arg(source).arg("-o").arg(&object), &f.dir);
+    let guest = f.dir.join("present guest.exe");
+    checked(Command::new(f.llvm.join("bin/lld-link"))
+        .args(["/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "/include:_tls_used"])
+        .arg(format!("/out:{}", guest.display())).arg(object)
+        .arg(f.dir.join("kernel32.lib")).arg(f.dir.join("d3d12_xs.lib"))
+        .arg(f.llvm.join("x86_64-w64-mingw32/lib/libmingw32.a")), &f.dir);
+
+    let capture_dir = f.dir.join("drawable captures");
+    fs::create_dir(&capture_dir).unwrap();
+    let output = run(f.command(&guest, &f.wine)
+        .env("VICTORY_SKIP_CPU_CHECK", "1")
+        .env("VICTORY_WINE_METAL_PRESENT", "1")
+        .env("VICTORY_WINE_METAL_DRAWABLE_DIR", &capture_dir), &f.dir);
+    let text = logs(&output);
+    assert_eq!(output.status.code(), Some(42), "{text}");
+    assert!(text.contains("Wine Metal proxy connected"), "{text}");
+    assert!(text.contains("TLS compiler state and thread callbacks passed"), "{text}");
+    assert!(text.contains("PresentX ordered graphics, source preservation and resize passed"), "{text}");
+    assert!(text.contains("mapped title result: 42"), "{text}");
+    for (index, x, expected) in [(0, 10, [0, 0, 255, 255]), (1, 32, [0, 255, 0, 255])] {
+        let bytes = fs::read(capture_dir.join(format!("drawable-{index:08}.bgra"))).unwrap();
+        assert!(bytes.len() >= 8);
+        let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        assert!(width >= 64 && height >= 64);
+        assert_eq!(bytes.len(), 8 + width * height * 4);
+        let pixel = |x: usize, y: usize| {
+            let at = 8 + (y * width + x) * 4;
+            &bytes[at..at + 4]
+        };
+        assert_eq!(pixel(width * x / 64, height / 2), expected, "{text}");
+        assert_eq!(pixel(width * 56 / 64, height / 2), [255, 128, 64, 0], "{text}");
+    }
+    assert!(!capture_dir.join("drawable-00000002.bgra").exists(), "{text}");
+
+    let headless = run(f.command(&guest, &f.wine)
+        .env("VICTORY_SKIP_CPU_CHECK", "1")
+        .env("VICTORY_WINE_METAL_PRESENT", "0")
+        .env_remove("VICTORY_WINE_METAL_DRAWABLE_DIR"), &f.dir);
+    let text = logs(&headless);
+    assert_eq!(headless.status.code(), Some(32), "{text}");
+    assert!(text.contains("mapped title result: 32"), "{text}");
+    assert!(!text.contains("PresentX ordered graphics, source preservation and resize passed"), "{text}");
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_link = f.dir.join("repository symlink");
+    std::os::unix::fs::symlink(repository, &repo_link).unwrap();
+    for forbidden in [repository, repo_link.as_path()] {
+        let output = run(f.command(&guest, &f.wine)
+            .env("VICTORY_SKIP_CPU_CHECK", "1")
+            .env("VICTORY_WINE_METAL_PRESENT", "1")
+            .env("VICTORY_WINE_METAL_DRAWABLE_DIR", forbidden), &f.dir);
+        let text = logs(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(text.contains("refusing to use") && text.contains("inside the VIctory source tree"), "{text}");
+        assert!(!text.contains("title exited with") && !text.contains("mapped title result:"), "{text}");
+    }
 }

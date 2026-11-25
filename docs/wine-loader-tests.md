@@ -442,6 +442,28 @@ removed. The Windows launcher's AVX2 preflight remains in force. It is
 **not** automatically bypassed: `VICTORY_SKIP_CPU_CHECK=1` is a deliberate
 user opt-in, not evidence that an executable's instructions are supported.
 
+To opt into a window for this supervised route, set
+`VICTORY_WINE_METAL_PRESENT=1` in the environment of the command above. The
+launcher passes it to its arm64 helper; no separate helper or presentation
+flag is needed. Without it the helper is headless and a presentation request
+fails. The helper needs an active Aqua session, an available display and a
+Metal device. It owns an AppKit window; a closed window cannot be reused for
+presentation in that helper process. This is not a sandbox.
+
+For diagnostic drawable readback, optionally set
+`VICTORY_WINE_METAL_DRAWABLE_DIR` to an existing writable directory **outside
+the source tree** in that same environment. The helper resolves symlinks and
+checks the output policy at startup, before accepting presentations. It
+captures at most the first two successful presentation requests, as
+`drawable-00000000.bgra` and `drawable-00000001.bgra`: two little-endian
+`u32` dimensions followed by tightly packed BGRA8 drawable pixels. Files are
+created without overwriting; a collision or write error causes the request to
+fail, potentially after the frame was presented. Captures can contain
+sensitive content and are not automatically removed. They are read back from
+the Metal drawable, not a screen capture of the composited desktop; Screen
+Recording permission is not used for this readback. Headless runs ignore the
+diagnostic directory.
+
 The Windows launcher reports a normal title return over an authenticated
 loopback result channel, then exits zero only after successful delivery. The
 macOS launcher checks that process exit separately, prints the full 32-bit
@@ -494,6 +516,24 @@ DirectStorage requests; its `G:` read uses Win32 file imports, and only the
 first returned byte is copied into the Metal input. Neither test establishes
 title streaming compatibility. The normal-Wine real Metal launcher
 regression also passed.
+
+With the same setup, run the Aqua presentation test separately:
+
+```sh
+cargo test --locked -p victory --target aarch64-apple-darwin --test wine_mapped_run \
+  mapped_graphics_present_drawable_contains_guest_pixels -- --ignored --nocapture
+```
+
+On Wine 11 under Rosetta, that test compiled the self-authored TLS-bearing
+D3D12.X graphics PE and launched it through the supervised Windows mapper.
+The PE submitted two textured triangles and `PresentX` requests, and the
+arm64 helper read back the actual drawable for each request. The test checked
+red and green triangle pixels and the asymmetric background, and checked the
+authenticated title result 42. With presentation disabled, the first valid
+`PresentX` failed and the reported title result was 32. This verifies drawable
+contents in that launched session, not a desktop screen capture, a GTA frame,
+or first-mission compatibility; it does not expand the supported presentation
+or D3D12.X subset described below.
 
 ### Restricted offscreen graphics
 

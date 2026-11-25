@@ -4,8 +4,25 @@
 mod host {
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    const MAX_DRAWABLE_CAPTURES: u32 = 2;
+    struct DrawableCaptures {
+        dir: PathBuf,
+        next: u32,
+    }
+
+    impl DrawableCaptures {
+        fn from_env() -> Result<Option<Self>, String> {
+            let Some(dir) = std::env::var_os("VICTORY_WINE_METAL_DRAWABLE_DIR") else { return Ok(None); };
+            let dir = std::fs::canonicalize(&dir)
+                .map_err(|e| format!("resolving drawable capture directory {dir:?}: {e}"))?;
+            if !dir.is_dir() { return Err(format!("drawable capture path is not a directory: {}", dir.display())); }
+            victory_core::ensure_outside_repo(&dir).map_err(|e| e.to_string())?;
+            Ok(Some(Self { dir, next: 0 }))
+        }
+    }
     const MAGIC: u32 = 0x3147_4d56;
     const MAX_SHADER: usize = 4 * 1024 * 1024;
     const MAX_BUFFER: usize = 16 * 1024 * 1024;
@@ -212,6 +229,7 @@ mod host {
         stream: &mut TcpStream,
         fields: [u32; 8],
         enabled: bool,
+        captures: &mut Option<DrawableCaptures>,
     ) -> Result<Vec<u8>, String> {
         if !enabled {
             return Err("presentation is not enabled".into());
@@ -230,22 +248,35 @@ mod host {
         }
         let mut pixels = vec![0; required];
         stream.read_exact(&mut pixels).map_err(|e| e.to_string())?;
-        let result = victory_metal::present::present(width, height, format, pitch, &pixels, flags == 1)
+        let capture_file = captures.as_ref().is_some_and(|c| c.next < MAX_DRAWABLE_CAPTURES);
+        let capture = flags == 1 || capture_file;
+        let result = victory_metal::present::present(width, height, format, pitch, &pixels, capture)
             .map_err(|e| e.to_string())?;
         let capture_len = result.capture.len();
         let expected_capture = (result.width as usize).checked_mul(result.height as usize)
             .and_then(|n| n.checked_mul(4)).ok_or("drawable size overflow")?;
         if result.width == 0 || result.height == 0
-            || (flags == 1 && (capture_len != expected_capture || capture_len > MAX_BUFFER))
-            || (flags == 0 && capture_len != 0)
+            || (capture && (capture_len != expected_capture || capture_len > MAX_BUFFER))
+            || (!capture && capture_len != 0)
         {
             return Err("invalid drawable capture returned by presenter".into());
         }
-        let mut response = Vec::with_capacity(12 + capture_len);
+        if capture_file {
+            let captures = captures.as_mut().expect("capture state checked above");
+            let path = captures.dir.join(format!("drawable-{:08}.bgra", captures.next));
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                .map_err(|e| format!("creating drawable capture {}: {e}", path.display()))?;
+            file.write_all(&result.width.to_le_bytes())
+                .and_then(|()| file.write_all(&result.height.to_le_bytes()))
+                .and_then(|()| file.write_all(&result.capture))
+                .map_err(|e| format!("writing drawable capture {}: {e}", path.display()))?;
+            captures.next += 1;
+        }
+        let mut response = Vec::with_capacity(12 + if flags == 1 { capture_len } else { 0 });
         response.extend_from_slice(&result.width.to_le_bytes());
         response.extend_from_slice(&result.height.to_le_bytes());
-        response.extend_from_slice(&(capture_len as u32).to_le_bytes());
-        response.extend_from_slice(&result.capture);
+        response.extend_from_slice(&(if flags == 1 { capture_len as u32 } else { 0 }).to_le_bytes());
+        if flags == 1 { response.extend_from_slice(&result.capture); }
         Ok(response)
     }
 
@@ -260,6 +291,7 @@ mod host {
         expected_token: &[u8; 16],
         cache: &mut Option<(Vec<u8>, bool, victory_gpu::WineMetalCompute)>,
         presentation_enabled: bool,
+        captures: &mut Option<DrawableCaptures>,
     ) -> Result<Response, String> {
         let mut header = [0; 32];
         stream.read_exact(&mut header).map_err(|e| e.to_string())?;
@@ -329,7 +361,7 @@ mod host {
                 victory_gpu::wine_transport::validate_stream_results(&results)?;
                 Ok(Response::Stream(results))
             }
-            4 => present_request(stream, fields, presentation_enabled).map(Response::Bytes),
+            4 => present_request(stream, fields, presentation_enabled, captures).map(Response::Bytes),
             _ => unreachable!(),
         }
     }
@@ -378,14 +410,17 @@ mod host {
         let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
         let presentation_enabled = std::env::var_os("VICTORY_WINE_METAL_PRESENT")
             .is_some_and(|value| value == "1");
+        // Headless runs retain their existing behavior. Validate diagnostic
+        // output before announcing readiness or accepting any requests.
+        let captures = if presentation_enabled { DrawableCaptures::from_env()? } else { None };
         if presentation_enabled {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             victory_metal::present::run_app(move || {
-                let _ = send.send(serve(listener, token, true, announce));
+                let _ = send.send(serve(listener, token, true, announce, captures));
             }).map_err(|e| e.to_string())?;
             receive.recv().map_err(|e| e.to_string())?
         } else {
-            serve(listener, token, false, announce)
+            serve(listener, token, false, announce, captures)
         }
     }
 
@@ -394,7 +429,7 @@ mod host {
         out.flush()
     }
 
-    fn serve(listener: TcpListener, token: [u8; 16], presentation_enabled: bool, announce: bool) -> Result<(), String> {
+    fn serve(listener: TcpListener, token: [u8; 16], presentation_enabled: bool, announce: bool, mut captures: Option<DrawableCaptures>) -> Result<(), String> {
         if announce {
             announce_listener(&listener, &mut io::stdout().lock()).map_err(|e| e.to_string())?;
         }
@@ -411,7 +446,7 @@ mod host {
                         eprintln!("setting connection timeouts failed: {error}");
                         continue;
                     }
-                    let result = request(&mut stream, &token, &mut cache, presentation_enabled);
+                    let result = request(&mut stream, &token, &mut cache, presentation_enabled, &mut captures);
                     if let Err(error) = respond(&mut stream, result) {
                         eprintln!("response failed: {error}");
                     }
@@ -453,7 +488,7 @@ mod host {
                 }
                 client.write_all(&token).unwrap();
                 let (mut server,_)=listener.accept().unwrap();
-                let result=request(&mut server,&[0;16],&mut None,false);
+                let result=request(&mut server,&[0;16],&mut None,false,&mut None);
                 assert!(result.unwrap_err().contains(expected));
             }
             let listener=TcpListener::bind("127.0.0.1:0").unwrap();
@@ -481,7 +516,7 @@ mod host {
                     for value in fields {client.write_all(&value.to_le_bytes()).unwrap();}
                     client.write_all(&token).unwrap();
                     let (mut server,_)=listener.accept().unwrap();
-                    assert!(request(&mut server,&[0;16],&mut None,false).unwrap_err().contains(expected));
+                    assert!(request(&mut server,&[0;16],&mut None,false,&mut None).unwrap_err().contains(expected));
                 }
             }
         }
@@ -498,7 +533,7 @@ mod host {
                 client.write_all(&0u32.to_le_bytes()).unwrap();
                 if version==15 || version==17 {client.write_all(&0u32.to_le_bytes()).unwrap();}
                 let (mut server,_)=listener.accept().unwrap();
-                let error=request(&mut server,&[0;16],&mut None,false).unwrap_err();
+                let error=request(&mut server,&[0;16],&mut None,false,&mut None).unwrap_err();
                 assert!(!error.contains("protocol header") && !error.contains("authentication"),"{error}");
             }
         }
@@ -511,7 +546,7 @@ mod host {
                 client.write_all(&word.to_le_bytes()).unwrap();
             }
             let (mut server, _) = listener.accept().unwrap();
-            let error = request(&mut server, &[0; 16], &mut None, false).unwrap_err();
+            let error = request(&mut server, &[0; 16], &mut None, false, &mut None).unwrap_err();
             assert!(error.contains("invalid protocol header"));
         }
     }
