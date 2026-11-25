@@ -447,7 +447,7 @@ impl Prepared {
         pixels: &mut [u8],
         preserve: bool,
     ) -> Result<(), String> {
-        self.draw_inputs_mrt(width, height, attributes, buffers, indices, first_vertex, vertex_count,
+        self.draw_inputs_mrt(width, height, attributes, buffers, indices, 4, first_vertex, vertex_count,
             instance_count, start_instance, viewport, scissor, depth, stencil, stencil_reference,
             constants, textures, samplers, &mut [pixels], preserve)
     }
@@ -455,7 +455,7 @@ impl Prepared {
     pub(crate) fn draw_inputs_mrt(
         &mut self, width: u32, height: u32, attributes: &[victory_metal::VertexAttribute],
         buffers: &[victory_metal::VertexBuffer<'_>], indices: Option<(victory_metal::IndexData<'_>, i32)>,
-        first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
+        topology: u32, first_vertex: u32, vertex_count: u32, instance_count: u32, start_instance: u32,
         viewport: [f64; 6], scissor: [u32; 4], mut depth: Option<&mut [f32]>,
         mut stencil: Option<&mut [u8]>, stencil_reference: u32, constants: &[u32],
         textures: &[(Texture<'_>, Option<SampledTextureIdentity>)],
@@ -504,8 +504,8 @@ impl Prepared {
         for (&(filter, min_lod, max_lod), entry) in samplers.iter().zip(&self.sampler_entries) {
             renderer.set_fragment_sampler_at(entry.heap_index, filter, min_lod, max_lod).map_err(|e| e.to_string())?;
         }
-        renderer.draw_buffers_mrt(
-            buffers, indices, first_vertex, vertex_count, instance_count, start_instance,
+        renderer.draw_buffers_mrt_topology(
+            buffers, indices, first_vertex, vertex_count, instance_count, start_instance, topology,
             constants, pixels, preserve,
         ).map_err(|e| e.to_string())?;
         if let Some(pixels) = depth.as_deref_mut() {
