@@ -1,17 +1,30 @@
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+An experimental macOS fork of VIctory, the Xbox Series X|S compatibility
+layer for user-supplied titles. The fork's macOS paths have been exercised
+with synthetic fixtures, not GTA VI.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+The Windows base runs x86-64 title code in its process and supplies the
+platform underneath it. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Status
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+**No game boot or upstream parity is established on macOS.** The fork has
+experimental PE mapping and Wine-to-native-Metal paths; its documented
+end-to-end results use synthetic guests. On Apple silicon the Wine route runs
+x86-64 code under Rosetta, not native ARM guest code. Neither route is a sandbox.
+
+The current upstream benchmark at
+[`ccfb02996eac831853e8324156f123eeff083e9d`](https://github.com/Marvisak/VIctory/tree/ccfb02996eac831853e8324156f123eeff083e9d)
+reports menus and audio, and a visible world with streets, buildings,
+vehicles and characters at 1–2 seconds per frame. It remains unplayable:
+surfaces are unlit, geometry is missing and some characters are broken.
+That is upstream's Windows result, not a result of this fork on macOS.
+
+### Historical Windows base (2026-11-23)
+
+At the fork's upstream base, the title was reported to boot, run menus at
+30 fps and load the world, where rendering failed:
 
 | Stage | State |
 |-------|-------|
@@ -28,7 +41,7 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
 > moment). To look further, use a diagnostics build with
 > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
 
-What each part does today and what it still needs:
+The following table records that historical Windows base, not macOS support:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
@@ -44,190 +57,29 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
-## Offline inspection on macOS
+## macOS: inspect first
 
-The native macOS CLI supports read-only PE32+ x86-64 and COFF inspection,
-shader-container analysis and GFX10 disassembly, and offline translation
-to DXIL. It does not load or execute titles, provide Xbox runtime services,
-or implement a Metal renderer. These commands also work on Windows.
-Use the pinned Rust toolchain and build only the CLI package:
+For a locally supplied PE, the shortest read-only import inspection from the
+repository root is:
 
 ```sh
-cargo build -p victory
-target/debug/victory inspect /path/to/title.exe --imports --exports
-target/debug/victory lib-exports /path/to/import.lib --list
-target/debug/victory shader-info /path/to/shaders --disasm
-target/debug/victory translate /path/to/shaders --list
-cargo test -p victory -p victory-pe
+cargo run -p victory -- inspect /path/to/title.exe --imports
 ```
 
-Translation reports whether DXIL was emitted; this does not validate the
-output or establish that it can run on macOS. `--validate`, `--pipelines`,
-and `VICTORY_PAIRS` require Windows. Shader inputs may be raw DXBC containers
-or SGD5 packed records, including those found inside otherwise uncompressed
-files. Compressed or encrypted archives are not generally unpacked.
+It reads the file without executing it; it does not establish whether the
+title can run. Input files must be supplied by the user; see
+[the asset policy](docs/asset-policy.md).
 
-On macOS, an independently obtained Apple Metal Shader Converter dynamic
-library can convert an emitted DXIL file to a `.metallib`:
+The fork also has restricted Metal compute, graphics and presentation paths
+verified with synthetic fixtures, not a complete Xbox GPU implementation.
+The [native loader notes](docs/native-macos-loader.md) describe the x86-64
+macOS PE mapper and its limitations; the
+[Wine loader notes](docs/wine-loader-tests.md) describe normal Wine loading,
+the Metal bridge, provider and DirectStorage gaps, and trusted-guest
+requirements. Their x86-64 macOS results on Apple silicon use Rosetta;
+they do not establish native ARM guest execution or game compatibility.
 
-```sh
-VICTORY_EMIT_DUMP=/path/outside/repo target/debug/victory translate /path/to/shader --list
-target/debug/victory convert-metal /path/outside/repo/emitted.dxil \
-  --library /path/to/libmetalirconverter.dylib --stage compute \
-  --output /path/outside/repo/shader.metallib
-```
-
-Use the input's actual stage (`vertex`, `fragment`, `mesh`, or `compute`).
-The converter is proprietary and not bundled; obtain it and comply with
-[Apple's terms](https://developer.apple.com/metal/shader-converter/).
-Conversion alone is not validation of shader behavior or resource bindings,
-and this command does not create a Metal renderer. To exercise the converter
-integration test, set `VICTORY_TEST_METAL_CONVERTER` to the dylib path and run
-`cargo test -p victory --test shader_offline`.
-
-An opt-in GPU test requires a Metal device with argument buffers tier 2,
-Xcode command-line tools and the converter library:
-
-```sh
-VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
-  cargo test -p victory --test metal_compute -- --ignored
-```
-
-It emits DXIL from a synthetic one-thread GFX10 shader, converts it, checks
-the converter's resource reflection, dispatches it on Metal and verifies
-`41 + 1` is written to a buffer without modifying its other words. This is
-one synthetic compute case, not a game compatibility or renderer test.
-
-The macOS `victory-gpu` command objects have an experimental synchronous
-compute path: a recorded console dispatch translates the native shader,
-loads it through Apple's converter, and executes it on Metal when its
-command list is submitted. Compute supports a single shader-visible view
-heap, a whole-buffer UAV at descriptor index zero, root constants, recorded
-buffer-to-buffer region copies, unsplit UAV barriers, and whole-buffer
-transitions among `COMMON`, `COPY_SOURCE`, `COPY_DEST` and
-`UNORDERED_ACCESS`. Only committed default-heap buffers on matching direct or
-compute queues and lists are supported; UAV access requires the resource's
-unordered-access flag. The path validates command use and transition
-before-states in list order and again at submission. Buffers can be promoted
-from `COMMON` on use; a transition from `COMMON` may also name a supported
-promotable before-state. Buffers decay to `COMMON` after the entire
-`ExecuteCommandLists` batch, not between lists, following the
-[D3D12 promotion and decay rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12#implicit-state-transitions).
-
-Copies use host memory at submission; dispatches finish before the next command,
-so GPU writes are visible to later copies and barriers. Copy ranges must be in
-bounds and non-overlapping, and source and destination must be distinct.
-Commands retain their resources until the list is reset or released. Placed or
-aliased resources, other heap types and state combinations, individual
-subresources, split or aliasing barriers, other shader bindings, descriptor
-changes after recording, root-signature commands and waits are not implemented.
-Unsupported list commands reject the list; submission
-failures latch the queue and prevent later fence signals.
-The caller must not access mapped resources concurrently with submission.
-This experimental path is not wired into a macOS title loader and is not
-an Xbox GPU backend.
-
-An opt-in native macOS `PresentX` path sends a single RGBA8/BGRA8 UNORM or
-UNORM_SRGB resource to a separate authenticated helper with an AppKit window and
-`CAMetalLayer`. It waits for Metal completion and preserves the source
-resource. The Wine proxy supports RGBA8 presentation; both paths reject
-unsupported planes and parameters. This is an experimental synthetic-fixture
-path, not a general swap chain or game compatibility. See
-[the native loader notes](docs/native-macos-loader.md) for setup and limits.
-
-To run the synthetic device/list/queue test on a Metal GPU (no title assets):
-
-```sh
-VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
-  cargo test -p victory-gpu console_compute_records_and_submits_on_metal -- --ignored
-```
-
-It records copy → transition → compute → transition → copy and checks unchanged
-pre-submit data, the post-submit value 42, surrounding bytes, resource lifetimes,
-batch-wide state tracking and decay, invalid transitions and queue failure.
-
-The same queue can execute a narrowly constrained offscreen draw: a validated
-graphics pipeline stream with a resource-free translated vertex shader and a
-translated pixel shader using at most one graphics root-constants parameter,
-one SRV table and one sampler table. Used root dwords are snapshotted per draw
-and uploaded as a real fragment constant buffer at `b0, space0`; Apple's
-converter reflection must confirm the expected automatic layout. This is not
-support for arbitrary console root CBVs or constant-buffer descriptors.
-Draws use one float4 vertex buffer,
-triangle-list topology, full-target viewport and scissor, and one committed
-linear single-sample RGBA8 render target. Whole-target readback to a buffer
-uses a 256-byte row-pitched footprint after an explicit `RENDER_TARGET` to
-`COPY_SOURCE` transition. Drawing preserves pixels outside the triangles; GPU
-work and host-memory copies complete in command order. Other graphics states,
-formats, depth, blending, instancing and presentation are rejected.
-
-`ClearRenderTargetView` records ordered full-target or clipped rectangle clears
-for the same RGBA8 targets, independent of the bound draw target. It snapshots
-the color and rectangles, retains the target, requires `RENDER_TARGET` state,
-and clears the linear host backing synchronously between GPU draws and copies.
-FLOAT channels convert to UNORM by clamping to [0, 1] and rounding to nearest
-with halfway values up; NaN becomes zero. Null rectangle arrays with a nonzero
-count and inverted rectangles are rejected.
-
-```sh
-VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
-  cargo test -p victory-gpu console_triangle_draw_preserves_target_and_copies_to_padded_buffer -- --ignored
-```
-
-The test uses a synthetic 5×4 target and two draws with different root values
-to check clear/draw/clear ordering, clipping, color conversion, rejected states,
-converter reflection, mapped row pitch, readback padding and resource lifetime.
-
-For texturing, the SRV must be a default view of a committed default-heap,
-linear, single-mip, single-sample RGBA8 2D texture. The shader's statically
-traced SRV and sampler tables must each address descriptor index zero in
-separate owned shader-visible heaps. Supported samplers are point or linear
-filtering with clamp-to-edge, zero LOD range and bias, and no comparison.
-Changing heaps invalidates descriptor-table bindings; rebind them before a draw.
-Recorded draws retain their resources and heaps, snapshot descriptor identity,
-and reject descriptor changes before execution; texture contents are read at
-submission. The converter is configured to use its texture-array compatibility
-ABI. Other texture layouts, dynamic indices and sampler modes are rejected.
-
-```sh
-VICTORY_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
-  cargo test -p victory-gpu console_samples_recorded_texture_and_sampler_tables -- --ignored
-```
-
-This synthetic test checks nearest and linear GPU samples, switching to an
-updated second texture, descriptor/resource lifetime and padded readback.
-
-The macOS-only `victory-metal::Renderer` builds a persistent offscreen Metal
-pipeline from converted vertex and fragment metallibs. It draws triangle
-lists from a float4 vertex buffer into RGBA8 and reads the pixels back;
-device, pipeline, target and buffers are reused across synchronous draws.
-Its fixed input layout supports one per-vertex float4, optional fragment
-`b0, space0` constants, and one fragment texture and sampler at heap index 0.
-Specify the constant buffer size in dwords (zero or a multiple of four) and
-supply that exact number per draw. If texture binding is enabled, upload a
-tightly packed RGBA8 image with `set_fragment_texture` before drawing; nearest
-or linear filtering uses clamp-to-edge with one mip level.
-
-The caller must verify from converter reflection that b0 uses the automatic
-linear layout at offset zero and that the constant buffer is large enough, and
-from translated shader metadata that texture and sampler accesses use heap
-index zero. The fragment metallib must expect a 2D-array texture view (the
-converter's older default or array compatibility mode). Other layouts and
-resource types are not supported; the renderer does not infer or validate
-them from metallibs. Console GPU semantics and presentation are not
-implemented. To exercise synthetic translated GFX10 vertex and fragment
-shaders, including changing constants and sampled texels:
-
-```sh
-cargo build -p victory
-VICTORY_TEST_CLI="$(pwd)/target/debug/victory" \
-VICTORY_TEST_METAL_CONVERTER=/path/to/libmetalirconverter.dylib \
-  cargo test -p victory-metal --test render -- --ignored
-```
-
-Input files are supplied by the user; see [the asset policy](docs/asset-policy.md).
-
-## Getting started
+## Windows getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
