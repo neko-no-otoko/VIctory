@@ -127,13 +127,14 @@ pub(crate) enum Vertices<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TextureDimension { D2, D2Array, Cube }
+enum TextureDimension { D2, D2Array, Cube, D3 }
 
 pub(crate) struct Texture<'a> {
     pub width: u32,
     pub height: u32,
     pub levels: u32,
     pub array_layers: Option<u32>,
+    pub volume_depth: Option<u32>,
     pub cube: bool,
     pub pixels: &'a [u8],
     pub filter: victory_metal::TextureFilter,
@@ -145,9 +146,10 @@ pub(crate) struct Texture<'a> {
 impl Texture<'_> {
     fn matches_dimension(&self, dimension: TextureDimension) -> bool {
         match dimension {
-            TextureDimension::D2 => !self.cube && self.array_layers.is_none(),
-            TextureDimension::D2Array => !self.cube && self.array_layers.is_some(),
-            TextureDimension::Cube => self.cube && self.array_layers == Some(6),
+            TextureDimension::D2 => !self.cube && self.array_layers.is_none() && self.volume_depth.is_none(),
+            TextureDimension::D2Array => !self.cube && self.array_layers.is_some() && self.volume_depth.is_none(),
+            TextureDimension::Cube => self.cube && self.array_layers == Some(6) && self.volume_depth.is_none(),
+            TextureDimension::D3 => !self.cube && self.array_layers.is_none() && self.volume_depth.is_some(),
         }
     }
 }
@@ -169,6 +171,7 @@ struct SampledTextureKey {
     height: u32,
     levels: u32,
     array_layers: Option<u32>,
+    volume_depth: Option<u32>,
     cube: bool,
     format: victory_metal::TextureFormat,
     linear: bool,
@@ -180,7 +183,7 @@ impl SampledTextureKey {
     fn new(identity: SampledTextureIdentity, texture: &Texture<'_>) -> Self {
         Self {
             identity, width: texture.width, height: texture.height, levels: texture.levels,
-            array_layers: texture.array_layers, cube: texture.cube, format: texture.format, linear: matches!(texture.filter, victory_metal::TextureFilter::Linear),
+            array_layers: texture.array_layers, volume_depth: texture.volume_depth, cube: texture.cube, format: texture.format, linear: matches!(texture.filter, victory_metal::TextureFilter::Linear),
             min_lod: texture.min_lod.to_bits(), max_lod: texture.max_lod.to_bits(),
         }
     }
@@ -200,7 +203,14 @@ fn upload_sampled_texture(
     }
     // A failed upload must never leave a stale identity attached to a renderer.
     *cached = None;
-    if texture.cube {
+    if let Some(depth) = texture.volume_depth {
+        if depth == 0 || texture.array_layers.is_some() || texture.cube {
+            return Err("invalid 3D texture view".into());
+        }
+        renderer.set_fragment_texture_3d_mips_at(
+            index, texture.width, texture.height, depth, texture.levels, texture.pixels, texture.format,
+        ).map_err(|e| e.to_string())?;
+    } else if texture.cube {
         if texture.array_layers != Some(6) || texture.width != texture.height {
             return Err("invalid cube texture view".into());
         }
@@ -229,7 +239,7 @@ mod sampled_texture_cache_tests {
     fn only_matching_explicit_identity_and_view_can_reuse_upload() {
         let identity = SampledTextureIdentity { resource: 1, generation: 0, first_mip: 0, first_slice: 0 };
         let mut texture = Texture {
-            width: 8, height: 8, levels: 2, array_layers: None, cube: false, pixels: &[], filter: TextureFilter::Nearest,
+            width: 8, height: 8, levels: 2, array_layers: None, volume_depth: None, cube: false, pixels: &[], filter: TextureFilter::Nearest,
             format: TextureFormat::Rgba8, min_lod: 0.0, max_lod: 0.0,
         };
         let original = SampledTextureKey::new(identity, &texture);
@@ -258,6 +268,9 @@ mod sampled_texture_cache_tests {
         texture.array_layers = Some(1);
         assert_ne!(original, SampledTextureKey::new(identity, &texture));
         texture.array_layers = None;
+        texture.volume_depth = Some(1);
+        assert_ne!(original, SampledTextureKey::new(identity, &texture));
+        texture.volume_depth = None;
         texture.cube = true;
         assert_ne!(original, SampledTextureKey::new(identity, &texture));
         texture.cube = false;
@@ -272,6 +285,25 @@ mod sampled_texture_cache_tests {
         texture.min_lod = 0.0;
         texture.max_lod = 1.0;
         assert_ne!(original, SampledTextureKey::new(identity, &texture));
+    }
+
+    #[test]
+    fn texture_view_dimensions_are_distinct() {
+        let mut texture = Texture {
+            width: 4, height: 4, levels: 1, array_layers: None, volume_depth: None, cube: false,
+            pixels: &[], filter: TextureFilter::Nearest, format: TextureFormat::Rgba8, min_lod: 0.0, max_lod: 0.0,
+        };
+        assert!(texture.matches_dimension(TextureDimension::D2));
+        assert!(!texture.matches_dimension(TextureDimension::D3));
+        texture.volume_depth = Some(1);
+        assert!(texture.matches_dimension(TextureDimension::D3));
+        assert!(!texture.matches_dimension(TextureDimension::D2));
+        assert!(!texture.matches_dimension(TextureDimension::D2Array));
+        assert!(!texture.matches_dimension(TextureDimension::Cube));
+        texture.array_layers = Some(6);
+        texture.cube = true;
+        assert!(!texture.matches_dimension(TextureDimension::D3));
+        assert!(!texture.matches_dimension(TextureDimension::Cube));
     }
 }
 
@@ -1082,9 +1114,10 @@ fn validate(
         let inst = &program.blocks[descriptor.site.0].insts[descriptor.site.1];
         let dimension = match &inst.fields {
             victory_shader::gfx10::Fields::Image { dim: 1, .. } => TextureDimension::D2,
+            victory_shader::gfx10::Fields::Image { dim: 2, .. } => TextureDimension::D3,
             victory_shader::gfx10::Fields::Image { dim: 3, .. } => TextureDimension::Cube,
             victory_shader::gfx10::Fields::Image { dim: 5, .. } => TextureDimension::D2Array,
-            _ => return Err("only 2D, 2D array and cube texture sampling is supported".into()),
+            _ => return Err("only 2D, 2D array, cube and 3D texture sampling is supported".into()),
         };
         if !matches!(inst.name(), "image_sample" | "image_sample_lz" | "image_sample_l" | "image_sample_b" | "image_sample_d") {
             return Err("only non-comparison texture sampling is supported".into());

@@ -1573,6 +1573,7 @@ impl State {
                             levels: sampled.mip_count,
                             array_layers: None,
                             cube: false,
+                            volume_depth: None,
                             pixels: self.texture_scratch.as_slice(),
                             filter: sampled.filter,
                             format: sampled_format(sampled.texture.ptr()).ok_or("invalid sampled texture format")?,

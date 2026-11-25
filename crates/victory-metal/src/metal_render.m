@@ -611,9 +611,9 @@ bool victory_metal_clear_depth(uint32_t width, uint32_t height, size_t pitch, ui
     }
 }
 
-bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, uint32_t height,
-                                  uint32_t levels, uint32_t layers, bool cube, const uint8_t *rgba,
-                                  uint32_t texture_format, char *error, size_t error_len) {
+static bool setTextureAt(void *handle, uint32_t index, uint32_t width, uint32_t height,
+                         uint32_t depth, uint32_t levels, uint32_t layers, bool cube, bool volume,
+                         const uint8_t *rgba, uint32_t texture_format, char *error, size_t error_len) {
     @autoreleasepool {
         if (error_len) error[0] = 0;
         VictoryMetalRenderer *r = (__bridge VictoryMetalRenderer *)handle;
@@ -637,14 +637,15 @@ bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, 
         }
         if (blockBytes && ![r.device supportsBCTextureCompression])
             return fail(error, error_len, @"BC texture compression is not supported by the Metal device");
-        MTLTextureType textureType = cube ? MTLTextureTypeCubeArray : MTLTextureType2DArray;
-        NSUInteger arrayLength = cube ? 1 : layers;
-        if (!texture || texture.width != width || texture.height != height ||
+        MTLTextureType textureType = volume ? MTLTextureType3D : (cube ? MTLTextureTypeCubeArray : MTLTextureType2DArray);
+        NSUInteger arrayLength = cube || volume ? 1 : layers;
+        if (!texture || texture.width != width || texture.height != height || texture.depth != depth ||
             texture.pixelFormat != format || texture.mipmapLevelCount != levels ||
             texture.textureType != textureType || texture.arrayLength != arrayLength) {
             MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:YES];
             desc.mipmapLevelCount = levels;
             desc.textureType = textureType;
+            desc.depth = depth;
             desc.arrayLength = arrayLength;
             desc.storageMode = MTLStorageModeShared;
             desc.usage = MTLTextureUsageShaderRead;
@@ -653,16 +654,18 @@ bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, 
         }
         const uint8_t *levelPixels = rgba;
         for (uint32_t slice = 0; slice < layers; ++slice) {
-            uint32_t w = width, h = height;
+            uint32_t w = width, h = height, d = depth;
             for (uint32_t level = 0; level < levels; ++level) {
                 size_t rowBytes = blockBytes ? (((size_t)w + 3) / 4) * blockBytes : (size_t)w * 4;
                 size_t rows = blockBytes ? ((size_t)h + 3) / 4 : h;
                 size_t imageBytes = rowBytes * rows;
-                [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:slice
-                             withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:imageBytes];
-                levelPixels += imageBytes;
+                MTLRegion region = volume ? MTLRegionMake3D(0, 0, 0, w, h, d) : MTLRegionMake2D(0, 0, w, h);
+                [texture replaceRegion:region mipmapLevel:level slice:slice
+                             withBytes:levelPixels bytesPerRow:rowBytes bytesPerImage:(volume && d == 1 ? 0 : imageBytes)];
+                levelPixels += imageBytes * d;
                 w = w > 1 ? w / 2 : 1;
                 h = h > 1 ? h / 2 : 1;
+                d = d > 1 ? d / 2 : 1;
             }
         }
         // IRDescriptorTableSetTexture encodes the resource ID independently of
@@ -672,6 +675,20 @@ bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, 
         r.sampledTextures[key] = texture;
         return true;
     }
+}
+
+bool victory_metal_set_texture_at(void *handle, uint32_t index, uint32_t width, uint32_t height,
+                                  uint32_t levels, uint32_t layers, bool cube, const uint8_t *rgba,
+                                  uint32_t texture_format, char *error, size_t error_len) {
+    return setTextureAt(handle, index, width, height, 1, levels, layers, cube, false,
+                        rgba, texture_format, error, error_len);
+}
+
+bool victory_metal_set_texture_3d_at(void *handle, uint32_t index, uint32_t width, uint32_t height,
+                                     uint32_t depth, uint32_t levels, const uint8_t *pixels,
+                                     uint32_t texture_format, char *error, size_t error_len) {
+    return setTextureAt(handle, index, width, height, depth, levels, 1, false, true,
+                        pixels, texture_format, error, error_len);
 }
 
 static MTLSamplerAddressMode samplerAddressMode(uint32_t address) {
