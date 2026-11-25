@@ -51,7 +51,7 @@ fn emitted_dxil() -> Vec<u8> {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let resources = resource::track(&program, &native.layout, native.stage).unwrap();
+    let resources = resource::track(&program, &native.layout, native.stage, None).unwrap();
     let raised = io::raise(&program, &native).unwrap();
     let structured = structure::structure(&program).unwrap();
     let mut empty_container = vec![0u8; 0x20];

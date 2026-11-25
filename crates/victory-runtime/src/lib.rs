@@ -66,8 +66,8 @@ mod native {
     }
     unsafe extern "win64" fn guest(_: *const (), _: *const u8, out: *mut bool) -> i32 { unsafe { put(out, false) } }
     unsafe extern "win64" fn state(_: *const (), _: *const u8, out: *mut u32) -> i32 { unsafe { put(out, 0) } }
-    unsafe extern "win64" fn gamertag(_: *const (), _: *const u8, _: u32, size: usize, buffer: *mut u8, used: *mut usize) -> i32 {
-        unsafe { super::user::write_gamertag(size, buffer, used) }
+    unsafe extern "win64" fn gamertag(_: *const (), _: *const u8, component: u32, size: usize, buffer: *mut u8, used: *mut usize) -> i32 {
+        unsafe { super::user::write_gamertag(component, size, buffer, used) }
     }
     unsafe extern "win64" fn unsupported_bool(_: *const ()) -> bool { std::process::abort() }
     static USER_TABLE: UserTable<35> = UserTable([

@@ -19,16 +19,14 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// Uses a prebuilt fixture for cross-compiled tests, or builds it locally.
-/// The nested build has its own target dir because the outer cargo holds the
-/// lock on the main one while tests run.
+/// Uses a prebuilt fixture for cross-compiled tests, or builds it in the
+/// outer test's scratch directory to avoid the main cargo target lock.
 fn build_probe() -> PathBuf {
     if let Some(path) = std::env::var_os("VICTORY_HLE_PROBE_DLL") {
         return PathBuf::from(path);
     }
-    let root = workspace_root();
-    let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
-    let target = root.join("target/fixtures");
+    let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
         .args(["build", "--quiet", "--manifest-path"])
         .arg(&manifest)

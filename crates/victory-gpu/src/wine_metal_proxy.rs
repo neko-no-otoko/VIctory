@@ -495,6 +495,7 @@ static FENCE_TABLE: Table<160> = {
     t[8] = fence_completed as *const ();
     t[9] = fence_event as *const ();
     t[10] = fence_signal as *const ();
+    t[11] = fence_creation_flags as *const ();
     Table(t)
 };
 static LIST_TABLE: Table<160> = {
@@ -978,6 +979,11 @@ extern "system" fn create_fence(this: This, initial: u64, flags: u32, iid: *cons
 
 extern "system" fn fence_completed(this: This) -> u64 {
     match data(this) { Some(Data::Fence(fence)) => fence.value(), _ => u64::MAX }
+}
+
+// create_fence rejects every nonzero flag, so every proxy fence has NONE.
+extern "system" fn fence_creation_flags(_: This) -> u32 {
+    0
 }
 
 extern "system" fn fence_signal(this: This, value: u64) -> HRESULT {
@@ -2006,4 +2012,48 @@ fn run_graphics(c: &Config, jobs: &[GraphicsJob]) -> Result<(), String> {
     }
     tracing::info!("Wine Metal proxy connected");
     Ok(())
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use crate::object::slot;
+
+    #[test]
+    fn fence1_query_and_creation_flags_abi() {
+        const FENCE1: Iid = guid(0x433685fe, 0xe22b, 0x4ca0, [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a]);
+        const UNSUPPORTED: Iid = guid(0x433685ff, 0xe22b, 0x4ca0, [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a]);
+        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Flags = extern "system" fn(This) -> u32;
+        type Release = extern "system" fn(This) -> u32;
+
+        let config = Arc::new(Config { addr: "127.0.0.1:1".parse().unwrap(), token: [0; 16], newer: false });
+        let mut device = std::ptr::null();
+        assert_eq!(new(Data::Device(config), &DEVICE_TABLE, &crate::device::IID, crate::device::IID, &mut device), S_OK);
+
+        let mut direct = std::ptr::null();
+        assert_eq!(create_fence(device, 3, 0, &FENCE1, &mut direct), S_OK);
+        assert_eq!(slot::<Flags>(direct, 0x58)(direct), 0);
+        assert_eq!(slot::<Release>(direct, 0x10)(direct), 0);
+
+        let mut rejected = device;
+        assert_eq!(create_fence(device, 3, 1, &FENCE1, &mut rejected), E_INVALIDARG);
+        assert!(rejected.is_null());
+        rejected = device;
+        assert_eq!(create_fence(device, 3, 0, &UNSUPPORTED, &mut rejected), E_NOINTERFACE);
+        assert!(rejected.is_null());
+
+        let mut fence = std::ptr::null();
+        assert_eq!(create_fence(device, 3, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let mut queried = std::ptr::null();
+        assert_eq!(slot::<Query>(fence, 0)(fence, &FENCE1, &mut queried), S_OK);
+        assert_eq!(queried, fence);
+        assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0);
+        rejected = fence;
+        assert_eq!(slot::<Query>(fence, 0)(fence, &UNSUPPORTED, &mut rejected), E_NOINTERFACE);
+        assert!(rejected.is_null());
+        assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
+        assert_eq!(slot::<Release>(fence, 0x10)(fence), 0);
+        assert_eq!(slot::<Release>(device, 0x10)(device), 0);
+    }
 }

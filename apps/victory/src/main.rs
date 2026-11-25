@@ -12,12 +12,14 @@ mod metal;
 mod native_census;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_fixture;
+#[cfg(windows)]
+mod prebuild;
+#[cfg(windows)]
+mod run;
 #[cfg(target_os = "macos")]
 mod wine_imports;
 #[cfg(target_os = "macos")]
 mod wine_launcher;
-#[cfg(windows)]
-mod run;
 mod shader;
 mod translate;
 
@@ -76,15 +78,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -95,7 +103,10 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader. With
+        /// `--cache`: then make every pipeline of the title's shader pack
+        /// into the host pipeline library `run` reads (on this GPU and
+        /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
@@ -104,6 +115,11 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate into the shader cache `run` reads (the warm-up):
+        /// every container found, once, nothing else checked or listed
+        /// (with `--pipelines`, then the shader pack's pipelines).
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
     },
     /// Convert a DXIL file to a Metal library using Apple's converter.
     #[cfg(target_os = "macos")]
@@ -282,13 +298,22 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs, pipelines),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
+            cache: false,
         } => translate::run(paths, validate, pipelines, list, jobs),
         #[cfg(target_os = "macos")]
         Command::ConvertMetal {
@@ -318,7 +343,14 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            if code != 0 {
+                // Preserve all 32 bits of the Windows process status.
+                std::process::exit(code as i32);
+            }
+            Ok(())
+        }
         #[cfg(windows)]
         Command::Config => show_config(),
     }
@@ -340,6 +372,8 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -347,7 +381,7 @@ fn show_config() -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir])
+        .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");

@@ -8,6 +8,58 @@ use crate::object::{self, This};
 use victory_shader::{
     Container, FourCC, HwStage, ResourceType, RootType, emit, ir, native, resource,
 };
+/// Bindings not implemented by either restricted Metal pipeline path.
+pub(crate) fn unsupported_host_bindings(host: &emit::HostShader) -> bool {
+    !host.root_uavs.is_empty()
+        || host.memory
+        || host.memory_writes
+        || host.view_addresses
+        || host.heap
+        || host.heap_writes
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_bindings_fail_closed() {
+        let mut host = emit::HostShader {
+            stage: HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+        };
+        assert!(!unsupported_host_bindings(&host));
+        host.root_uavs.push(0);
+        assert!(unsupported_host_bindings(&host));
+        host.root_uavs.clear();
+        host.memory = true;
+        assert!(unsupported_host_bindings(&host));
+        host.memory = false;
+        host.memory_writes = true;
+        assert!(unsupported_host_bindings(&host));
+        host.memory_writes = false;
+        host.view_addresses = true;
+        assert!(unsupported_host_bindings(&host));
+        host.view_addresses = false;
+        host.heap = true;
+        assert!(unsupported_host_bindings(&host));
+        host.heap = false;
+        host.heap_writes = true;
+        assert!(unsupported_host_bindings(&host));
+    }
+}
+
 
 pub(crate) struct Prepared {
     compute: victory_metal::compute::Compute,
@@ -27,8 +79,9 @@ impl Prepared {
 
     fn new_inner(container: &[u8], raw_views: bool) -> Result<Self, String> {
         let c = Container::parse(container).map_err(|e| e.to_string())?;
-        let dxil = c.part(FourCC::DXIL).ok_or("missing DXIL part")?;
-        let programs = victory_shader::native_programs(dxil.data).map_err(|e| e.to_string())?;
+        let native_part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))
+            .ok_or("missing DXIL or ACCC part")?;
+        let programs = victory_shader::native_programs(native_part.data).map_err(|e| e.to_string())?;
         if programs.len() != 1 || programs[0].stage != HwStage::Cs {
             return Err("expected exactly one compute program".into());
         }
@@ -51,7 +104,7 @@ impl Prepared {
             uav
         };
         let program = ir::build(&p.code, p.wave64, p.vgprs).map_err(|e| e.to_string())?;
-        let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
+        let traced = resource::track(&program, &p.layout, p.stage, None).map_err(|e| e.to_string())?;
         let descriptor = traced.descriptors.iter()
             .find(|d| matches!(d.source, resource::Source::Loaded { .. }))
             .ok_or("expected a table descriptor access")?;
@@ -195,6 +248,7 @@ impl Prepared {
         if !host.samplers.is_empty()
             || host.root_cbvs.as_slice() != cbv_slot.as_slice()
             || !host.root_srvs.is_empty()
+            || unsupported_host_bindings(&host)
             || host.user_data.iter().any(|u| {
                 !matches!(u.root, RootType::Constants | RootType::Table)
                     || (u.root == RootType::Table && u.slot != root.slot)

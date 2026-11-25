@@ -73,37 +73,42 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    if runtime::title_storage().1 != runtime::StorageMode::Virtual {
-        // Copy the title's input before suspension can invalidate it.
-        let request = wine_launch_text(exe).and_then(|exe| {
-            wine_launch_text(args).map(|args| (exe, args))
-        });
-        super::lifecycle::end_title(
-            "XLaunchNewGame",
-            Box::new(move || {
-                let result = request.and_then(|(exe, args)| wine_relaunch(&exe, &args));
-                if let Err(error) = result {
-                    eprintln!("XLaunchNewGame: Wine relaunch failed: {error}");
-                    std::process::exit(1);
-                }
-            }),
-        );
-    } else {
-        let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
-        tracing::info!(exe, args, "XLaunchNewGame");
-        let current = runtime::main_image()
-            .and_then(runtime::image_path)
-            .unwrap_or_default();
-        let ours: Vec<_> = std::env::args_os().skip(1).collect();
-        let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-        super::lifecycle::end_title(
-            "XLaunchNewGame",
-            Box::new(move || super::lifecycle::relaunch(command)),
-        );
+    #[cfg(windows)]
+    {
+        if runtime::title_storage().1 != runtime::StorageMode::Virtual {
+            // Copy the title's input before suspension can invalidate it.
+            let request = wine_launch_text(exe).and_then(|exe| {
+                wine_launch_text(args).map(|args| (exe, args))
+            });
+            super::lifecycle::end_title(
+                "XLaunchNewGame",
+                Box::new(move || {
+                    let result = request.and_then(|(exe, args)| wine_relaunch(&exe, &args));
+                    if let Err(error) = result {
+                        eprintln!("XLaunchNewGame: Wine relaunch failed: {error}");
+                        std::process::exit(1);
+                    }
+                }),
+            );
+        } else {
+            let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+            tracing::info!(exe, args, "XLaunchNewGame");
+            let current = runtime::main_image()
+                .and_then(runtime::image_path)
+                .unwrap_or_default();
+            let ours: Vec<_> = std::env::args_os().skip(1).collect();
+            let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+            super::lifecycle::end_title(
+                "XLaunchNewGame",
+                Box::new(move || super::lifecycle::relaunch(command)),
+            );
+        }
+        loop {
+            std::thread::park();
+        }
     }
-    loop {
-        std::thread::park();
-    }
+    #[cfg(not(windows))]
+    let _ = (exe, args);
 }
 
 const WINE_LAUNCH_LIMIT: usize = 32_767;
@@ -174,14 +179,52 @@ fn relaunch_args(
     args: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut out: Vec<_> = ours.into_iter().take_while(|a| a != "--").collect();
+    // `runtime` makes the image path absolute when it maps the title, so a
+    // relative launch argument is not textually equal to it. Normalise the
+    // same way before matching, or a relaunch would run the old executable.
     if !exe.is_empty()
-        && let Some(slot) = out.iter_mut().find(|a| a.as_os_str() == current)
+        && let Some(slot) = out.iter_mut().find(|a| {
+            a.as_os_str() == current
+                || std::path::absolute(a).is_ok_and(|p| p.as_os_str() == current)
+        })
     {
         *slot = exe.into();
     }
     if !args.trim().is_empty() {
         out.push("--".into());
-        out.extend(args.split_whitespace().map(Into::into));
+        out.extend(split_args(args).into_iter().map(Into::into));
+    }
+    out
+}
+
+/// Splits the title's command-line tail into arguments, keeping double-quoted
+/// strings together (including empty ones). Windows command lines quote only
+/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in args.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if !quoted && c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
     }
     out
 }
@@ -282,6 +325,37 @@ mod tests {
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn a_relaunch_replaces_a_relative_startup_executable() {
+        // `runtime::set_image_path` makes this absolute before the launch.
+        let current = std::path::absolute("game.exe").unwrap();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
+        let again = relaunch_args(
+            ours,
+            current.as_os_str(),
+            "other.exe",
+            r#"--config="C:\Program Files\game" "" -name=O'Brien -y"#,
+        );
+        let expected: Vec<std::ffi::OsString> = [
+            "run",
+            "other.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            r"--config=C:\Program Files\game",
+            "",
+            "-name=O'Brien",
+            "-y",
+        ]
+        .map(Into::into)
+        .into();
+        assert_eq!(again, expected, "the requested exe and quoted args survive");
     }
 
     #[test]

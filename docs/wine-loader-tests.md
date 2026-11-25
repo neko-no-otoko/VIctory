@@ -237,11 +237,11 @@ does not establish game compatibility or ARM-native PE execution.
 
 The opt-in proxy keeps D3D12.X HLE objects and vtables inside the Wine PE
 process. It copies bounded, ordered resource and command data over
-authenticated loopback TCP to a separate x86-64 macOS host, which uses
-VIctory's Metal paths and returns each completed request's results. No
-guest pointers or COM objects cross the process boundary. Wine and the native
-host both execute under Rosetta on Apple Silicon; this is not ARM-native guest
-execution. This is a trusted-workload experiment, not a process sandbox.
+authenticated loopback TCP to a separate macOS host, which uses VIctory's
+Metal paths and returns each completed request's results. No guest pointers
+or COM objects cross the process boundary. The host may be arm64 or x86-64;
+the tested Wine guest runs x86-64 under Rosetta. This is a trusted-workload
+experiment, not a process sandbox.
 
 The restricted compute path supports one whole-buffer raw UAV with an
 optional root CBV, or a bounded table of raw SRV/UAV buffers. The latter
@@ -255,6 +255,15 @@ general resource states and arbitrary D3D12.X methods remain unsupported;
 some unsupported void methods abort rather than pretend to succeed. The
 loopback bearer token is not a boundary against other processes with access
 to it.
+
+The merge of upstream `ccfb02996eac831853e8324156f123eeff083e9d` retains
+the restricted proxy representation. Shader-visible descriptor records
+copied as guest bytes are not synchronized into proxy slots, unlike the
+upstream Windows host. `CheckFeatureSupport` is not implemented by this
+proxy. Shaders needing root UAVs, title-memory page tables, view-address
+tables or direct resource heaps are rejected by the Metal pipeline rather
+than bound to unsupported resources. Guarded compute supports dword views;
+sub-dword raw accesses remain rejected on the restricted path.
 
 The compute CBV must address a live committed default-heap buffer in COMMON
 or VERTEX_AND_CONSTANT_BUFFER state, at a 16-byte-aligned offset; the view

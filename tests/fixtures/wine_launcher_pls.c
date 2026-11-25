@@ -41,7 +41,7 @@ int main(void) {
         if (SLOT(storage, Prompt, 6)(storage, 1, &block) || (uint32_t)SLOT(queue, Status, 3)(queue, &block, 1) != NOT_SUPPORTED) return 15;
     } else {
         if (SLOT(storage, Size, 3)(storage, &size) || size != 4) return 16;
-        if ((uint32_t)SLOT(storage, Path, 4)(storage, 3, path, &used) != 0x8007007au) return 17;
+        if ((uint32_t)SLOT(storage, Path, 4)(storage, 3, path, &used) != 0x80004005u) return 17;
         if ((uint32_t)SLOT(storage, Path, 4)(storage, sizeof(path), NULL, &used) != 0x8007007au) return 26;
         if (SLOT(storage, Path, 4)(storage, sizeof(path), path, &used) || strcmp(path, "P:\\") || used != 4) return 18;
         if (SLOT(storage, Info, 5)(storage, &space) || space.total != 1048576 || space.used != (!strcmp(mode, "read") ? sizeof(payload) : 0) || space.free != space.total - space.used || space.available > space.free) return 19;

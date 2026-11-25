@@ -112,7 +112,7 @@ fn fragment_dxil(use_constants: bool, sampled: bool) -> Vec<u8> {
     data.extend_from_slice(&sig);
     let container = Container::parse(&data).unwrap();
     let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let resources = resource::track(&program, &native.layout, native.stage).unwrap();
+    let resources = resource::track(&program, &native.layout, native.stage, None).unwrap();
     let raised = io::raise(&program, &native).unwrap();
     let structured = structure::structure(&program).unwrap();
     emit::emit(
@@ -176,7 +176,7 @@ fn vertex_dxil() -> Vec<u8> {
     }
     let container = Container::parse(&data).unwrap();
     let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let resources = resource::track(&program, &native.layout, native.stage).unwrap();
+    let resources = resource::track(&program, &native.layout, native.stage, None).unwrap();
     let raised = io::raise(&program, &native).unwrap();
     let structured = structure::structure(&program).unwrap();
     emit::emit(

@@ -12,9 +12,12 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, and [`console`] which console model the title sees. The queue also
-//! handles the supported subset of console presentation.
+//! share, [`console`] which console model the title sees, and `external` host
+//! libraries recording into title lists. The queue also handles the supported
+//! subset of console presentation.
 
+#[cfg(windows)]
+mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -25,6 +28,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -32,6 +37,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
@@ -57,8 +64,13 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod twin;
 #[cfg(windows)]
 mod watch;
 pub mod wine_transport;
@@ -76,4 +88,7 @@ pub use metal_graphics::WineMetalGraphics;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{
+    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    writing as kernel_will_write,
+};

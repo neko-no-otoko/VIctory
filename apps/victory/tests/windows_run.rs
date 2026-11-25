@@ -21,7 +21,7 @@ fn executes_synthetic_pe_through_cli() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "status: {}\n{stdout}\n{stderr}", output.status);
+    assert_eq!(output.status.code(), Some(42), "status: {}\n{stdout}\n{stderr}", output.status);
     assert!(stdout.contains("bound          "), "{stdout}\n{stderr}");
     assert!(stdout.contains("1 hle,"), "{stdout}\n{stderr}");
     assert!(stdout.contains("0 missing"), "{stdout}\n{stderr}");
@@ -46,7 +46,7 @@ fn executes_synthetic_d3d12x_through_cli() {
         .output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "status: {}\n{stdout}\n{stderr}", output.status);
+    assert_eq!(output.status.code(), Some(42), "status: {}\n{stdout}\n{stderr}", output.status);
     assert!(stdout.contains("1 hle,") && stdout.contains("0 missing"), "{stdout}\n{stderr}");
     assert!(stdout.contains("host D3D12 device ready") || stderr.contains("host D3D12 device ready"), "{stdout}\n{stderr}");
     assert!(!stdout.contains("no host command list") && !stderr.contains("no host command list"), "{stdout}\n{stderr}");
@@ -72,7 +72,7 @@ fn executes_synthetic_d3d12x_compute_through_cli() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let logs = format!("{stdout}\n{stderr}");
-    assert!(output.status.success(), "status: {}\n{logs}", output.status);
+    assert_eq!(output.status.code(), Some(42), "status: {}\n{logs}", output.status);
     assert!(stdout.contains("1 hle,") && stdout.contains("0 missing"), "{logs}");
     assert!(logs.contains("host D3D12 device ready"), "{logs}");
     assert!(logs.contains("shader translated") && logs.contains("host pipeline shaders"), "{logs}");
@@ -104,7 +104,7 @@ fn executes_tls_d3d12x_compute_through_wine_metal_proxy() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let logs = format!("{stdout}\n{stderr}");
-    assert!(output.status.success(), "status: {}\n{logs}", output.status);
+    assert_eq!(output.status.code(), Some(42), "status: {}\n{logs}", output.status);
     assert!(logs.contains("Wine Metal proxy connected"), "{logs}");
     assert!(stdout.contains("1 hle,") && stdout.contains("0 missing"), "{logs}");
     assert!(stdout.contains("TLS compiler state and thread callbacks passed"), "{logs}");

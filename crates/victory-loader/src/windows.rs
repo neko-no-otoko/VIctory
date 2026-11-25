@@ -152,8 +152,8 @@ fn map_dll(
         return Ok(());
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let image = load(&prepare(&original)?, dirs.1)
-        .with_context(|| format!("loading {}", path.display()))?;
+    let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
+    let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())
@@ -183,13 +183,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {

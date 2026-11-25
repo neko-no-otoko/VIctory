@@ -68,6 +68,23 @@ host-ABI pointers.
 Guest DLL allocation hooks and the Windows runtime page mapper are not
 installed by this native bridge; it uses the GPU implementation's own
 allocation path. This is not complete D3D12.X, Windows startup, or game support.
+The merged upstream shader translator may describe root UAVs, computed title
+memory, view-address tables or direct descriptor heaps. The restricted Metal
+bridge rejects these bindings; it does not provide the upstream Windows
+backend's memory or descriptor-heap implementation. Native
+`CheckFeatureSupport` is not implemented.
+
+In the isolated merge of fork `1effa796591b020ad0593ab3649ef8b1ca4c2252`
+with upstream `ccfb02996eac831853e8324156f123eeff083e9d`, arm64 and
+x86-64 macOS CLI/helper builds and x86-64 Windows gnullvm CLI/provider
+builds succeeded. Synthetic tests passed native UV/offset, Metal render,
+native CBV, Wine tiled/mip, raw bounds and group barrier cases. The format
+suite passed 38 tests with five ignored. A Wine-launched Windows synthetic
+loader test passed with `VICTORY_SKIP_CPU_CHECK=1`; without it, Rosetta
+failed the upstream AVX2 preflight. The Wine import case-collision subcase
+was unavailable on the case-insensitive test filesystem. These checks do
+not establish title compatibility or full upstream feature parity.
+
 With a trusted Apple Metal Shader Converter dylib, LLVM-MinGW and a Metal GPU:
 
 ```sh

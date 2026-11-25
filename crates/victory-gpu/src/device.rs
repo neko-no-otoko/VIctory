@@ -91,7 +91,8 @@ const LEVEL_IIDS: [Iid; 9] = [
     ),
 ];
 
-fn is_device(iid: *const Iid) -> bool {
+/// Whether `iid` names the device: its first interface or a newer level.
+pub(crate) fn is_device(iid: *const Iid) -> bool {
     object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
 }
 
@@ -293,12 +294,18 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const SHADER_MODEL: u32 = 7;
+    const OPTIONS1: u32 = 8;
+    const OPTIONS4: u32 = 23;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        SHADER_MODEL => 4,
+        OPTIONS1 => 24,
+        OPTIONS4 => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -340,6 +347,27 @@ extern "system" fn check_feature_support(
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
             S_OK
         }
+        SHADER_MODEL => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<u32>() };
+            // The highest asked for, up to 6.6 (the AMD upscaler asks).
+            *q = (*q).min(0x66);
+            S_OK
+        }
+        OPTIONS1 => {
+            let lanes = crate::console::current().compute_units() * 64;
+            // SAFETY: checked size and non-null.
+            unsafe {
+                data.cast::<[u32; 6]>()
+                    .write_unaligned([1, 32, 64, lanes, 1, 1])
+            };
+            S_OK
+        }
+        OPTIONS4 => {
+            // SAFETY: checked size and non-null. Native 16-bit shader operations.
+            unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 1]) };
+            S_OK
+        }
         _ => feature_levels(data),
     }
 }
@@ -364,6 +392,18 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
         }
         None => UNSUPPORTED,
     }
+}
+
+/// The host device's state: the console's device is removed when the host's is.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -398,6 +438,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -542,6 +583,54 @@ mod tests {
         assert_eq!(missing(), E_NOTIMPL);
     }
 
+    /// A device child, and the DXGI device, hand out the device as any
+    /// interface the device itself answers to.
+    #[test]
+    fn the_device_is_found_at_every_level_through_others() {
+        type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence),
+            S_OK
+        );
+        let get_device = slot::<Get>(fence, 0x38);
+        let dxgi = dxgi::device();
+        let query = slot::<Get>(dxgi, 0);
+        for iid in std::iter::once(&IID).chain(&LEVEL_IIDS) {
+            let mut found = std::ptr::null();
+            assert_eq!(get_device(fence, iid, &mut found), S_OK, "{iid:02x?}");
+            assert_eq!(found, device());
+            let mut found = std::ptr::null();
+            assert_eq!(query(dxgi, iid, &mut found), S_OK, "{iid:02x?}");
+            assert_eq!(found, device());
+        }
+        // What the device is not, it is not through them either.
+        let mut found = device();
+        assert_eq!(get_device(fence, fence_iid, &mut found), E_NOINTERFACE);
+        assert!(found.is_null());
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    /// The host's: a fence's `GetDevice` for `ID3D12Device5`.
+    #[cfg(windows)]
+    #[test]
+    fn the_hosts_children_hand_out_newer_device_levels() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // SAFETY: plain calls on the host device and its fence.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut device: Option<ID3D12Device5> = None;
+            assert!(fence.GetDevice(&mut device).is_ok());
+            assert!(device.is_some());
+        }
+    }
+
     #[test]
     fn virtual_memory_configuration_reports_user_space() {
         let mut config = VirtualMemory {
@@ -576,5 +665,36 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The queries the AMD upscaler's capability check makes.
+    #[test]
+    fn shader_model_and_wave_options_are_the_consoles() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut model = 0x67u32;
+        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x66);
+        model = 0x62;
+        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x62);
+        let mut waves = [0u32; 6];
+        assert_eq!(check(device, 8, waves.as_mut_ptr().cast(), 24), S_OK);
+        assert_eq!(waves[..3], [1, 32, 64]);
+        let mut options4 = [0u32; 3];
+        assert_eq!(check(device, 23, options4.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(options4[2], 1, "native 16-bit operations");
+        assert_eq!(
+            check(device, 8, waves.as_mut_ptr().cast(), 16),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 }

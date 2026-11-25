@@ -109,6 +109,8 @@ unsigned entry(void) {
     used=99;
     if ((unsigned long)((GetGamertag)v[15])(object,user,0,sizeof(small),small,&used)!=0x8007007aUL ||
         used!=99 || small[0]!='x' || small[5]!='x') return 7;
+    name[0]='x'; used=99;
+    if (((GetGamertag)v[15])(object,user,2,1,name,&used) || used!=1 || name[0]) return 14;
     if (((Duplicate)v[3])(object,user,&duplicate) || !duplicate) return 8;
     if (((Compare)v[5])(object,user,duplicate)!=0) return 9;
     ((Close)v[4])(object,duplicate);

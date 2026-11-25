@@ -1098,7 +1098,7 @@ fn validate(
         _ => return Err(format!("unsupported native stage inputs or outputs: {:?}, vgprs {}, signatures {:?}", p.io, p.vgprs, vertex_signatures)),
     }
     let program = ir::build(&p.patched_code(), p.wave64, p.vgprs).map_err(|e| e.to_string())?;
-    let traced = resource::track(&program, &p.layout, p.stage).map_err(|e| e.to_string())?;
+    let traced = resource::track(&program, &p.layout, p.stage, None).map_err(|e| e.to_string())?;
     let mut loads = Vec::new();
     let mut seen = Vec::new();
     let mut texture_accesses = Vec::new();
@@ -1195,8 +1195,9 @@ fn validate(
     let mut channels = vec![0u8; varying.len()];
     for (site, interp) in &raised.interps {
         let (attribute, flat) = match interp {
-            io::Interp::Interpolated { attribute, barycentric, first }
+            io::Interp::Interpolated { attribute, barycentric, first, unless }
                 if *barycentric == io::Barycentric::PerspectiveCenter
+                    && unless.is_empty()
                     && !first.is_empty()
                     && program.blocks[site.0].insts[site.1].name() == "v_interp_p2_f32"
                     && first.iter().all(|&(b, i)| program.blocks[b].insts[i].name() == "v_interp_p1_f32") => (attribute, false),
@@ -1281,6 +1282,7 @@ fn validate(
         || !host.static_samplers.is_empty()
         || !host.root_cbvs.is_empty()
         || !host.root_srvs.is_empty()
+        || crate::metal::unsupported_host_bindings(&host)
     {
         return Err("translated shader has unsupported bindings".into());
     }

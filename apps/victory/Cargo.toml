@@ -29,7 +29,9 @@ victory-native = { path = "../../crates/victory-native" }
 [target.'cfg(windows)'.dependencies]
 victory-loader.workspace = true
 victory-hle.workspace = true
+victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
